@@ -1,0 +1,220 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1180" viewBox="0 0 1800 1180" role="img" aria-labelledby="title desc">
+  <title id="title">cuBBS-Cred GPU 四操作混合架构</title>
+  <desc id="desc">展示 W3C HTTP 输入经 CPU 规范化和 Rust 调度后，分别进入 Sign、Verify、ProofGen 和 ProofVerify 的 CUDA primitive 流水线，再由 host 完成协议组装与安全判定。</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#061426"/>
+      <stop offset="0.55" stop-color="#0a1d34"/>
+      <stop offset="1" stop-color="#10233e"/>
+    </linearGradient>
+    <linearGradient id="host" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#163f68"/>
+      <stop offset="1" stop-color="#102b4c"/>
+    </linearGradient>
+    <linearGradient id="gpu" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0e5548"/>
+      <stop offset="1" stop-color="#09392f"/>
+    </linearGradient>
+    <linearGradient id="purple" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#533394"/>
+      <stop offset="1" stop-color="#31205f"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="9" stdDeviation="10" flood-color="#000814" flood-opacity="0.42"/>
+    </filter>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="5" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <marker id="arrowBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#60a5fa"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#34d399"/>
+    </marker>
+    <marker id="arrowOrange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#fb923c"/>
+    </marker>
+    <style>
+      text { font-family: Inter, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; }
+      .title { fill:#f8fafc; font-size:36px; font-weight:750; letter-spacing:.3px; }
+      .subtitle { fill:#9fb5cf; font-size:17px; }
+      .lane-title { fill:#f8fafc; font-size:23px; font-weight:720; }
+      .lane-sub { fill:#9fb5cf; font-size:14px; }
+      .box-title { fill:#f8fafc; font-size:16px; font-weight:680; }
+      .box-body { fill:#c5d4e6; font-size:13.5px; }
+      .small { fill:#a9bed4; font-size:12.5px; }
+      .tag { fill:#e8f2ff; font-size:12px; font-weight:700; letter-spacing:.5px; }
+      .eq { fill:#e9d5ff; font-size:14px; font-family:"JetBrains Mono", monospace; }
+    </style>
+  </defs>
+
+  <rect width="1800" height="1180" fill="url(#bg)"/>
+  <circle cx="1640" cy="90" r="230" fill="#2563eb" opacity=".055"/>
+  <circle cx="170" cy="1040" r="260" fill="#10b981" opacity=".04"/>
+
+  <text class="title" x="56" y="58">cuBBS-Cred · GPU 四操作混合密码学架构</text>
+  <text class="subtitle" x="58" y="88">W3C/协议语义由 host 掌控 · CUDA 加速算术热点 · ABI v2 primitive composition · CPU/GPU 同一验证等式</text>
+
+  <g transform="translate(1280,35)">
+    <rect x="0" y="0" width="456" height="62" rx="14" fill="#0e223b" stroke="#294968"/>
+    <circle cx="24" cy="21" r="6" fill="#60a5fa"/><text class="small" x="38" y="25">HOST / W3C / protocol</text>
+    <circle cx="199" cy="21" r="6" fill="#34d399"/><text class="small" x="213" y="25">OMNI CUDA</text>
+    <circle cx="329" cy="21" r="6" fill="#fb923c"/><text class="small" x="343" y="25">BLST fallback</text>
+    <text class="small" x="24" y="48">绿色越多 = 越多昂贵群运算已下沉 GPU</text>
+  </g>
+
+  <!-- ingress -->
+  <g filter="url(#shadow)">
+    <rect x="58" y="126" width="378" height="106" rx="17" fill="url(#host)" stroke="#3b82f6" stroke-width="1.5"/>
+    <rect x="58" y="126" width="92" height="25" rx="12" fill="#2563eb"/><text class="tag" x="77" y="143">HTTP / W3C</text>
+    <text class="box-title" x="82" y="178">并发请求与微批队列</text>
+    <text class="box-body" x="82" y="203">backpressure · timeout · original order</text>
+
+    <rect x="498" y="126" width="378" height="106" rx="17" fill="url(#host)" stroke="#3b82f6" stroke-width="1.5"/>
+    <rect x="498" y="126" width="74" height="25" rx="12" fill="#2563eb"/><text class="tag" x="519" y="143">CPU</text>
+    <text class="box-title" x="522" y="178">JSON-LD / RDFC / N-Quads</text>
+    <text class="box-body" x="522" y="203">proofHash · mandatoryHash · header · messages</text>
+
+    <rect x="938" y="126" width="378" height="106" rx="17" fill="url(#host)" stroke="#3b82f6" stroke-width="1.5"/>
+    <rect x="938" y="126" width="109" height="25" rx="12" fill="#2563eb"/><text class="tag" x="956" y="143">RUST HOST</text>
+    <text class="box-title" x="962" y="178">BbsEngine 协议拆解</text>
+    <text class="box-body" x="962" y="203">validate · prepare terms · protocol state</text>
+
+    <rect x="1378" y="126" width="364" height="106" rx="17" fill="url(#host)" stroke="#3b82f6" stroke-width="1.5"/>
+    <rect x="1378" y="126" width="110" height="25" rx="12" fill="#2563eb"/><text class="tag" x="1395" y="143">SCHEDULER</text>
+    <text class="box-title" x="1402" y="178">完整密码学 shape 分桶</text>
+    <text class="box-body" x="1402" y="203">op · PK · header · L · indexes · ph</text>
+  </g>
+  <path d="M436 179 H490" stroke="#60a5fa" stroke-width="2.5" marker-end="url(#arrowBlue)"/>
+  <path d="M876 179 H930" stroke="#60a5fa" stroke-width="2.5" marker-end="url(#arrowBlue)"/>
+  <path d="M1316 179 H1370" stroke="#60a5fa" stroke-width="2.5" marker-end="url(#arrowBlue)"/>
+
+  <!-- dispatch rail -->
+  <rect x="58" y="267" width="1684" height="74" rx="18" fill="#0d213a" stroke="#31506f"/>
+  <text class="box-title" x="84" y="296">CUDA ABI v2 hybrid primitive dispatcher</text>
+  <text class="box-body" x="84" y="319">整操作 ABI 保留但当前为 stub；host 将四操作组合为 message-to-scalar / G1 MSM / proof-pair / pairing primitives</text>
+  <g transform="translate(1114,282)">
+    <rect width="600" height="42" rx="12" fill="#111d2e" stroke="#475569"/>
+    <text class="small" x="18" y="17">生产 MSM 路由：1 item · 2 common · 3 large · 4 universal</text>
+    <text class="small" x="18" y="34">5/6 BLST fallback · 7/8 reference benchmark only</text>
+  </g>
+
+  <!-- four operation panels -->
+  <g filter="url(#shadow)">
+    <!-- sign -->
+    <rect x="58" y="379" width="396" height="520" rx="22" fill="#0c1f35" stroke="#36caa0" stroke-width="1.5"/>
+    <rect x="58" y="379" width="396" height="63" rx="22" fill="#0d3b39"/>
+    <text class="lane-title" x="82" y="411">1 · Sign</text>
+    <text class="lane-sub" x="82" y="431">signature = (A, e)</text>
+    <rect x="80" y="464" width="352" height="72" rx="14" fill="url(#gpu)" stroke="#34d399"/>
+    <text class="box-title" x="101" y="492">GPU · message → Fr</text>
+    <text class="box-body" x="101" y="516">batched XMD/SHA-256 · packed scalars</text>
+    <rect x="80" y="558" width="352" height="84" rx="14" fill="url(#gpu)" stroke="#34d399"/>
+    <text class="box-title" x="101" y="586">GPU · common-points MSM</text>
+    <text class="box-body" x="101" y="610">B = P1 + domain·Q1 + ΣmᵢHᵢ</text>
+    <text class="small" x="101" y="630">comb8/9/10 · GLV · large/universal</text>
+    <rect x="80" y="664" width="352" height="78" rx="14" fill="url(#gpu)" stroke="#34d399"/>
+    <text class="box-title" x="101" y="692">GPU · scaled B → A</text>
+    <text class="box-body" x="101" y="716">device row scale + MSM output</text>
+    <rect x="80" y="770" width="352" height="102" rx="14" fill="url(#host)" stroke="#60a5fa"/>
+    <text class="box-title" x="101" y="798">HOST · 协议收尾</text>
+    <text class="box-body" x="101" y="822">deterministic e（默认 CPU）</text>
+    <text class="box-body" x="101" y="844">batch inversion · encode 80 bytes</text>
+    <text class="eq" x="101" y="865">A = B / (SK + e)</text>
+
+    <!-- verify -->
+    <rect x="487" y="379" width="396" height="520" rx="22" fill="#0c1f35" stroke="#36caa0" stroke-width="1.5"/>
+    <rect x="487" y="379" width="396" height="63" rx="22" fill="#0d3b39"/>
+    <text class="lane-title" x="511" y="411">2 · Verify Signature</text>
+    <text class="lane-sub" x="511" y="431">完整消息签名验证</text>
+    <rect x="509" y="464" width="352" height="72" rx="14" fill="url(#gpu)" stroke="#34d399"/>
+    <text class="box-title" x="530" y="492">GPU · message → Fr + B MSM</text>
+    <text class="box-body" x="530" y="516">共享 generator table / prepared B cache</text>
+    <rect x="509" y="558" width="352" height="84" rx="14" fill="url(#gpu)" stroke="#34d399"/>
+    <text class="box-title" x="530" y="586">GPU · B − eA / aggregate G1</text>
+    <text class="box-body" x="530" y="610">fresh non-zero coefficients</text>
+    <text class="small" x="530" y="630">large batch specialized GLV path</text>
+    <rect x="509" y="664" width="352" height="78" rx="14" fill="url(#gpu)" stroke="#34d399"/>
+    <text class="box-title" x="530" y="692">GPU · pairing（收益足够时）</text>
+    <text class="box-body" x="530" y="716">CUDA Miller loop + final exponent</text>
+    <rect x="509" y="770" width="352" height="102" rx="14" fill="url(#host)" stroke="#60a5fa"/>
+    <text class="box-title" x="530" y="798">HOST · 安全判定</text>
+    <text class="box-body" x="530" y="822">small batch BLST · aggregate fail → per-item</text>
+    <text class="eq" x="530" y="847">e(A,W+eP2) = e(B,P2)</text>
+    <text class="small" x="530" y="867">逐项结果和输入顺序保持不变</text>
+
+    <!-- proof gen -->
+    <rect x="916" y="379" width="396" height="520" rx="22" fill="#0c1f35" stroke="#36caa0" stroke-width="1.5"/>
+    <rect x="916" y="379" width="396" height="63" rx="22" fill="#0d3b39"/>
+    <text class="lane-title" x="940" y="411">3 · ProofGen</text>
+    <text class="lane-sub" x="940" y="431">随机化选择性披露证明</text>
+    <rect x="938" y="464" width="352" height="72" rx="14" fill="url(#gpu)" stroke="#34d399"/>
+    <text class="box-title" x="959" y="492">GPU · message → Fr + B MSM</text>
+    <text class="box-body" x="959" y="516">exact-key B/A cache · common points</text>
+    <rect x="938" y="558" width="352" height="84" rx="14" fill="url(#gpu)" stroke="#34d399"/>
+    <text class="box-title" x="959" y="586">GPU · fixed/variable radix16</text>
+    <text class="box-body" x="959" y="610">D · Abar · Bbar · T1</text>
+    <text class="small" x="959" y="630">packed-warp / multiple workspaces</text>
+    <rect x="938" y="664" width="352" height="78" rx="14" fill="url(#gpu)" stroke="#34d399"/>
+    <text class="box-title" x="959" y="692">GPU · hidden-message T2 MSM</text>
+    <text class="box-body" x="959" y="716">common generators + variable D point</text>
+    <rect x="938" y="770" width="352" height="102" rx="14" fill="url(#host)" stroke="#60a5fa"/>
+    <text class="box-title" x="959" y="798">HOST · 零知识协议收尾</text>
+    <text class="box-body" x="959" y="822">fresh CSPRNG · transcript · challenge</text>
+    <text class="box-body" x="959" y="844">responses · proof encoding</text>
+    <text class="small" x="959" y="866">随机数绝不跨 proof 重用</text>
+
+    <!-- proof verify -->
+    <rect x="1345" y="379" width="397" height="520" rx="22" fill="#0c1f35" stroke="#36caa0" stroke-width="1.5"/>
+    <rect x="1345" y="379" width="397" height="63" rx="22" fill="#0d3b39"/>
+    <text class="lane-title" x="1369" y="411">4 · ProofVerify</text>
+    <text class="lane-sub" x="1369" y="431">公开消息 + 隐藏 witness 的知识证明</text>
+    <rect x="1367" y="464" width="353" height="72" rx="14" fill="url(#gpu)" stroke="#34d399"/>
+    <text class="box-title" x="1388" y="492">GPU · disclosed message → Fr</text>
+    <text class="box-body" x="1388" y="516">domain / prepared-state reuse</text>
+    <rect x="1367" y="558" width="353" height="84" rx="14" fill="url(#gpu)" stroke="#34d399"/>
+    <text class="box-title" x="1388" y="586">GPU · fused T1′ / T2′ pair</text>
+    <text class="box-body" x="1388" y="610">signed-radix16 · GLV · split variable term</text>
+    <text class="small" x="1388" y="630">当前 GPU gate：至少 2 条隐藏消息</text>
+    <rect x="1367" y="664" width="353" height="78" rx="14" fill="url(#gpu)" stroke="#34d399"/>
+    <text class="box-title" x="1388" y="692">GPU · pairing（收益足够时）</text>
+    <text class="box-body" x="1388" y="716">Abar / Bbar randomized-signature equation</text>
+    <rect x="1367" y="770" width="353" height="102" rx="14" fill="url(#host)" stroke="#60a5fa"/>
+    <text class="box-title" x="1388" y="798">HOST · 双条件判定</text>
+    <text class="eq" x="1388" y="823">c′ = c</text>
+    <text class="eq" x="1388" y="846">e(Abar,W) = e(Bbar,P2)</text>
+    <text class="small" x="1388" y="867">near-full disclosure shape → CPU verifier</text>
+  </g>
+
+  <!-- arrows inside panels -->
+  <g stroke="#34d399" stroke-width="2" marker-end="url(#arrowGreen)">
+    <path d="M256 536 V550"/><path d="M256 642 V656"/><path d="M256 742 V762"/>
+    <path d="M685 536 V550"/><path d="M685 642 V656"/><path d="M685 742 V762"/>
+    <path d="M1114 536 V550"/><path d="M1114 642 V656"/><path d="M1114 742 V762"/>
+    <path d="M1544 536 V550"/><path d="M1544 642 V656"/><path d="M1544 742 V762"/>
+  </g>
+  <g stroke="#60a5fa" stroke-width="2" opacity=".85">
+    <path d="M256 341 V370"/><path d="M685 341 V370"/><path d="M1114 341 V370"/><path d="M1544 341 V370"/>
+  </g>
+
+  <!-- fallback + output -->
+  <g filter="url(#shadow)">
+    <rect x="58" y="936" width="1110" height="82" rx="17" fill="#372518" stroke="#fb923c" stroke-width="1.5"/>
+    <rect x="76" y="953" width="153" height="25" rx="12" fill="#c2410c"/><text class="tag" x="94" y="970">SAFE FALLBACK</text>
+    <text class="box-title" x="251" y="969">BLST / zkryptium CPU reference</text>
+    <text class="box-body" x="251" y="994">点解码与 subgroup check · 小 batch pairing · 不支持 shape · GPU 错误回退 · 逐项定位</text>
+
+    <rect x="1200" y="936" width="542" height="82" rx="17" fill="#15243a" stroke="#64748b"/>
+    <text class="box-title" x="1224" y="969">关键架构事实</text>
+    <text class="box-body" x="1224" y="994">GPU 是 primitive accelerator；host 仍是协议与安全判定 authority</text>
+
+    <rect x="58" y="1055" width="1684" height="82" rx="20" fill="url(#purple)" stroke="#c084fc" stroke-width="1.6"/>
+    <text class="lane-title" x="84" y="1088">统一输出与正确性不变量</text>
+    <text class="box-body" x="84" y="1115">Sign / ProofGen → 标准 signature、proofValue　　Verify / ProofVerify → ordered true|false　　CPU 与 GPU 检查相同 BBS 等式和 wire format</text>
+  </g>
+  <path d="M613 1018 V1047" stroke="#fb923c" stroke-width="2.5" marker-end="url(#arrowOrange)"/>
+  <path d="M1471 1018 V1047" stroke="#60a5fa" stroke-width="2.5" marker-end="url(#arrowBlue)"/>
+
+  <text class="small" x="58" y="1164">cuBBS-Cred ABI v2 · current hybrid design · routes and gates are runtime/configuration dependent; diagram shows production ownership and correctness boundaries.</text>
+</svg>

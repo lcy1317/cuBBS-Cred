@@ -1,0 +1,99 @@
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "fontFamily": "Times New Roman",
+    "fontSize": "12px",
+    "primaryTextColor": "#172033",
+    "lineColor": "#516782",
+    "clusterBkg": "#FAFBFD",
+    "clusterBorder": "#718096"
+  },
+  "flowchart": {
+    "curve": "linear",
+    "htmlLabels": true,
+    "nodeSpacing": 28,
+    "rankSpacing": 34
+  }
+}}%%
+flowchart TD
+  client["Client sends a synchronous HTTP request"] --> router["Axum route selection and JSON parsing"]
+  router --> valid{"Request valid?"}
+  valid -- "No" --> http_error["Build HTTP error response"]
+  valid -- "Yes" --> input_mode{"Input path"}
+
+  subgraph host_in["CPU Host: request preparation and batching"]
+    input_mode -- "Standard W3C document" --> classify["Classify Sign, Verify, ProofGen, or ProofVerify"]
+    classify --> w3c_prepare["JSON-LD and RDFC preparation<br/>proof parsing and primitive lowering"]
+    w3c_prepare --> primitive["Typed BBS primitive request"]
+
+    input_mode -- "Managed VC identifier" --> lookup["Look up credential ID and disclosure profile"]
+    managed_store[("Managed VC store<br/>preprocessed primitive state and output template")]
+    lookup --> managed_store
+    managed_store --> primitive
+
+    primitive --> request_form{"Single item or HTTP bulk batch?"}
+    request_form -- "Single item" --> op_queue["Operation-specific queue<br/>coalesce concurrent requests"]
+    op_queue --> dispatch{"Batch full or coalescing window elapsed?"}
+    dispatch -- "Wait" --> op_queue
+    dispatch -- "Dispatch" --> pipeline_slot["Acquire bounded backend pipeline slot"]
+
+    request_form -- "Bulk batch" --> bulk_slot["Acquire managed bulk pipeline slot"]
+    pipeline_slot --> engine["BbsEngine batch API"]
+    bulk_slot --> engine
+  end
+
+  subgraph gpu["cuBBS-Cred GPU backend"]
+    engine --> planner["Shape-aware planner<br/>message count, disclosure layout, MSM terms"]
+    planner --> h2s["Hash-to-Scalar kernels"]
+    planner --> msm_class["G1 MSM classifier<br/>point reuse, K, and N"]
+    planner --> pairing["Pairing kernels<br/>Verify and ProofVerify only"]
+
+    msm_class --> route1["Route 1<br/>variable points"]
+    msm_class --> route2["Route 2<br/>common points"]
+    msm_class --> route3["Route 3<br/>large common points"]
+    msm_class --> route4["Route 4<br/>universal fallback"]
+    route1 --> msm_out["Shared MSM reduction and output packing"]
+    route2 --> msm_out
+    route3 --> msm_out
+    route4 --> msm_out
+
+    h2s --> typed_result["Typed device results"]
+    msm_out --> typed_result
+    pairing --> typed_result
+  end
+
+  subgraph host_out["CPU Host: protocol completion and response"]
+    typed_result --> finalize["Complete protocol dependencies<br/>assemble signature, proof, or verification result"]
+    finalize --> reorder["Restore original batch item order"]
+    reorder --> response_mode{"Response format"}
+    response_mode -- "Full" --> full_json["Serialize complete W3C JSON result"]
+    response_mode -- "Managed compact" --> compact_json["Serialize proofValue or verified vector"]
+  end
+
+  full_json --> http_ok["Return HTTP 200 on the original connection"]
+  compact_json --> http_ok
+  http_ok --> done(["Client receives the final result"])
+  http_error --> done
+
+  register["Trusted registration or preload"] -. "prepare once" .-> managed_store
+  lookup -. "not found" .-> http_error
+  w3c_prepare -. "invalid document" .-> http_error
+  engine -. "backend failure" .-> http_error
+
+  classDef client fill:#EAF2F8,stroke:#35658A,color:#172033,stroke-width:1.4px
+  classDef host fill:#EDF3F8,stroke:#56728E,color:#172033,stroke-width:1.2px
+  classDef cache fill:#FFF3D6,stroke:#B7791F,color:#4A3210,stroke-width:1.2px
+  classDef gpuCore fill:#E5F4EE,stroke:#23765A,color:#173E32,stroke-width:1.2px
+  classDef route fill:#F0F8F4,stroke:#23765A,color:#173E32,stroke-width:1.1px
+  classDef decision fill:#F1EAF5,stroke:#7B4B8A,color:#392243,stroke-width:1.2px
+  classDef result fill:#E9F1FB,stroke:#3B6D9A,color:#1D3D5C,stroke-width:1.2px
+  classDef error fill:#FBE9E7,stroke:#B44B3E,color:#652820,stroke-width:1.2px
+
+  class client,done client
+  class router,classify,w3c_prepare,primitive,lookup,op_queue,pipeline_slot,bulk_slot,engine,finalize,reorder host
+  class managed_store cache
+  class planner,h2s,msm_class,pairing,msm_out,typed_result gpuCore
+  class route1,route2,route3,route4 route
+  class valid,input_mode,request_form,dispatch,response_mode decision
+  class full_json,compact_json,http_ok result
+  class http_error error

@@ -1,0 +1,98 @@
+{
+  "schemaVersion": 1,
+  "sourceRevision": "7a0926b6b9b8146c9c30ce26571df57af1778021",
+  "w3cImplementations": [
+    {
+      "id": "digitalbazaar-bbs-2023-cryptosuite",
+      "sourcePath": "ref/implementations/bbs-2023-cryptosuite",
+      "version": "2.0.2-0",
+      "language": "JavaScript",
+      "operations": {
+        "issue": true,
+        "verifyBase": false,
+        "derive": true,
+        "verifyDerived": true
+      },
+      "credentialBatchApi": false,
+      "crossRequestBatchScheduler": false,
+      "correctness": {
+        "status": "passed",
+        "testsPassed": 62,
+        "testsFailed": 0,
+        "command": "NODE_OPTIONS=--experimental-global-webcrypto npm test"
+      },
+      "performanceResult": null
+    },
+    {
+      "id": "grotto-bbs-vc-library",
+      "sourcePath": "ref/implementations/grotto-bbs-vc-library",
+      "version": "0.1.0",
+      "language": "JavaScript",
+      "operations": {
+        "issue": true,
+        "verifyBase": true,
+        "derive": true,
+        "verifyDerived": true
+      },
+      "credentialBatchApi": false,
+      "crossRequestBatchScheduler": false,
+      "correctness": {
+        "status": "passed",
+        "testsPassed": 28,
+        "testsFailed": 0,
+        "command": "npm ci && npm test"
+      },
+      "performanceResult": null
+    },
+    {
+      "id": "spruceid-ssi",
+      "sourcePath": "ref/implementations/spruceid-ssi",
+      "version": "0.4.0",
+      "language": "Rust",
+      "operations": {
+        "issue": true,
+        "verifyBase": false,
+        "derive": true,
+        "verifyDerived": true
+      },
+      "credentialBatchApi": false,
+      "crossRequestBatchScheduler": false,
+      "correctness": {
+        "status": "passed",
+        "testsPassed": 8,
+        "testsFailed": 0,
+        "command": "cargo test -p ssi-data-integrity-suites --features 'w3c,bbs' bbs_2023 --lib"
+      },
+      "performanceResult": null
+    },
+    {
+      "id": "procivis-one-open-core",
+      "sourcePath": "ref/implementations/procivis-one-open-core",
+      "version": "0.1.0",
+      "language": "Rust",
+      "operations": {
+        "issue": true,
+        "verifyBase": false,
+        "derive": true,
+        "verifyDerived": true
+      },
+      "credentialBatchApi": false,
+      "crossRequestBatchScheduler": false,
+      "correctness": {
+        "status": "blocked-dependency",
+        "testsPassed": 0,
+        "testsFailed": 0,
+        "command": "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p one-providers json_ld_bbsplus --lib",
+        "blocker": "The pinned pairing_crypto revision 517a424a989b57b987aacb3642bd7cd2c60b94d1 could not be fetched from https://github.com/Iskander508/pairing_crypto."
+      },
+      "performanceResult": null
+    }
+  ],
+  "conclusion": {
+    "implementationCount": 4,
+    "runnableCorrectnessCount": 3,
+    "benchmarkedCount": 0,
+    "credentialBatchApiCount": 0,
+    "crossRequestBatchSchedulerCount": 0
+  }
+}

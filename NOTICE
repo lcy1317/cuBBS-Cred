@@ -1,0 +1,20 @@
+cuBBS-Cred
+
+This product is licensed under the Apache License, Version 2.0, and includes
+or builds against third-party software:
+
+* ZKryptium, Copyright 2023 and 2025 Fondazione LINKS / LINKS Foundation.
+  The modified protocol crate in crates/cubbs-bbs-protocol retains the
+  upstream Apache-2.0 license and copyright notices.
+* BLST, Copyright Supranational LLC, licensed under Apache-2.0.
+* SPPARK, Copyright Supranational LLC, licensed under Apache-2.0.
+* CFRG BBS conformance material from decentralized-identity/bbs-signature,
+  licensed under Apache-2.0 in the bundled snapshot.
+* W3C Verifiable Credentials, Data Integrity, and Verifiable Driver's License
+  JSON-LD contexts embedded in the service. The copies, provenance, formatting
+  changes, and applicable W3C/Apache notices are recorded in
+  crates/cubbs-vc-di-bbs/src/contexts/NOTICE.md.
+
+See THIRD_PARTY.md for component boundaries, upstream locations, benchmark-only
+references, and binary-distribution requirements. This NOTICE is informational
+and does not replace the license terms of any component.

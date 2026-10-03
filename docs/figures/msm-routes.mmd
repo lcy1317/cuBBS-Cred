@@ -1,0 +1,92 @@
+flowchart TB
+  title["cuBBS-Cred · Route 1–4 在四操作中的位置"]
+  subtitle["ABI v2 production routes · 只调度 G1 MSM，不代表四个操作编号"]
+  title --> subtitle
+
+  subgraph protocol["BBS protocol plane · Rust host 拆解四操作"]
+    direction LR
+    sign["SIGN<br/>B / A common-generator MSM"]
+    verify["VERIFY<br/>B MSM<br/>B − eA variable/fused MSM"]
+    proofgen["PROOF GEN<br/>B + hidden T2 common MSM<br/>D/Abar/Bbar/T1 variable MSM"]
+    proofverify["PROOF VERIFY<br/>T1′/T2′ paired MSM<br/>common + proof-specific points"]
+  end
+
+  subtitle --> protocol
+  sign --> jobs
+  verify --> jobs
+  proofgen --> jobs
+  proofverify --> jobs
+
+  jobs["Canonical G1 MSM jobs<br/>points · scalar rows · term count · output count"]
+
+  subgraph dispatcher["CUDA ABI v2 · cuBBS-Cred MSM dispatcher"]
+    direction TB
+    classify{"Point layout / shape?"}
+    variable["Variable or fused item<br/>每项 points 不同 · 1/2/3-term 等专用 shape"]
+    common["Common points matrix<br/>同一 Hᵢ / generator table · 多 scalar rows"]
+    other["Untuned / mixed / oversized<br/>仍要求生产 CUDA 覆盖"]
+    route1["ROUTE 1 · cuBBS-Cred Item<br/>specialized variable/fused item MSM"]
+    route2["ROUTE 2 · cuBBS-Cred Common<br/>tuned common-points / fixed-base batch"]
+    route3["ROUTE 3 · cuBBS-Cred Large<br/>large-shape tiled GLV/window-4"]
+    route4["ROUTE 4 · cuBBS-Cred Universal<br/>bounded common-points or variable-base fallback"]
+
+    classify -- "specialized item" --> variable
+    classify -- "common + tuned" --> common
+    classify -- "otherwise" --> other
+    variable --> route1
+    common -- "normal tuned shape" --> route2
+    common -- "large term count" --> route3
+    other --> route4
+    variable -. "unsupported specialized shape" .-> route4
+    common -. "not in tuned tables" .-> route4
+  end
+
+  jobs --> classify
+  route1 --> g1out
+  route2 --> g1out
+  route3 --> g1out
+  route4 --> g1out
+  g1out["Compressed G1 result(s)<br/>B · A · T1/T2 · T1′/T2′ · aggregate terms"]
+
+  subgraph outside["同一四操作的其他阶段 · 不属于 Route 1–4"]
+    direction LR
+    hash["message → Fr<br/>SHA-256/XMD/H2S"]
+    pairing["pairing equation<br/>CUDA when profitable / BLST fallback"]
+    final["host protocol finalization<br/>challenge · responses · encode · final boolean"]
+  end
+
+  g1out --> pairing
+  g1out --> final
+  hash -. "为 MSM 提供 scalars" .-> jobs
+  pairing --> final
+
+  note["生产自动选择仅 Route 1–4<br/>Route 5/6 = BLST 显式 fallback/benchmark<br/>Route 7/8 = SPPARK reference benchmark only"]
+  dispatcher -. "ABI v2 policy" .-> note
+  legend["选择原则<br/>Route 1：item/fused 专用<br/>Route 2：常规 common-points 吞吐<br/>Route 3：large shape 吞吐<br/>Route 4：完整 CUDA 覆盖兜底"]
+  dispatcher -.-> legend
+
+  classDef heading fill:#071a2e,stroke:#60a5fa,color:#ffffff,stroke-width:2px
+  classDef op fill:#11345a,stroke:#60a5fa,color:#eff6ff,stroke-width:2px
+  classDef input fill:#172a46,stroke:#93c5fd,color:#eff6ff,stroke-width:2px
+  classDef decision fill:#3b285f,stroke:#c084fc,color:#faf5ff,stroke-width:2px
+  classDef kind fill:#163b3a,stroke:#5eead4,color:#ecfeff,stroke-width:2px
+  classDef r1 fill:#064e3b,stroke:#34d399,color:#ecfdf5,stroke-width:3px
+  classDef r2 fill:#075985,stroke:#38bdf8,color:#f0f9ff,stroke-width:3px
+  classDef r3 fill:#5b3a08,stroke:#fbbf24,color:#fffbeb,stroke-width:3px
+  classDef r4 fill:#5b2132,stroke:#fb7185,color:#fff1f2,stroke-width:3px
+  classDef outside fill:#3f2a16,stroke:#fb923c,color:#fff7ed,stroke-width:2px
+  classDef result fill:#35205d,stroke:#c084fc,color:#faf5ff,stroke-width:2px
+  classDef noteStyle fill:#1f2937,stroke:#94a3b8,color:#f8fafc,stroke-width:1.5px
+
+  class title,subtitle heading
+  class sign,verify,proofgen,proofverify op
+  class jobs input
+  class classify decision
+  class variable,common,other kind
+  class route1 r1
+  class route2 r2
+  class route3 r3
+  class route4 r4
+  class hash,pairing,final outside
+  class g1out result
+  class note,legend noteStyle

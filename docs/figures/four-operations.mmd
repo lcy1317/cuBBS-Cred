@@ -1,0 +1,83 @@
+flowchart TB
+  client["HTTP clients / W3C test suite"] --> api["cubbs-w3c-service<br/>concurrency + micro-batch + backpressure"]
+  api --> rdf["CPU · W3C/Data Integrity<br/>JSON-LD → RDFC → N-Quads → header/messages"]
+  rdf --> engine["Rust host · BbsEngine<br/>protocol state + validation + ordered results"]
+  engine --> bucket["Full cryptographic shape key<br/>operation · PK · header · L · disclosed indexes · ph"]
+
+  subgraph gpu["cuBBS-Cred CUDA primitive plane · ABI v2 hybrid backend"]
+    direction LR
+
+    subgraph sign["1 · Sign"]
+      s1["message → Fr"] --> s2["packed scalar rows"]
+      s2 --> s3["route 1–4<br/>common-points MSM"]
+      s3 --> s4["A points"]
+    end
+
+    subgraph verify["2 · Verify Signature"]
+      v1["message → Fr"] --> v2["B MSM"]
+      v2 --> v3["B − eA / aggregate G1"]
+      v3 --> v4["CUDA pairing<br/>when profitable"]
+    end
+
+    subgraph proofgen["3 · ProofGen"]
+      g1["message → Fr"] --> g2["B MSM"]
+      g2 --> g3["D · Abar · Bbar · T1<br/>fixed/variable radix16"]
+      g3 --> g4["T2 hidden-message MSM"]
+    end
+
+    subgraph proofverify["4 · ProofVerify"]
+      p1["disclosed message → Fr"] --> p2["fused T1/T2 paired MSM"]
+      p2 --> p3["signed-radix16 / GLV"]
+      p3 --> p4["CUDA pairing<br/>when profitable"]
+    end
+  end
+
+  bucket --> s1
+  bucket --> v1
+  bucket --> g1
+  bucket --> p1
+
+  subgraph hostfinal["Protocol finalization and security decision · host"]
+    direction LR
+    sf["Sign<br/>batch inversion / encode (A,e)"]
+    vf["Verify<br/>pairing fallback + per-item retry"]
+    gf["ProofGen<br/>CSPRNG + challenge + responses + proof encode"]
+    pf["ProofVerify<br/>recompute c′; require c′=c + pairing"]
+  end
+
+  s4 --> sf
+  v4 --> vf
+  g4 --> gf
+  p4 --> pf
+
+  blst["BLST / zkryptium CPU<br/>validation · small pairing · unsupported shape · correctness fallback"]
+  bucket -. fallback .-> blst
+  blst --> sf
+  blst --> vf
+  blst --> gf
+  blst --> pf
+
+  sf --> output["W3C proofValue / true|false<br/>original request order restored"]
+  vf --> output
+  gf --> output
+  pf --> output
+
+  routes["Production MSM route registry<br/>1 cuBBS-Cred item · 2 common-points · 3 large · 4 universal<br/>5/6 BLST fallback · 7/8 reference benchmark only"]
+  routes -. dispatch policy .-> gpu
+
+  invariant["Invariant<br/>CPU and GPU check the same BBS equations and wire formats"]
+  output --> invariant
+
+  classDef ingress fill:#dbeafe,stroke:#2563eb,color:#172554,stroke-width:2px
+  classDef host fill:#172a46,stroke:#60a5fa,color:#eff6ff,stroke-width:2px
+  classDef kernel fill:#083c35,stroke:#34d399,color:#ecfdf5,stroke-width:2px
+  classDef fallback fill:#4a2a13,stroke:#fb923c,color:#fff7ed,stroke-width:2px
+  classDef result fill:#35205d,stroke:#c084fc,color:#faf5ff,stroke-width:2px
+  classDef note fill:#1f2937,stroke:#94a3b8,color:#f8fafc,stroke-width:1.5px
+
+  class client,api,rdf ingress
+  class engine,bucket,sf,vf,gf,pf host
+  class s1,s2,s3,s4,v1,v2,v3,v4,g1,g2,g3,g4,p1,p2,p3,p4 kernel
+  class blst fallback
+  class output,invariant result
+  class routes note

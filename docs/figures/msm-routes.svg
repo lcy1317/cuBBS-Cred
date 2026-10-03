@@ -1,0 +1,154 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1060" viewBox="0 0 1600 1060" role="img" aria-labelledby="title desc">
+  <title id="title">cuBBS-Cred Route 1–4 在四操作中的位置</title>
+  <desc id="desc">Sign、Verify、ProofGen、ProofVerify 产生 G1 MSM jobs，CUDA ABI v2 dispatcher 根据 points 布局和 shape 选择 cuBBS-Cred Route 1 至 4。Route 不包含消息哈希、pairing 和 host finalization。</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#061525"/>
+      <stop offset="1" stop-color="#0b2135"/>
+    </linearGradient>
+    <linearGradient id="panel" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d2942"/>
+      <stop offset="1" stop-color="#102f48"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#020617" flood-opacity="0.48"/>
+    </filter>
+    <marker id="arrowBlue" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#60a5fa"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#34d399"/>
+    </marker>
+    <marker id="arrowOrange" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#fb923c"/>
+    </marker>
+    <style>
+      .title { font: 700 34px Inter, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #f8fafc; }
+      .subtitle { font: 400 17px Inter, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #a9c7e8; }
+      .section { font: 700 17px Inter, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #dbeafe; letter-spacing: .4px; }
+      .cardTitle { font: 700 18px Inter, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #fff; }
+      .body { font: 400 14px Inter, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #cbd5e1; }
+      .small { font: 400 13px Inter, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #a9c7e8; }
+      .routeNo { font: 800 25px Inter, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #fff; }
+      .routeName { font: 700 16px Inter, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #fff; }
+      .routeBody { font: 400 13px Inter, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #e2e8f0; }
+      .pill { font: 700 12px Inter, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #071525; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1060" fill="url(#bg)"/>
+  <circle cx="1460" cy="70" r="230" fill="#0ea5e9" opacity=".06"/>
+  <circle cx="120" cy="970" r="270" fill="#34d399" opacity=".05"/>
+
+  <text class="title" x="60" y="62">cuBBS-Cred · Route 1–4 在四操作中的位置</text>
+  <text class="subtitle" x="60" y="92">ABI v2 production route 只负责 G1 MSM kernel 选择；它不是四个 BBS 操作的编号</text>
+  <rect x="1320" y="42" width="220" height="42" rx="21" fill="#12395b" stroke="#60a5fa"/>
+  <text class="section" x="1430" y="69" text-anchor="middle">CUDA PRODUCTION</text>
+
+  <text class="section" x="60" y="140">① 四操作产生不同的 MSM 工作</text>
+  <g filter="url(#shadow)">
+    <rect x="60" y="162" width="350" height="126" rx="18" fill="#11345a" stroke="#60a5fa" stroke-width="2"/>
+    <rect x="437" y="162" width="350" height="126" rx="18" fill="#11345a" stroke="#60a5fa" stroke-width="2"/>
+    <rect x="814" y="162" width="350" height="126" rx="18" fill="#11345a" stroke="#60a5fa" stroke-width="2"/>
+    <rect x="1191" y="162" width="349" height="126" rx="18" fill="#11345a" stroke="#60a5fa" stroke-width="2"/>
+  </g>
+  <text class="cardTitle" x="84" y="197">SIGN</text>
+  <text class="body" x="84" y="226">B / A common-generator MSM</text>
+  <text class="small" x="84" y="252">同一 generator table · 多 scalar rows</text>
+  <text class="cardTitle" x="461" y="197">VERIFY</text>
+  <text class="body" x="461" y="226">B MSM · B − eA variable/fused MSM</text>
+  <text class="small" x="461" y="252">common + proof-specific points</text>
+  <text class="cardTitle" x="838" y="197">PROOF GEN</text>
+  <text class="body" x="838" y="226">B / hidden T2 · D/Abar/Bbar/T1</text>
+  <text class="small" x="838" y="252">common MSM + variable point multiplication</text>
+  <text class="cardTitle" x="1215" y="197">PROOF VERIFY</text>
+  <text class="body" x="1215" y="226">fused T1′ / T2′ paired MSM</text>
+  <text class="small" x="1215" y="252">common generators + proof-specific points</text>
+
+  <path d="M235 288 V316 H800" fill="none" stroke="#60a5fa" stroke-width="2" opacity=".75"/>
+  <path d="M612 288 V316 H800" fill="none" stroke="#60a5fa" stroke-width="2" opacity=".75"/>
+  <path d="M989 288 V316 H800" fill="none" stroke="#60a5fa" stroke-width="2" opacity=".75"/>
+  <path d="M1365 288 V316 H800" fill="none" stroke="#60a5fa" stroke-width="2" opacity=".75"/>
+  <path d="M800 316 V344" fill="none" stroke="#60a5fa" stroke-width="3" marker-end="url(#arrowBlue)"/>
+
+  <rect x="505" y="346" width="590" height="56" rx="16" fill="#172a46" stroke="#93c5fd" stroke-width="2"/>
+  <text class="cardTitle" x="800" y="372" text-anchor="middle">Canonical G1 MSM jobs</text>
+  <text class="small" x="800" y="392" text-anchor="middle">points · scalar rows · term count · output count · shape metadata</text>
+
+  <rect x="60" y="430" width="1480" height="414" rx="24" fill="url(#panel)" stroke="#2dd4bf" stroke-width="2" filter="url(#shadow)"/>
+  <rect x="60" y="430" width="1480" height="54" rx="24" fill="#0b403d"/>
+  <path d="M60 460 Q60 484 84 484 H1516 Q1540 484 1540 460" fill="#0b403d"/>
+  <text class="section" x="88" y="465">② CUDA ABI v2 · cuBBS-Cred G1 MSM dispatcher</text>
+  <rect x="1270" y="443" width="240" height="28" rx="14" fill="#34d399"/>
+  <text class="pill" x="1390" y="462" text-anchor="middle">AUTO SELECT: ROUTE 1–4 ONLY</text>
+
+  <rect x="92" y="520" width="320" height="118" rx="17" fill="#163b3a" stroke="#5eead4" stroke-width="2"/>
+  <text class="cardTitle" x="116" y="555">COMMON-POINTS MATRIX</text>
+  <text class="body" x="116" y="584">同一 Hᵢ / generator table</text>
+  <text class="body" x="116" y="608">对应多个 scalar rows</text>
+
+  <rect x="92" y="675" width="320" height="118" rx="17" fill="#163b3a" stroke="#5eead4" stroke-width="2"/>
+  <text class="cardTitle" x="116" y="710">VARIABLE / FUSED ITEM</text>
+  <text class="body" x="116" y="739">每项 points 不同</text>
+  <text class="body" x="116" y="763">1/2/3-term 等专用 shape</text>
+
+  <path d="M412 579 H466" fill="none" stroke="#34d399" stroke-width="3" marker-end="url(#arrowGreen)"/>
+  <path d="M412 734 H466" fill="none" stroke="#34d399" stroke-width="3" marker-end="url(#arrowGreen)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="478" y="510" width="300" height="128" rx="17" fill="#075985" stroke="#38bdf8" stroke-width="3"/>
+    <rect x="800" y="510" width="300" height="128" rx="17" fill="#5b3a08" stroke="#fbbf24" stroke-width="3"/>
+    <rect x="478" y="664" width="300" height="128" rx="17" fill="#064e3b" stroke="#34d399" stroke-width="3"/>
+    <rect x="800" y="664" width="300" height="128" rx="17" fill="#5b2132" stroke="#fb7185" stroke-width="3"/>
+  </g>
+  <text class="routeNo" x="502" y="547">ROUTE 2</text>
+  <text class="routeName" x="502" y="575">cuBBS-Cred Common</text>
+  <text class="routeBody" x="502" y="603">tuned common-points</text>
+  <text class="routeBody" x="502" y="623">fixed-base batch throughput</text>
+  <text class="routeNo" x="824" y="547">ROUTE 3</text>
+  <text class="routeName" x="824" y="575">cuBBS-Cred Large</text>
+  <text class="routeBody" x="824" y="603">large-shape tiled</text>
+  <text class="routeBody" x="824" y="623">GLV / window-4</text>
+  <text class="routeNo" x="502" y="701">ROUTE 1</text>
+  <text class="routeName" x="502" y="729">cuBBS-Cred Item</text>
+  <text class="routeBody" x="502" y="757">specialized variable / fused</text>
+  <text class="routeBody" x="502" y="777">item MSM</text>
+  <text class="routeNo" x="824" y="701">ROUTE 4</text>
+  <text class="routeName" x="824" y="729">cuBBS-Cred Universal</text>
+  <text class="routeBody" x="824" y="757">bounded common or variable</text>
+  <text class="routeBody" x="824" y="777">untuned-shape CUDA fallback</text>
+
+  <text class="small" x="470" y="503">normal tuned shape</text>
+  <text class="small" x="799" y="503">large term count</text>
+  <text class="small" x="470" y="657">specialized item</text>
+  <text class="small" x="799" y="657">otherwise / oversized</text>
+
+  <path d="M778 574 H1122" fill="none" stroke="#34d399" stroke-width="2.5"/>
+  <path d="M1100 574 H1122" fill="none" stroke="#34d399" stroke-width="2.5"/>
+  <path d="M778 728 H1122" fill="none" stroke="#34d399" stroke-width="2.5"/>
+  <path d="M1100 728 H1122" fill="none" stroke="#34d399" stroke-width="2.5"/>
+  <path d="M1122 574 V728" fill="none" stroke="#34d399" stroke-width="2.5"/>
+  <path d="M1122 651 H1162" fill="none" stroke="#34d399" stroke-width="3" marker-end="url(#arrowGreen)"/>
+
+  <rect x="1174" y="562" width="332" height="176" rx="18" fill="#35205d" stroke="#c084fc" stroke-width="2"/>
+  <text class="cardTitle" x="1198" y="601">G1 RESULT(S)</text>
+  <text class="body" x="1198" y="633">B · A · aggregate G1 terms</text>
+  <text class="body" x="1198" y="659">T1 / T2 · T1′ / T2′</text>
+  <line x1="1198" y1="681" x2="1480" y2="681" stroke="#a78bfa" opacity=".5"/>
+  <text class="small" x="1198" y="707">返回原四操作继续协议流程</text>
+
+  <text class="section" x="60" y="886">③ Route 边界之外：仍属于四操作，但不由 Route 1–4 调度</text>
+  <rect x="60" y="908" width="430" height="104" rx="17" fill="#3f2a16" stroke="#fb923c" stroke-width="2"/>
+  <rect x="585" y="908" width="430" height="104" rx="17" fill="#3f2a16" stroke="#fb923c" stroke-width="2"/>
+  <rect x="1110" y="908" width="430" height="104" rx="17" fill="#3f2a16" stroke="#fb923c" stroke-width="2"/>
+  <text class="cardTitle" x="84" y="944">message → Fr</text>
+  <text class="body" x="84" y="974">SHA-256 / XMD / H2S · 为 MSM 准备 scalars</text>
+  <text class="cardTitle" x="609" y="944">pairing equation</text>
+  <text class="body" x="609" y="974">CUDA when profitable · small batch 可用 BLST</text>
+  <text class="cardTitle" x="1134" y="944">host protocol finalization</text>
+  <text class="body" x="1134" y="974">challenge · responses · encode · final boolean</text>
+  <path d="M490 960 H574" fill="none" stroke="#fb923c" stroke-width="2.5" marker-end="url(#arrowOrange)"/>
+  <path d="M1015 960 H1099" fill="none" stroke="#fb923c" stroke-width="2.5" marker-end="url(#arrowOrange)"/>
+
+  <text class="small" x="60" y="1040">ABI v2 policy: Route 5/6 是显式 BLST fallback/benchmark；Route 7/8 是可选 SPPARK reference benchmark，均不是生产自动 GPU route。</text>
+</svg>

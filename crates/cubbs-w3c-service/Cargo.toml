@@ -1,0 +1,17 @@
+[package]
+name = "cubbs-w3c-service"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+axum.workspace = true
+base64.workspace = true
+bs58.workspace = true
+cubbs-bbs = { path = "../cubbs-bbs" }
+cubbs-vc-di-bbs = { path = "../cubbs-vc-di-bbs" }
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }

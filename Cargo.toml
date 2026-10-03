@@ -1,0 +1,55 @@
+[workspace]
+members = [
+    "benchmarks/gpu-ceiling",
+    "crates/cubbs-bbs",
+    "crates/cubbs-bbs-protocol",
+    "crates/cubbs-bbs-gpu-abi-smoke",
+    "crates/cubbs-bbs-proofvalue",
+    "crates/cubbs-bench",
+    "crates/cubbs-vc-di-bbs",
+    "crates/cubbs-w3c-service",
+]
+default-members = [
+    "crates/cubbs-bbs",
+    "crates/cubbs-bbs-protocol",
+    "crates/cubbs-bbs-proofvalue",
+    "crates/cubbs-vc-di-bbs",
+    "crates/cubbs-w3c-service",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/lcy1317/cuBBS-Cred"
+
+[workspace.dependencies]
+async-std = { version = "1.13", features = ["attributes"] }
+axum = "0.7"
+base64 = "0.22"
+bytes = "1"
+bls12_381_plus = "0.8.18"
+bs58 = "0.5"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+hmac = "0.12"
+futures = "0.3"
+iref = "3.1.2"
+json-ld = { version = "0.21.4", features = ["reqwest", "serde"] }
+json-syntax = { version = "0.12.5", features = ["serde_json"] }
+libloading = "0.8"
+cubbs_bbs_protocol = { package = "cubbs-bbs-protocol", path = "crates/cubbs-bbs-protocol", default-features = false, features = ["bbsplus"] }
+oxrdf = "0.2.4"
+oxttl = "0.1.8"
+rdf-canon = "0.15.3"
+rdf-types = "0.22.5"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+serde_cbor = "0.11"
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+zkryptium = "=0.2.2"
+zkryptium_061 = { package = "zkryptium", version = "=0.6.1", default-features = false, features = ["bbsplus"] }

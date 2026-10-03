@@ -1,0 +1,14 @@
+[package]
+name = "spruce-w3c-http"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+hyper = { version = "0.14.32", features = ["http1", "server", "tcp"] }
+serde_json = "1.0"
+ssi = { path = "../../../ref/implementations/spruceid-ssi", default-features = false, features = ["w3c", "bbs"] }
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread"] }
+
+[workspace]

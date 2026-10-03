@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "datasetId": "http-unique-10k-v1",
+  "description": "Deterministic unique W3C issue-request workload for sustained HTTP issue, base verify, derive, and disclosure-proof verify flows",
+  "entryCount": 10000,
+  "issuerDistribution": {
+    "serviceLocalIssuer": 10000
+  },
+  "vcShapeDistribution": {
+    "exampleCredentialV1": 10000
+  },
+  "featureDistribution": {
+    "mandatoryIssuerAndSelectiveName": 10000
+  },
+  "generationSeed": 0,
+  "generationCommand": "w3c-http-load --generate-dataset benchmarks/w3c/datasets/http-unique-10k-v1/generated/issue-requests.jsonl --dataset-size 10000",
+  "generatedPath": "generated/issue-requests.jsonl",
+  "generatedSha256": "4aa117c74fbf1029f8d3f6b75a3c669b011dbe055bd5bd760cddc661ab1bbd4f",
+  "uniqueCredentialIds": true
+}

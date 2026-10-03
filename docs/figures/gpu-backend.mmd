@@ -1,0 +1,89 @@
+---
+config:
+  theme: base
+  fontFamily: 'Times New Roman, Times, serif'
+  themeVariables:
+    fontFamily: 'Times New Roman, Times, serif'
+    fontSize: 12pt
+    background: '#FFFFFF'
+    primaryTextColor: '#17212B'
+    lineColor: '#4B5563'
+  themeCSS: |
+    .nodeLabel, .edgeLabel, .cluster-label {
+      font-family: "Times New Roman", Times, serif !important;
+      font-size: 12pt !important;
+    }
+    .cluster-label { font-weight: 700 !important; }
+    .edgeLabel { background-color: #FFFFFF !important; }
+  flowchart:
+    curve: basis
+    nodeSpacing: 26
+    rankSpacing: 34
+---
+flowchart TB
+    host_in["CPU Host Boundary<br/>operation batching · protocol state"]
+
+    subgraph gpu["cuBBS-Cred GPU Backend"]
+      direction TB
+      dispatch["Submission Dispatcher<br/>validate · select engine · assign stream"]
+
+      h2s["H2S Engine<br/>SHA-256 / XMD · mod-r"]
+      h2s_out["$$\mathbb{F}_r$$ scalars"]
+      h2s --> h2s_out
+
+      subgraph msm["MSM Engine over $$\mathbb{G}_1$$"]
+        direction TB
+        classifier["Shape Classifier<br/>point layout · N · K · workspace"]
+        r1["R1<br/>variable / fused"]
+        r2["R2<br/>tuned common"]
+        r3["R3<br/>large / tiled"]
+        r4["R4<br/>universal CUDA"]
+        msm_out["Group reduction<br/>N outputs in $$\mathbb{G}_1$$"]
+        classifier --> r1
+        classifier --> r2
+        classifier --> r3
+        classifier --> r4
+        r1 --> msm_out
+        r2 --> msm_out
+        r3 --> msm_out
+        r4 --> msm_out
+      end
+
+      pairing["Pairing Engine<br/>batch / aggregate Miller loops"]
+      pairing_out["$$e:\mathbb{G}_1\times\mathbb{G}_2\rightarrow\mathbb{G}_T$$"]
+      pairing --> pairing_out
+
+      result["GPU Result Interface<br/>scalars · group points · pairing status"]
+      resources["Runtime Resources<br/>point tables · prepared $$\mathbb{G}_2$$ · buffers · streams · telemetry"]
+
+      dispatch -->|"H2S"| h2s
+      dispatch -->|"MSM"| classifier
+      dispatch -->|"Pairing"| pairing
+      h2s_out --> result
+      msm_out --> result
+      pairing_out --> result
+      resources -.-> h2s
+      resources -.-> classifier
+      resources -.-> pairing
+    end
+
+    host_out["CPU Host Boundary<br/>protocol continuation · finalization"]
+    host_in -->|"packed primitive batches"| dispatch
+    result -->|"stage results"| host_out
+
+    classDef hostStyle fill:#EAF0F6,color:#17212B,stroke:#1F4E79,stroke-width:1.5px,font-family:Times New Roman,font-size:12pt;
+    classDef interfaceStyle fill:#F3F4F6,color:#17212B,stroke:#5B6573,stroke-width:1.5px,font-family:Times New Roman,font-size:12pt;
+    classDef h2sStyle fill:#FFF3E0,color:#17212B,stroke:#A65E00,stroke-width:1.5px,font-family:Times New Roman,font-size:12pt;
+    classDef msmStyle fill:#E7F2ED,color:#17212B,stroke:#1F6F54,stroke-width:1.5px,font-family:Times New Roman,font-size:12pt;
+    classDef pairingStyle fill:#F2EAF4,color:#17212B,stroke:#77507D,stroke-width:1.5px,font-family:Times New Roman,font-size:12pt;
+    classDef runtimeStyle fill:#EEF2F7,color:#17212B,stroke:#68788A,stroke-width:1.5px,font-family:Times New Roman,font-size:12pt;
+
+    class host_in,host_out hostStyle;
+    class dispatch,result interfaceStyle;
+    class h2s,h2s_out h2sStyle;
+    class classifier,r1,r2,r3,r4,msm_out msmStyle;
+    class pairing,pairing_out pairingStyle;
+    class resources runtimeStyle;
+
+    style gpu fill:#FAFBFC,stroke:#1F4E79,stroke-width:2px,color:#17212B;
+    style msm fill:#FBFEFC,stroke:#1F6F54,stroke-width:1px,color:#17212B;

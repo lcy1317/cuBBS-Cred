@@ -1,0 +1,32 @@
+[package]
+name = "cubbs-vc-di-bbs"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64.workspace = true
+bs58.workspace = true
+chrono.workspace = true
+hmac.workspace = true
+futures.workspace = true
+iref.workspace = true
+json-ld.workspace = true
+json-syntax.workspace = true
+cubbs-bbs = { path = "../cubbs-bbs" }
+cubbs-bbs-proofvalue = { path = "../cubbs-bbs-proofvalue" }
+oxrdf.workspace = true
+oxttl.workspace = true
+rdf-canon.workspace = true
+rdf-types.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+
+[dev-dependencies]
+async-std.workspace = true
+rand.workspace = true

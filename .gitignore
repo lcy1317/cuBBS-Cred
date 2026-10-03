@@ -1,0 +1,32 @@
+.env
+task.list
+
+# Build and dependency outputs are reproducible and must stay local.
+/target/
+/dist/
+**/target/
+**/node_modules/
+**/__pycache__/
+*.pyc
+*.orig
+
+# Archived results and external reference implementations stay local.
+# Their layout and provenance contract are documented under docs/.
+/ref/
+
+# New generated results must be archived under ref/results, not committed.
+/benchmarks/results/
+/benchmarks/paper-results/
+/benchmarks/bbs/results/
+/benchmarks/w3c/results/
+/CFRG-IETF-BBS/results/
+/diagnostics/
+
+# Local literature corpus.
+/research/
+
+# Clean local paper-figure working/publication package.
+/paper-figures/
+
+# Editable documentation figure sources are tracked; generated decks are not.
+/docs/figures/generated/
