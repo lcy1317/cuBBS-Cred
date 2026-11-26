@@ -349,6 +349,11 @@ static int32_t compute_g1_msm_fused_common_points_with_cuda(
       }
       return cudaGetLastError();
     };
+    if (cached->use_pippenger_large) {
+      return add_variable_term(cubbs_bbs_launch_pippenger_large_glv_msm(
+          cached->device_points, device_scalars + scalar_offset,
+          term_count, n, device_outputs + out_offset, stream));
+    }
     if (cached->device_limlee_affines != nullptr) {
       return add_variable_term(cubbs_bbs_launch_glv_limlee(
           cached->device_limlee_affines, cached->device_limlee_offsets,

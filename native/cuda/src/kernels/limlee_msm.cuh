@@ -202,13 +202,13 @@ __global__ static void cubbs_bbs_limlee_build_subtables_kernel(
   }
 }
 
-// Kernel A: GLV split + coalesced bit-transpose into uint32_t lookup masks.
-// Uses bank-conflict-free shared memory [4][18][32] so registers stay minimal
-// with zero local-memory stack spill even at g = 17..18.
+// Kernel A: GLV split + coalesced bit-transpose into compact uint16_t lookup masks
+// (when group_size <= 16: bit 15 = sign, bits 0..14 = idx in [0..32767], halving L2/DRAM traffic!).
+template <typename MaskT>
 __global__ static void cubbs_bbs_limlee_bit_transpose_kernel(
     const uint8_t *scalars_le, size_t term_count, size_t output_count,
     uint32_t num_groups, uint32_t group_size, uint32_t v_sub,
-    uint32_t *masks_out) {
+    MaskT *masks_out) {
   __shared__ uint64_t s_k[4u][CUBBS_LIMLEE_MAX_GROUP_SIZE][32u];
   const uint32_t tid = threadIdx.x;
   const size_t task = static_cast<size_t>(blockIdx.x) * 32u + tid;
@@ -243,11 +243,12 @@ __global__ static void cubbs_bbs_limlee_bit_transpose_kernel(
   const size_t col0 = row * 2u;
   const size_t col1 = col0 + 1u;
   const uint32_t flip_mask = (1u << (gl - 1u)) - 1u;
+  constexpr uint32_t sign_bit = (sizeof(MaskT) == 2u) ? 0x8000u : 0x80000000u;
 
   for (uint32_t sv = 0u; sv < v_sub; ++sv) {
     const uint32_t s = g * v_sub + sv;
     const uint32_t bit_base = sv * num_bits;
-    uint32_t *sub_base = masks_out + (static_cast<size_t>(s) * num_bits * stride);
+    MaskT *sub_base = masks_out + (static_cast<size_t>(s) * num_bits * stride);
     for (uint32_t lb = 0u; lb < num_bits; ++lb) {
       const uint32_t bit = bit_base + lb;
       const uint32_t shift = bit & 63u;
@@ -260,8 +261,8 @@ __global__ static void cubbs_bbs_limlee_bit_transpose_kernel(
         const uint32_t bk = static_cast<uint32_t>((s_k[w_k1][k][tid] >> shift) & 1ull);
         idx1 |= (bk << (k - 1u));
       }
-      const uint32_t out1 = (b0_1 == 0u) ? (0x80000000u | (idx1 ^ flip_mask)) : idx1;
-      sub_base[static_cast<size_t>(lb) * stride + col0] = out1;
+      const uint32_t out1 = (b0_1 == 0u) ? (sign_bit | (idx1 ^ flip_mask)) : idx1;
+      sub_base[static_cast<size_t>(lb) * stride + col0] = static_cast<MaskT>(out1);
 
       const uint32_t b0_2 = static_cast<uint32_t>((s_k[w_k2][0u][tid] >> shift) & 1ull);
       uint32_t idx2 = 0u;
@@ -269,8 +270,8 @@ __global__ static void cubbs_bbs_limlee_bit_transpose_kernel(
         const uint32_t bk = static_cast<uint32_t>((s_k[w_k2][k][tid] >> shift) & 1ull);
         idx2 |= (bk << (k - 1u));
       }
-      const uint32_t out2 = (b0_2 == 0u) ? (0x80000000u | (idx2 ^ flip_mask)) : idx2;
-      sub_base[static_cast<size_t>(lb) * stride + col1] = out2;
+      const uint32_t out2 = (b0_2 == 0u) ? (sign_bit | (idx2 ^ flip_mask)) : idx2;
+      sub_base[static_cast<size_t>(lb) * stride + col1] = static_cast<MaskT>(out2);
     }
   }
 }
@@ -289,14 +290,15 @@ __device__ __forceinline__ static void cubbs_bbs_apply_glv_endomorphism(
   }
 }
 
-// Kernel B (kSplits == 1): 2 threads per row, 32 rows per 64-thread block.
-// Isolated __noinline__ dbl_u & xyzz_add keeps inner loop register pressure minimal.
+// Kernel B (kSplits == 1): 2 threads per row, 32 rows per 64-thread block, in-block SMEM combine
+// (no global-memory partials round-trip!) + compact uint16_t masks when group_size <= 16.
+template <typename MaskT>
 __global__ static void __launch_bounds__(64, 4)
 cubbs_bbs_g1_msm_glv_limlee_direct_kernel(
     const cubbs_sppark_plain_affine_t *affines,
     const size_t *subtable_offsets,
     const cubbs_sppark_bucket_t *c_total,
-    const uint32_t *masks,
+    const MaskT *masks,
     size_t output_count, uint32_t total_subtables, uint32_t num_bits,
     cubbs_sppark_bucket_t *outputs) {
   __shared__ __align__(16) uint8_t smem[32u * sizeof(cubbs_sppark_bucket_t)];
@@ -307,6 +309,8 @@ cubbs_bbs_g1_msm_glv_limlee_direct_kernel(
   const size_t row = col >> 1u;
   const uint32_t half = tid & 1u;
   const size_t stride = output_count * 2u;
+  constexpr uint32_t sign_bit = (sizeof(MaskT) == 2u) ? 0x8000u : 0x80000000u;
+  constexpr uint32_t idx_mask = sign_bit - 1u;
 
   cubbs_sppark_bucket_t acc;
   acc.inf();
@@ -316,10 +320,10 @@ cubbs_bbs_g1_msm_glv_limlee_direct_kernel(
         cubbs_bbs_xyzz_dbl_u(acc);
       }
       for (uint32_t s = 0u; s < total_subtables; ++s) {
-        const uint32_t entry =
-            masks[(static_cast<size_t>(s) * num_bits + static_cast<size_t>(bit)) * stride + col];
-        const bool neg = (entry & 0x80000000u) != 0u;
-        const uint32_t idx = entry & 0x7fffffffu;
+        const uint32_t entry = static_cast<uint32_t>(
+            masks[(static_cast<size_t>(s) * num_bits + static_cast<size_t>(bit)) * stride + col]);
+        const bool neg = (entry & sign_bit) != 0u;
+        const uint32_t idx = entry & idx_mask;
         acc.uadd(affines[subtable_offsets[s] + idx], neg);
       }
     }
@@ -336,35 +340,37 @@ cubbs_bbs_g1_msm_glv_limlee_direct_kernel(
   }
 }
 
-// Kernel B (kSplits > 1): splits subtables across kSplits threads per half so
-// smaller batches (B=512, B=128, B=1) saturate all 36 SMs on RTX 5060 Ti.
-template <uint32_t kSplits>
+// Kernel B (kSplits > 1): in-block SMEM tree reduction across splits (no global partials round-trip!).
+template <typename MaskT>
 __global__ static void __launch_bounds__(64, 4)
 cubbs_bbs_g1_msm_glv_limlee_split_kernel(
     const cubbs_sppark_plain_affine_t *affines,
     const size_t *subtable_offsets,
     const cubbs_sppark_bucket_t *c_total,
-    const uint32_t *masks,
+    const MaskT *masks,
     size_t output_count, uint32_t total_subtables, uint32_t num_bits,
+    uint32_t splits,
     cubbs_sppark_bucket_t *outputs) {
-  constexpr uint32_t kThreadsPerRow = 2u * kSplits;
-  constexpr uint32_t kRowsPerBlock = 64u / kThreadsPerRow;
   __shared__ __align__(16) uint8_t smem[64u * sizeof(cubbs_sppark_bucket_t)];
   auto *partials = reinterpret_cast<cubbs_sppark_bucket_t *>(smem);
 
+  const uint32_t threads_per_row = 2u * splits;
+  const uint32_t rows_per_block = 64u / threads_per_row;
   const uint32_t tid = threadIdx.x;
-  const uint32_t local_row = tid / kThreadsPerRow;
-  const uint32_t in_row = tid - (local_row * kThreadsPerRow);
+  const uint32_t local_row = tid / threads_per_row;
+  const uint32_t in_row = tid - (local_row * threads_per_row);
   const uint32_t split_id = in_row >> 1u;
   const uint32_t half = in_row & 1u;
-  const size_t row = static_cast<size_t>(blockIdx.x) * kRowsPerBlock + local_row;
+  const size_t row = static_cast<size_t>(blockIdx.x) * rows_per_block + local_row;
+  constexpr uint32_t sign_bit = (sizeof(MaskT) == 2u) ? 0x8000u : 0x80000000u;
+  constexpr uint32_t idx_mask = sign_bit - 1u;
 
   cubbs_sppark_bucket_t acc;
   acc.inf();
   if (row < output_count) {
     const size_t stride = output_count * 2u;
     const size_t col = row * 2u + half;
-    const uint32_t per_split = (total_subtables + kSplits - 1u) / kSplits;
+    const uint32_t per_split = (total_subtables + splits - 1u) / splits;
     const uint32_t s_begin = split_id * per_split;
     const uint32_t s_end = min(total_subtables, s_begin + per_split);
     if (s_begin < s_end) {
@@ -373,10 +379,10 @@ cubbs_bbs_g1_msm_glv_limlee_split_kernel(
           cubbs_bbs_xyzz_dbl_u(acc);
         }
         for (uint32_t s = s_begin; s < s_end; ++s) {
-          const uint32_t entry =
-              masks[(static_cast<size_t>(s) * num_bits + static_cast<size_t>(bit)) * stride + col];
-          const bool neg = (entry & 0x80000000u) != 0u;
-          const uint32_t idx = entry & 0x7fffffffu;
+          const uint32_t entry = static_cast<uint32_t>(
+              masks[(static_cast<size_t>(s) * num_bits + static_cast<size_t>(bit)) * stride + col]);
+          const bool neg = (entry & sign_bit) != 0u;
+          const uint32_t idx = entry & idx_mask;
           acc.uadd(affines[subtable_offsets[s] + idx], neg);
         }
       }
@@ -388,7 +394,7 @@ cubbs_bbs_g1_msm_glv_limlee_split_kernel(
   partials[tid] = acc;
   __syncthreads();
 
-  for (uint32_t stride_r = kThreadsPerRow >> 1u; stride_r > 0u; stride_r >>= 1u) {
+  for (uint32_t stride_r = threads_per_row >> 1u; stride_r > 0u; stride_r >>= 1u) {
     if (in_row < stride_r) {
       cubbs_bbs_limlee_xyzz_add_noinline(partials[tid], partials[tid + stride_r]);
     }
@@ -411,11 +417,62 @@ static uint32_t cubbs_bbs_limlee_target_threads(uint32_t total_subtables) {
     return 0u;
   }();
   if (env_target != 0u) return env_target;
-  // Tuned defaults on RTX 5060 Ti:
-  //   - M=64 (<= 16 subtables): 4096 -> splits=1 at B=2048
-  //   - M=256 (17..32 subtables): 2048 -> splits=2 at B=512 (optimal doubling/SM tradeoff)
-  //   - M=2048 (> 32 subtables): 4096 -> splits=16 at B=128
   return (total_subtables >= 17u && total_subtables <= 32u) ? 2048u : 4096u;
+}
+
+template <typename MaskT>
+static cudaError_t cubbs_bbs_launch_glv_limlee_typed(
+    const cubbs_sppark_plain_affine_t *affines,
+    const size_t *subtable_offsets,
+    const cubbs_sppark_bucket_t *c_total,
+    const uint8_t *scalars_le,
+    size_t term_count, size_t output_count,
+    uint32_t num_groups, uint32_t group_size, uint32_t v_sub,
+    cudaStream_t stream, cubbs_sppark_bucket_t *outputs) {
+  const uint32_t total_subtables = num_groups * v_sub;
+  const uint32_t num_bits = 128u / v_sub;
+  const size_t mask_count =
+      static_cast<size_t>(total_subtables) * num_bits * output_count * 2u;
+
+  auto &msm_arena = cubbs_bbs_thread_msm_arena();
+  cudaError_t err = msm_arena.reserve_and_reset(
+      CuBbsDeviceArena::align_up(mask_count * sizeof(MaskT)));
+  if (err != cudaSuccess) return err;
+  MaskT *device_masks = msm_arena.alloc<MaskT>(mask_count);
+
+  {
+    constexpr uint32_t tr_threads = 32u;
+    const size_t total_tasks = output_count * num_groups;
+    const uint32_t tr_blocks =
+        static_cast<uint32_t>((total_tasks + tr_threads - 1u) / tr_threads);
+    cubbs_bbs_limlee_bit_transpose_kernel<MaskT><<<tr_blocks, tr_threads, 0, stream>>>(
+        scalars_le, term_count, output_count, num_groups, group_size, v_sub, device_masks);
+    err = cudaGetLastError();
+  }
+
+  if (err == cudaSuccess) {
+    const uint32_t target_threads = cubbs_bbs_limlee_target_threads(total_subtables);
+    uint32_t splits = 1u;
+    while (splits < 32u && splits * 2u <= total_subtables &&
+           (output_count * 2u * splits) < target_threads) {
+      splits <<= 1u;
+    }
+    if (splits == 1u) {
+      const uint32_t blocks = static_cast<uint32_t>((output_count * 2u + 63u) / 64u);
+      cubbs_bbs_g1_msm_glv_limlee_direct_kernel<MaskT><<<blocks, 64u, 0, stream>>>(
+          affines, subtable_offsets, c_total, device_masks,
+          output_count, total_subtables, num_bits, outputs);
+    } else {
+      const uint32_t rows_per_block = 64u / (2u * splits);
+      const uint32_t blocks = static_cast<uint32_t>(
+          (output_count + rows_per_block - 1u) / rows_per_block);
+      cubbs_bbs_g1_msm_glv_limlee_split_kernel<MaskT><<<blocks, 64u, 0, stream>>>(
+          affines, subtable_offsets, c_total, device_masks,
+          output_count, total_subtables, num_bits, splits, outputs);
+    }
+    err = cudaGetLastError();
+  }
+  return err;
 }
 
 static cudaError_t cubbs_bbs_launch_glv_limlee(
@@ -427,70 +484,14 @@ static cudaError_t cubbs_bbs_launch_glv_limlee(
     uint32_t num_groups, uint32_t group_size, uint32_t v_sub,
     cudaStream_t stream, cubbs_sppark_bucket_t *outputs) {
   if (output_count == 0u || term_count == 0u) return cudaSuccess;
-  const uint32_t total_subtables = num_groups * v_sub;
-  const uint32_t num_bits = 128u / v_sub;
-  const size_t mask_count =
-      static_cast<size_t>(total_subtables) * num_bits * output_count * 2u;
-
-  uint32_t *device_masks = nullptr;
-  cudaError_t err = cudaMallocAsync(&device_masks, mask_count * sizeof(uint32_t), stream);
-  if (err != cudaSuccess) return err;
-
-  // Kernel A: GLV split + coalesced bit-transpose (32 threads/block for 18KB SMEM).
-  {
-    constexpr uint32_t tr_threads = 32u;
-    const size_t total_tasks = output_count * num_groups;
-    const uint32_t tr_blocks =
-        static_cast<uint32_t>((total_tasks + tr_threads - 1u) / tr_threads);
-    cubbs_bbs_limlee_bit_transpose_kernel<<<tr_blocks, tr_threads, 0, stream>>>(
-        scalars_le, term_count, output_count, num_groups, group_size, v_sub, device_masks);
-    err = cudaGetLastError();
+  if (group_size <= 16u) {
+    return cubbs_bbs_launch_glv_limlee_typed<uint16_t>(
+        affines, subtable_offsets, c_total, scalars_le, term_count, output_count,
+        num_groups, group_size, v_sub, stream, outputs);
   }
-
-  // Kernel B: Choose split factor to saturate 36 SMs with minimal extra doublings.
-  if (err == cudaSuccess) {
-    const uint32_t target_threads = cubbs_bbs_limlee_target_threads(total_subtables);
-    uint32_t splits = 1u;
-    while (splits < 32u && splits * 2u <= total_subtables &&
-           (output_count * 2u * splits) < target_threads) {
-      splits <<= 1u;
-    }
-    if (splits == 1u) {
-      const uint32_t blocks = static_cast<uint32_t>((output_count * 2u + 63u) / 64u);
-      cubbs_bbs_g1_msm_glv_limlee_direct_kernel<<<blocks, 64u, 0, stream>>>(
-          affines, subtable_offsets, c_total, device_masks,
-          output_count, total_subtables, num_bits, outputs);
-    } else if (splits == 2u) {
-      const uint32_t blocks = static_cast<uint32_t>((output_count + 15u) / 16u);
-      cubbs_bbs_g1_msm_glv_limlee_split_kernel<2u><<<blocks, 64u, 0, stream>>>(
-          affines, subtable_offsets, c_total, device_masks,
-          output_count, total_subtables, num_bits, outputs);
-    } else if (splits == 4u) {
-      const uint32_t blocks = static_cast<uint32_t>((output_count + 7u) / 8u);
-      cubbs_bbs_g1_msm_glv_limlee_split_kernel<4u><<<blocks, 64u, 0, stream>>>(
-          affines, subtable_offsets, c_total, device_masks,
-          output_count, total_subtables, num_bits, outputs);
-    } else if (splits == 8u) {
-      const uint32_t blocks = static_cast<uint32_t>((output_count + 3u) / 4u);
-      cubbs_bbs_g1_msm_glv_limlee_split_kernel<8u><<<blocks, 64u, 0, stream>>>(
-          affines, subtable_offsets, c_total, device_masks,
-          output_count, total_subtables, num_bits, outputs);
-    } else if (splits == 16u) {
-      const uint32_t blocks = static_cast<uint32_t>((output_count + 1u) / 2u);
-      cubbs_bbs_g1_msm_glv_limlee_split_kernel<16u><<<blocks, 64u, 0, stream>>>(
-          affines, subtable_offsets, c_total, device_masks,
-          output_count, total_subtables, num_bits, outputs);
-    } else {
-      const uint32_t blocks = static_cast<uint32_t>(output_count);
-      cubbs_bbs_g1_msm_glv_limlee_split_kernel<32u><<<blocks, 64u, 0, stream>>>(
-          affines, subtable_offsets, c_total, device_masks,
-          output_count, total_subtables, num_bits, outputs);
-    }
-    err = cudaGetLastError();
-  }
-
-  (void)cudaFreeAsync(device_masks, stream);
-  return err;
+  return cubbs_bbs_launch_glv_limlee_typed<uint32_t>(
+      affines, subtable_offsets, c_total, scalars_le, term_count, output_count,
+      num_groups, group_size, v_sub, stream, outputs);
 }
 
 #endif // CUBBS_BBS_LIMLEE_MSM_CUH

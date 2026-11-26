@@ -6,7 +6,7 @@
 #include <stdint.h>
 
 static __device__ __forceinline__ uint32_t rotr32(uint32_t value, uint32_t bits) {
-  return (value >> bits) | (value << (32u - bits));
+  return __funnelshift_r(value, value, bits);
 }
 
 static __device__ __forceinline__ uint32_t load_be32(const uint8_t *bytes) {
@@ -131,6 +131,20 @@ static __device__ __forceinline__ void sha256_transform_regs(
 #undef CUBBS_SHA256_STEP
 #undef CUBBS_SHA256_EXPAND
 
+// Non-inlined wrapper used by streaming CuBbsSha256Ctx to prevent I-cache bloat
+// and register spilling when compress() is called from multiple sites.
+static __device__ __noinline__ void sha256_transform_regs_noinline(
+    uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3,
+    uint32_t w4, uint32_t w5, uint32_t w6, uint32_t w7,
+    uint32_t w8, uint32_t w9, uint32_t w10, uint32_t w11,
+    uint32_t w12, uint32_t w13, uint32_t w14, uint32_t w15,
+    uint32_t &s0, uint32_t &s1, uint32_t &s2, uint32_t &s3,
+    uint32_t &s4, uint32_t &s5, uint32_t &s6, uint32_t &s7) {
+  sha256_transform_regs(w0, w1, w2, w3, w4, w5, w6, w7,
+                        w8, w9, w10, w11, w12, w13, w14, w15,
+                        s0, s1, s2, s3, s4, s5, s6, s7);
+}
+
 // Zero-spill streaming SHA-256 context holding state and block words in scalar registers.
 struct CuBbsSha256Ctx {
   uint32_t s0, s1, s2, s3, s4, s5, s6, s7;
@@ -154,9 +168,9 @@ struct CuBbsSha256Ctx {
   }
 
   __device__ __forceinline__ void compress() {
-    sha256_transform_regs(w0, w1, w2, w3, w4, w5, w6, w7,
-                          w8, w9, w10, w11, w12, w13, w14, w15,
-                          s0, s1, s2, s3, s4, s5, s6, s7);
+    sha256_transform_regs_noinline(w0, w1, w2, w3, w4, w5, w6, w7,
+                                   w8, w9, w10, w11, w12, w13, w14, w15,
+                                   s0, s1, s2, s3, s4, s5, s6, s7);
   }
 
   __device__ __forceinline__ void init() {
@@ -246,11 +260,28 @@ struct CuBbsSha256Ctx {
   }
 
   __device__ __forceinline__ void update_scalar_le_as_be(const uint8_t *le32) {
-    if ((block_len & 3u) == 0u) {
+    if (block_len == 0u) {
+      const uint4 *v = reinterpret_cast<const uint4 *>(le32);
+      const uint4 lo = v[0];
+      const uint4 hi = v[1];
+      w0 = hi.w; w1 = hi.z; w2 = hi.y; w3 = hi.x;
+      w4 = lo.w; w5 = lo.z; w6 = lo.y; w7 = lo.x;
+      block_len = 32u;
+      total_len += 32ull;
+    } else if (block_len == 32u) {
+      const uint4 *v = reinterpret_cast<const uint4 *>(le32);
+      const uint4 lo = v[0];
+      const uint4 hi = v[1];
+      w8 = hi.w; w9 = hi.z; w10 = hi.y; w11 = hi.x;
+      w12 = lo.w; w13 = lo.z; w14 = lo.y; w15 = lo.x;
+      compress();
+      block_len = 0u;
+      total_len += 32ull;
+    } else if ((block_len & 3u) == 0u) {
       // On little-endian CUDA, u32[word] already places the most-significant
       // byte of each 4-byte LE limb in bits 31..24 — the exact SHA-256 BE word.
       const uint32_t *u32 = reinterpret_cast<const uint32_t *>(le32);
-#pragma unroll
+#pragma unroll 1
       for (int word = 7; word >= 0; --word) {
         push_word(u32[word]);
       }
@@ -258,6 +289,46 @@ struct CuBbsSha256Ctx {
       for (int b = 31; b >= 0; --b) {
         push_byte(le32[b]);
       }
+    }
+  }
+
+  // Ultra-fast bulk scalar hashing for Sign e = H2S(sk || msg_0 || ... || msg_{M-1} || dom):
+  // Zero switch(), zero block_len branches, direct 128-bit coalesced uint4 loads!
+  __device__ __forceinline__ void update_scalars_le_as_be_bulk(
+      const uint8_t *scalars_le, size_t count) {
+    size_t m = 0u;
+    if (block_len == 32u && m < count) {
+      const uint4 *v = reinterpret_cast<const uint4 *>(scalars_le);
+      const uint4 lo = v[0];
+      const uint4 hi = v[1];
+      w8 = hi.w; w9 = hi.z; w10 = hi.y; w11 = hi.x;
+      w12 = lo.w; w13 = lo.z; w14 = lo.y; w15 = lo.x;
+      compress();
+      block_len = 0u;
+      total_len += 32ull;
+      m = 1u;
+    }
+    if (block_len == 0u) {
+      const uint4 *v = reinterpret_cast<const uint4 *>(scalars_le + (m * 32u));
+      const size_t pairs = (count - m) >> 1u;
+      for (size_t p = 0u; p < pairs; ++p) {
+        const uint4 lo0 = v[0];
+        const uint4 hi0 = v[1];
+        const uint4 lo1 = v[2];
+        const uint4 hi1 = v[3];
+        v += 4;
+        w0 = hi0.w; w1 = hi0.z; w2 = hi0.y; w3 = hi0.x;
+        w4 = lo0.w; w5 = lo0.z; w6 = lo0.y; w7 = lo0.x;
+        w8 = hi1.w; w9 = hi1.z; w10 = hi1.y; w11 = hi1.x;
+        w12 = lo1.w; w13 = lo1.z; w14 = lo1.y; w15 = lo1.x;
+        compress();
+      }
+      total_len += static_cast<uint64_t>(pairs) * 64ull;
+      m += pairs * 2u;
+    }
+    while (m < count) {
+      update_scalar_le_as_be(scalars_le + (m * 32u));
+      ++m;
     }
   }
 

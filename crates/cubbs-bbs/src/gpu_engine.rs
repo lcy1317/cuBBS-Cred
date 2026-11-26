@@ -2,6 +2,27 @@
 
 use super::*;
 
+use std::cell::RefCell;
+
+#[derive(Default)]
+struct FusedStagingScratch {
+    signatures: Vec<u8>,
+    proofs: Vec<u8>,
+    coefficients_le: Vec<u8>,
+    domains_be: Vec<u8>,
+    packed_pks: Vec<u8>,
+    packed_ph: Vec<u8>,
+    ph_offsets: Vec<u64>,
+    ph_lengths: Vec<u64>,
+    item_counts: Vec<u32>,
+    item_starts: Vec<u64>,
+}
+
+thread_local! {
+    static FUSED_STAGING_SCRATCH: RefCell<FusedStagingScratch> =
+        RefCell::new(FusedStagingScratch::default());
+}
+
 // FIFO is sufficient here: hits need no bookkeeping and retained templates
 // cannot grow without bound as new issuer/header/shape combinations arrive.
 #[derive(Debug)]
@@ -148,6 +169,53 @@ impl GpuBbsEngine {
         Ok(terms)
     }
 
+    pub(super) fn resolve_domains_batch_cached<'a>(
+        &self,
+        items: impl Iterator<Item = (&'a [u8], &'a [u8], usize)>,
+        domains_out: &mut Vec<u8>,
+    ) -> Result<()> {
+        domains_out.clear();
+        let mut misses: Vec<(usize, Vec<u8>, Vec<u8>, usize)> = Vec::new();
+        {
+            let guard = self.b_msm_term_templates.lock().unwrap();
+            let mut key = BbsMsmTermTemplateKey {
+                public_key: Vec::with_capacity(PUBLIC_KEY_LEN),
+                header: Vec::with_capacity(64),
+                message_count: 0,
+            };
+            for (pos, (pk, hdr, m)) in items.enumerate() {
+                key.public_key.clear();
+                key.public_key.extend_from_slice(pk);
+                key.header.clear();
+                key.header.extend_from_slice(hdr);
+                key.message_count = m;
+                if let Some(tmpl) = guard.entries.get(&key) {
+                    let Some(dom) = tmpl.scalar_be.get(1) else {
+                        return Err(Error::Gpu("cached template missing domain scalar".to_owned()));
+                    };
+                    if dom.len() != 32 {
+                        return Err(Error::Gpu("cached template invalid domain length".to_owned()));
+                    }
+                    domains_out.extend_from_slice(dom);
+                } else {
+                    domains_out.extend_from_slice(&[0u8; 32]);
+                    misses.push((pos, pk.to_vec(), hdr.to_vec(), m));
+                }
+            }
+        }
+        for (pos, pk, hdr, m) in misses {
+            let tmpl = self.template_points_and_domain_cached(&pk, &hdr, m)?;
+            let Some(dom) = tmpl.scalar_be.get(1) else {
+                return Err(Error::Gpu("computed template missing domain scalar".to_owned()));
+            };
+            if dom.len() != 32 {
+                return Err(Error::Gpu("computed template invalid domain length".to_owned()));
+            }
+            domains_out[pos * 32..(pos + 1) * 32].copy_from_slice(dom);
+        }
+        Ok(())
+    }
+
     pub(super) fn sign_batch_fused_resident_gpu<R: std::borrow::Borrow<SignRequest>>(
         &self,
         kernel: &GpuKernelLibrary,
@@ -218,24 +286,15 @@ impl GpuBbsEngine {
                 if first_template.compressed_points.len() != msg_count + 2 {
                     return None;
                 }
-                let mut domains = vec![0u8; group_len * 32];
-                for (pos, &req_idx) in indices.iter().enumerate() {
-                    let req = reqs[req_idx].borrow();
-                    let tmpl = self
-                        .template_points_and_domain_cached(&req.public_key, &req.header, msg_count)
-                        .ok()?;
-                    if tmpl.compressed_points.len() != first_template.compressed_points.len()
-                        || tmpl.compressed_points.as_slice()
-                            != first_template.compressed_points.as_slice()
-                    {
-                        return None;
-                    }
-                    let dom = tmpl.scalar_be.get(1)?;
-                    if dom.len() != 32 {
-                        return None;
-                    }
-                    domains[pos * 32..(pos + 1) * 32].copy_from_slice(dom);
-                }
+                let mut domains = Vec::with_capacity(group_len * 32);
+                self.resolve_domains_batch_cached(
+                    indices.iter().map(|&req_idx| {
+                        let req = reqs[req_idx].borrow();
+                        (req.public_key.as_slice(), req.header.as_slice(), msg_count)
+                    }),
+                    &mut domains,
+                )
+                .ok()?;
                 (
                     Arc::clone(&first_template.compressed_points),
                     domains,
@@ -340,7 +399,7 @@ impl GpuBbsEngine {
         &self,
         kernel: &GpuKernelLibrary,
         reqs: &[R],
-        plan: &planner::ExecutionPlan,
+        plan: Option<&planner::ExecutionPlan>,
     ) -> Option<BbsBatchRunResult<bool>> {
         let attempted = reqs.len();
         if attempted == 0
@@ -351,191 +410,220 @@ impl GpuBbsEngine {
             return None;
         }
         let first_req = reqs.first()?.borrow();
-        if first_req.public_key.len() != PUBLIC_KEY_LEN
-            || reqs.iter().any(|r| {
-                let req = r.borrow();
-                req.public_key != first_req.public_key
-                    || req.signature.len() != SIGNATURE_LEN
-                    || req.header.len() != BBS2023_HEADER_LEN
-                    || (!verify_mixed_aggregate_enabled() && plan.batches.len() > 1)
-            })
-        {
-            return None;
-        }
-
         let first_m = first_req.messages.len();
-        let uniform_m = reqs.iter().all(|r| r.borrow().messages.len() == first_m);
-        let max_m = reqs.iter().map(|r| r.borrow().messages.len()).max()?;
-
-        // Resolve common_points (for max_m) and per-batch domains via template cache.
-        let mut common_points: Option<Arc<Vec<Vec<u8>>>> = None;
-        let mut domains_be = Vec::new();
-        let domain_stride: usize;
-
-        if uniform_m && reqs.iter().all(|r| r.borrow().header == first_req.header) {
-            let tmpl = self
-                .template_points_and_domain_cached(&first_req.public_key, &first_req.header, max_m)
-                .ok()?;
-            if tmpl.compressed_points.len() != max_m + 2
-                || tmpl.scalar_be.get(1).map(Vec::len) != Some(32)
-            {
-                return None;
-            }
-            common_points = Some(Arc::clone(&tmpl.compressed_points));
-            domains_be = tmpl.scalar_be[1].clone();
-            domain_stride = 0;
-        } else {
-            domains_be.resize(attempted * 32, 0u8);
-            domain_stride = 32;
-            for batch in &plan.batches {
-                let &rep_idx = batch.request_indices.first()?;
-                let rep = reqs[rep_idx].borrow();
-                let m = rep.messages.len();
-                let tmpl = self
-                    .template_points_and_domain_cached(&rep.public_key, &rep.header, m)
-                    .ok()?;
-                if tmpl.compressed_points.len() != m + 2 {
-                    return None;
-                }
-                let dom = tmpl.scalar_be.get(1)?;
-                if dom.len() != 32 {
-                    return None;
-                }
-                if m == max_m && common_points.is_none() {
-                    common_points = Some(Arc::clone(&tmpl.compressed_points));
-                }
-                for &idx in &batch.request_indices {
-                    let r = reqs[idx].borrow();
-                    if r.header != rep.header || r.messages.len() != m {
-                        return None;
-                    }
-                    domains_be[idx * 32..(idx + 1) * 32].copy_from_slice(dom);
-                }
-            }
-        }
-        let common_points = common_points?;
-
-        // Generate B random nonzero 128-bit little-endian coefficients (32B stride)
-        // using thread_rng() (ChaCha12 CSPRNG seeded from OS entropy — zero syscalls!).
-        let mut coefficients_le = vec![0u8; attempted * 32];
-        let mut rng = rand::thread_rng();
-        for i in 0..attempted {
-            let slot = &mut coefficients_le[i * 32..i * 32 + 16];
-            rng.fill_bytes(slot);
-            if slot.iter().all(|&b| b == 0) {
-                slot[0] = 1;
-            }
-        }
-
-        // Pack signatures (B * 80B) and raw messages directly into CUDA pinned scratch.
-        let mut signatures = Vec::with_capacity(attempted * SIGNATURE_LEN);
+        let mut all_same_pk = true;
+        let mut all_same_hdr = true;
+        let mut uniform_m = true;
+        let mut max_m = first_m;
         let mut total_msgs = 0usize;
         let mut total_bytes = 0usize;
         for r in reqs {
             let req = r.borrow();
-            signatures.extend_from_slice(&req.signature);
-            total_msgs += req.messages.len();
+            if req.public_key.len() != PUBLIC_KEY_LEN
+                || req.signature.len() != SIGNATURE_LEN
+                || req.header.len() != BBS2023_HEADER_LEN
+            {
+                return None;
+            }
+            if all_same_pk && req.public_key != first_req.public_key {
+                all_same_pk = false;
+            }
+            if all_same_hdr && req.header != first_req.header {
+                all_same_hdr = false;
+            }
+            let m = req.messages.len();
+            if m != first_m {
+                uniform_m = false;
+                if m > max_m {
+                    max_m = m;
+                }
+            }
+            total_msgs += m;
             for msg in &req.messages {
                 total_bytes += msg.len();
             }
         }
-        let mut item_counts = if uniform_m {
-            Vec::new()
-        } else {
-            Vec::with_capacity(attempted)
-        };
-        let mut item_starts = if uniform_m {
-            Vec::new()
-        } else {
-            Vec::with_capacity(attempted)
-        };
+        if !uniform_m && !verify_mixed_aggregate_enabled() {
+            if plan.map_or(true, |p| p.batches.len() > 1) {
+                return None;
+            }
+        }
+
+        // Resolve common_points ONCE for max_m (generators depend only on max_m, not on PK!).
+        let common_tmpl = self
+            .template_points_and_domain_cached(&first_req.public_key, &first_req.header, max_m)
+            .ok()?;
+        if common_tmpl.compressed_points.len() != max_m + 2
+            || common_tmpl.scalar_be.get(1).map(Vec::len) != Some(32)
+        {
+            return None;
+        }
+        let common_points = Arc::clone(&common_tmpl.compressed_points);
+        let all_same_pk_hdr_m = all_same_pk && uniform_m && all_same_hdr;
 
         let g2_gen = g2_generator_compressed();
-        let verify_res = if let Some((p_msgs, p_offs, p_lens)) =
-            unsafe { kernel.pipeline_pinned_scratch_slices(total_bytes, total_msgs) }
-        {
-            let mut byte_cursor = 0usize;
-            let mut msg_cursor = 0usize;
+
+        let verify_res = FUSED_STAGING_SCRATCH.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let s = &mut *guard;
+
+            let domain_stride: usize;
+            if all_same_pk_hdr_m {
+                s.domains_be.clear();
+                s.domains_be.extend_from_slice(&common_tmpl.scalar_be[1]);
+                domain_stride = 0;
+            } else {
+                if self
+                    .resolve_domains_batch_cached(
+                        reqs.iter().map(|r| {
+                            let req = r.borrow();
+                            (
+                                req.public_key.as_slice(),
+                                req.header.as_slice(),
+                                req.messages.len(),
+                            )
+                        }),
+                        &mut s.domains_be,
+                    )
+                    .is_err()
+                {
+                    return Err(Error::Gpu("failed to resolve verify domains".to_owned()));
+                }
+                domain_stride = 32;
+            }
+
+            // Generate B random nonzero 128-bit LE coefficients (32B stride) with 1 RNG fill call.
+            s.coefficients_le.clear();
+            s.coefficients_le.resize(attempted * 32, 0u8);
+            // Fill the second half as scratch random bytes (attempted * 16B), then scatter into 32B strides.
+            let mut rng = rand::thread_rng();
+            let raw_start = attempted * 16;
+            rng.fill_bytes(&mut s.coefficients_le[raw_start..]);
+            for i in 0..attempted {
+                let src_off = raw_start + i * 16;
+                let dst_off = i * 32;
+                let mut c = [0u8; 16];
+                c.copy_from_slice(&s.coefficients_le[src_off..src_off + 16]);
+                if c == [0u8; 16] {
+                    c[0] = 1;
+                }
+                s.coefficients_le[dst_off..dst_off + 16].copy_from_slice(&c);
+                s.coefficients_le[dst_off + 16..dst_off + 32].fill(0);
+            }
+
+            // Pack signatures (B * 80B) and optional Unique-PKs (B * 96B) into reusable scratch.
+            s.signatures.clear();
+            s.signatures.reserve(attempted * SIGNATURE_LEN);
+            s.packed_pks.clear();
+            if !all_same_pk && attempted > 1 {
+                s.packed_pks.reserve(attempted * PUBLIC_KEY_LEN);
+            }
             for r in reqs {
                 let req = r.borrow();
-                if !uniform_m {
-                    item_starts.push(msg_cursor as u64);
-                    item_counts.push(req.messages.len() as u32);
+                s.signatures.extend_from_slice(&req.signature);
+                if !all_same_pk && attempted > 1 {
+                    s.packed_pks.extend_from_slice(&req.public_key);
                 }
-                for msg in &req.messages {
-                    let len = msg.len();
-                    p_offs[msg_cursor] = byte_cursor as u64;
-                    p_lens[msg_cursor] = len as u64;
-                    if len > 0 {
-                        p_msgs[byte_cursor..byte_cursor + len].copy_from_slice(msg);
+            }
+            s.item_counts.clear();
+            s.item_starts.clear();
+            if !uniform_m {
+                s.item_counts.reserve(attempted);
+                s.item_starts.reserve(attempted);
+            }
+
+            let pk_arg: &[u8] = if all_same_pk || attempted == 1 {
+                first_req.public_key.as_slice()
+            } else {
+                s.packed_pks.as_slice()
+            };
+
+            if let Some((p_msgs, p_offs, p_lens)) =
+                unsafe { kernel.pipeline_pinned_scratch_slices(total_bytes, total_msgs) }
+            {
+                let mut byte_cursor = 0usize;
+                let mut msg_cursor = 0usize;
+                for r in reqs {
+                    let req = r.borrow();
+                    if !uniform_m {
+                        s.item_starts.push(msg_cursor as u64);
+                        s.item_counts.push(req.messages.len() as u32);
                     }
-                    byte_cursor += len;
-                    msg_cursor += 1;
+                    for msg in &req.messages {
+                        let len = msg.len();
+                        p_offs[msg_cursor] = byte_cursor as u64;
+                        p_lens[msg_cursor] = len as u64;
+                        if len > 0 {
+                            p_msgs[byte_cursor..byte_cursor + len].copy_from_slice(msg);
+                        }
+                        byte_cursor += len;
+                        msg_cursor += 1;
+                    }
                 }
+                kernel.verify_pre_b_aggregate_fused(
+                    common_points.as_slice(),
+                    attempted,
+                    &s.signatures,
+                    &s.coefficients_le,
+                    &s.domains_be,
+                    domain_stride,
+                    if uniform_m {
+                        None
+                    } else {
+                        Some(&s.item_counts)
+                    },
+                    if uniform_m {
+                        None
+                    } else {
+                        Some(&s.item_starts)
+                    },
+                    p_msgs,
+                    p_offs,
+                    p_lens,
+                    pk_arg,
+                    &g2_gen,
+                )
+            } else {
+                let mut packed_messages = Vec::with_capacity(total_bytes);
+                let mut offsets = Vec::with_capacity(total_msgs);
+                let mut lengths = Vec::with_capacity(total_msgs);
+                for r in reqs {
+                    let req = r.borrow();
+                    if !uniform_m {
+                        s.item_starts.push(offsets.len() as u64);
+                        s.item_counts.push(req.messages.len() as u32);
+                    }
+                    for msg in &req.messages {
+                        offsets.push(packed_messages.len() as u64);
+                        lengths.push(msg.len() as u64);
+                        packed_messages.extend_from_slice(msg);
+                    }
+                }
+                kernel.verify_pre_b_aggregate_fused(
+                    common_points.as_slice(),
+                    attempted,
+                    &s.signatures,
+                    &s.coefficients_le,
+                    &s.domains_be,
+                    domain_stride,
+                    if uniform_m {
+                        None
+                    } else {
+                        Some(&s.item_counts)
+                    },
+                    if uniform_m {
+                        None
+                    } else {
+                        Some(&s.item_starts)
+                    },
+                    &packed_messages,
+                    &offsets,
+                    &lengths,
+                    pk_arg,
+                    &g2_gen,
+                )
             }
-            kernel.verify_pre_b_aggregate_fused(
-                common_points.as_slice(),
-                attempted,
-                &signatures,
-                &coefficients_le,
-                &domains_be,
-                domain_stride,
-                if uniform_m {
-                    None
-                } else {
-                    Some(&item_counts)
-                },
-                if uniform_m {
-                    None
-                } else {
-                    Some(&item_starts)
-                },
-                p_msgs,
-                p_offs,
-                p_lens,
-                &first_req.public_key,
-                &g2_gen,
-            )
-        } else {
-            let mut packed_messages = Vec::with_capacity(total_bytes);
-            let mut offsets = Vec::with_capacity(total_msgs);
-            let mut lengths = Vec::with_capacity(total_msgs);
-            for r in reqs {
-                let req = r.borrow();
-                if !uniform_m {
-                    item_starts.push(offsets.len() as u64);
-                    item_counts.push(req.messages.len() as u32);
-                }
-                for msg in &req.messages {
-                    offsets.push(packed_messages.len() as u64);
-                    lengths.push(msg.len() as u64);
-                    packed_messages.extend_from_slice(msg);
-                }
-            }
-            kernel.verify_pre_b_aggregate_fused(
-                common_points.as_slice(),
-                attempted,
-                &signatures,
-                &coefficients_le,
-                &domains_be,
-                domain_stride,
-                if uniform_m {
-                    None
-                } else {
-                    Some(&item_counts)
-                },
-                if uniform_m {
-                    None
-                } else {
-                    Some(&item_starts)
-                },
-                &packed_messages,
-                &offsets,
-                &lengths,
-                &first_req.public_key,
-                &g2_gen,
-            )
-        };
+        });
         match verify_res {
             Ok(true) => Some(batch_run_result(
                 attempted,
@@ -609,23 +697,15 @@ impl GpuBbsEngine {
                 if first_tmpl.compressed_points.len() != msg_count + 2 {
                     return None;
                 }
-                let mut domains = vec![0u8; group_len * 32];
-                for (pos, &req_idx) in indices.iter().enumerate() {
-                    let req = reqs[req_idx].borrow();
-                    let tmpl = self
-                        .template_points_and_domain_cached(&req.public_key, &req.header, msg_count)
-                        .ok()?;
-                    if tmpl.compressed_points.len() != first_tmpl.compressed_points.len()
-                        || tmpl.compressed_points.as_slice() != first_tmpl.compressed_points.as_slice()
-                    {
-                        return None;
-                    }
-                    let dom = tmpl.scalar_be.get(1)?;
-                    if dom.len() != 32 {
-                        return None;
-                    }
-                    domains[pos * 32..(pos + 1) * 32].copy_from_slice(dom);
-                }
+                let mut domains = Vec::with_capacity(group_len * 32);
+                self.resolve_domains_batch_cached(
+                    indices.iter().map(|&req_idx| {
+                        let req = reqs[req_idx].borrow();
+                        (req.public_key.as_slice(), req.header.as_slice(), msg_count)
+                    }),
+                    &mut domains,
+                )
+                .ok()?;
                 (Arc::clone(&first_tmpl.compressed_points), domains, 32usize)
             };
 
@@ -667,7 +747,7 @@ impl GpuBbsEngine {
             }
 
             let mut csprng_seed = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut csprng_seed);
+            rand::thread_rng().fill_bytes(&mut csprng_seed);
 
             let res = if let Some((p_msgs, p_offs, p_lens)) =
                 unsafe { kernel.pipeline_pinned_scratch_slices(total_bytes, total_msgs) }
@@ -771,12 +851,9 @@ impl GpuBbsEngine {
         }
         let first_pk = &reqs[0].borrow().public_key;
         let all_same_pk = reqs.iter().all(|r| r.borrow().public_key == *first_pk);
-        if !all_same_pk && !(kernel.can_pairing_eq() && native_pairing_enabled()) {
-            return None;
-        }
 
         // Validate structure and group by (total_message_count, disclosed_indexes)
-        // so uniform, mixed-shape, and unique-PK batches stay GPU-resident.
+        // so uniform, mixed-shape, and unique-PK batches stay 100% GPU-resident.
         let mut groups: Vec<(usize, Vec<usize>, Vec<usize>)> = Vec::new();
         for (idx, r) in reqs.iter().enumerate() {
             let req = r.borrow();
@@ -801,58 +878,33 @@ impl GpuBbsEngine {
         }
 
         let g2_gen = g2_generator_compressed();
-        let mut rng = rand::thread_rng();
 
         for (msg_count, disclosed_indexes, indices) in groups {
             let group_len = indices.len();
             let first_req = reqs[indices[0]].borrow();
-            let all_same_pk_hdr = all_same_pk
+            let group_same_pk = all_same_pk
+                || group_len == 1
+                || indices
+                    .iter()
+                    .all(|&i| reqs[i].borrow().public_key == first_req.public_key);
+            let all_same_pk_hdr = group_same_pk
                 && indices
                     .iter()
                     .all(|&i| reqs[i].borrow().header == first_req.header);
-            let (common_points, domains_be, domain_stride) = if all_same_pk_hdr {
-                let tmpl = self
-                    .template_points_and_domain_cached(
-                        &first_req.public_key,
-                        &first_req.header,
-                        msg_count,
-                    )
-                    .ok()?;
-                if tmpl.compressed_points.len() != msg_count + 2
-                    || tmpl.scalar_be.get(1).map(Vec::len) != Some(32)
-                {
-                    return None;
-                }
-                (
-                    Arc::clone(&tmpl.compressed_points),
-                    tmpl.scalar_be[1].clone(),
-                    0usize,
+
+            let first_tmpl = self
+                .template_points_and_domain_cached(
+                    &first_req.public_key,
+                    &first_req.header,
+                    msg_count,
                 )
-            } else {
-                let first_tmpl = self
-                    .template_points_and_domain_cached(
-                        &first_req.public_key,
-                        &first_req.header,
-                        msg_count,
-                    )
-                    .ok()?;
-                if first_tmpl.compressed_points.len() != msg_count + 2 {
-                    return None;
-                }
-                let mut domains = vec![0u8; group_len * 32];
-                for (pos, &req_idx) in indices.iter().enumerate() {
-                    let req = reqs[req_idx].borrow();
-                    let tmpl = self
-                        .template_points_and_domain_cached(&req.public_key, &req.header, msg_count)
-                        .ok()?;
-                    let dom = tmpl.scalar_be.get(1)?;
-                    if dom.len() != 32 {
-                        return None;
-                    }
-                    domains[pos * 32..(pos + 1) * 32].copy_from_slice(dom);
-                }
-                (Arc::clone(&first_tmpl.compressed_points), domains, 32usize)
-            };
+                .ok()?;
+            if first_tmpl.compressed_points.len() != msg_count + 2
+                || first_tmpl.scalar_be.get(1).map(Vec::len) != Some(32)
+            {
+                return None;
+            }
+            let common_points = Arc::clone(&first_tmpl.compressed_points);
 
             let disclosed_u32: Vec<u32> = disclosed_indexes.iter().map(|&i| i as u32).collect();
             let mut is_disclosed = vec![false; msg_count];
@@ -867,134 +919,154 @@ impl GpuBbsEngine {
             }
             let proof_stride = 272usize + (undisclosed_u32.len() * 32usize);
 
-            let mut coefficients_le = vec![0u8; group_len * 32];
-            for i in 0..group_len {
-                let slot = &mut coefficients_le[i * 32..i * 32 + 16];
-                rng.fill_bytes(slot);
-                if slot.iter().all(|&b| b == 0) {
-                    slot[0] = 1;
+            let verify_res = FUSED_STAGING_SCRATCH.with(|cell| {
+                let mut guard = cell.borrow_mut();
+                let s = &mut *guard;
+
+                let domain_stride: usize;
+                if all_same_pk_hdr {
+                    s.domains_be.clear();
+                    s.domains_be.extend_from_slice(&first_tmpl.scalar_be[1]);
+                    domain_stride = 0;
+                } else {
+                    if self
+                        .resolve_domains_batch_cached(
+                            indices.iter().map(|&req_idx| {
+                                let req = reqs[req_idx].borrow();
+                                (req.public_key.as_slice(), req.header.as_slice(), msg_count)
+                            }),
+                            &mut s.domains_be,
+                        )
+                        .is_err()
+                    {
+                        return Err(Error::Gpu("failed to resolve proof verify domains".to_owned()));
+                    }
+                    domain_stride = 32;
                 }
-            }
 
-            let mut proofs = Vec::with_capacity(group_len * proof_stride);
-            let mut total_bytes = 0usize;
-            let mut total_ph_bytes = 0usize;
-            for &req_idx in &indices {
-                let req = reqs[req_idx].borrow();
-                proofs.extend_from_slice(&req.proof);
-                for msg in &req.disclosed_messages {
-                    total_bytes += msg.len();
+                s.coefficients_le.clear();
+                s.coefficients_le.resize(group_len * 32, 0u8);
+                let mut rng = rand::thread_rng();
+                for i in 0..group_len {
+                    let slot = &mut s.coefficients_le[i * 32..i * 32 + 16];
+                    rng.fill_bytes(slot);
+                    if slot.iter().all(|&b| b == 0) {
+                        slot[0] = 1;
+                    }
                 }
-                total_ph_bytes += req.presentation_header.len();
-            }
-            let total_msgs = group_len * disclosed_u32.len();
 
-            let mut packed_ph = Vec::with_capacity(total_ph_bytes);
-            let mut ph_offsets = Vec::with_capacity(group_len);
-            let mut ph_lengths = Vec::with_capacity(group_len);
-            for &req_idx in &indices {
-                let req = reqs[req_idx].borrow();
-                ph_offsets.push(packed_ph.len() as u64);
-                ph_lengths.push(req.presentation_header.len() as u64);
-                packed_ph.extend_from_slice(&req.presentation_header);
-            }
-
-            let pk_arg: &[u8] = if all_same_pk { first_pk.as_slice() } else { &[] };
-            let verify_res = if let Some((p_msgs, p_offs, p_lens)) =
-                unsafe { kernel.pipeline_pinned_scratch_slices(total_bytes, total_msgs) }
-            {
-                let mut byte_cursor = 0usize;
-                let mut msg_cursor = 0usize;
+                s.proofs.clear();
+                s.proofs.reserve(group_len * proof_stride);
+                s.packed_pks.clear();
+                if !group_same_pk {
+                    s.packed_pks.reserve(group_len * PUBLIC_KEY_LEN);
+                }
+                let mut total_bytes = 0usize;
+                let mut total_ph_bytes = 0usize;
                 for &req_idx in &indices {
-                    for msg in &reqs[req_idx].borrow().disclosed_messages {
-                        let len = msg.len();
-                        p_offs[msg_cursor] = byte_cursor as u64;
-                        p_lens[msg_cursor] = len as u64;
-                        if len > 0 {
-                            p_msgs[byte_cursor..byte_cursor + len].copy_from_slice(msg);
+                    let req = reqs[req_idx].borrow();
+                    s.proofs.extend_from_slice(&req.proof);
+                    if !group_same_pk {
+                        s.packed_pks.extend_from_slice(&req.public_key);
+                    }
+                    for msg in &req.disclosed_messages {
+                        total_bytes += msg.len();
+                    }
+                    total_ph_bytes += req.presentation_header.len();
+                }
+                let total_msgs = group_len * disclosed_u32.len();
+
+                s.packed_ph.clear();
+                s.packed_ph.reserve(total_ph_bytes);
+                s.ph_offsets.clear();
+                s.ph_offsets.reserve(group_len);
+                s.ph_lengths.clear();
+                s.ph_lengths.reserve(group_len);
+                for &req_idx in &indices {
+                    let req = reqs[req_idx].borrow();
+                    let ph_off = s.packed_ph.len() as u64;
+                    s.ph_offsets.push(ph_off);
+                    s.ph_lengths.push(req.presentation_header.len() as u64);
+                    s.packed_ph.extend_from_slice(&req.presentation_header);
+                }
+
+                let pk_arg: &[u8] = if group_same_pk {
+                    first_req.public_key.as_slice()
+                } else {
+                    s.packed_pks.as_slice()
+                };
+                if let Some((p_msgs, p_offs, p_lens)) =
+                    unsafe { kernel.pipeline_pinned_scratch_slices(total_bytes, total_msgs) }
+                {
+                    let mut byte_cursor = 0usize;
+                    let mut msg_cursor = 0usize;
+                    for &req_idx in &indices {
+                        for msg in &reqs[req_idx].borrow().disclosed_messages {
+                            let len = msg.len();
+                            p_offs[msg_cursor] = byte_cursor as u64;
+                            p_lens[msg_cursor] = len as u64;
+                            if len > 0 {
+                                p_msgs[byte_cursor..byte_cursor + len].copy_from_slice(msg);
+                            }
+                            byte_cursor += len;
+                            msg_cursor += 1;
                         }
-                        byte_cursor += len;
-                        msg_cursor += 1;
                     }
-                }
-                kernel.proof_verify_fused_common_batch(
-                    common_points.as_slice(),
-                    &disclosed_u32,
-                    &undisclosed_u32,
-                    group_len,
-                    &proofs,
-                    proof_stride,
-                    &coefficients_le,
-                    &domains_be,
-                    domain_stride,
-                    p_msgs,
-                    p_offs,
-                    p_lens,
-                    &packed_ph,
-                    &ph_offsets,
-                    &ph_lengths,
-                    pk_arg,
-                    &g2_gen,
-                )
-            } else {
-                let mut packed_messages = Vec::with_capacity(total_bytes);
-                let mut offsets = Vec::with_capacity(total_msgs);
-                let mut lengths = Vec::with_capacity(total_msgs);
-                for &req_idx in &indices {
-                    for msg in &reqs[req_idx].borrow().disclosed_messages {
-                        offsets.push(packed_messages.len() as u64);
-                        lengths.push(msg.len() as u64);
-                        packed_messages.extend_from_slice(msg);
+                    kernel.proof_verify_fused_common_batch(
+                        common_points.as_slice(),
+                        &disclosed_u32,
+                        &undisclosed_u32,
+                        group_len,
+                        &s.proofs,
+                        proof_stride,
+                        &s.coefficients_le,
+                        &s.domains_be,
+                        domain_stride,
+                        p_msgs,
+                        p_offs,
+                        p_lens,
+                        &s.packed_ph,
+                        &s.ph_offsets,
+                        &s.ph_lengths,
+                        pk_arg,
+                        &g2_gen,
+                    )
+                } else {
+                    let mut packed_messages = Vec::with_capacity(total_bytes);
+                    let mut offsets = Vec::with_capacity(total_msgs);
+                    let mut lengths = Vec::with_capacity(total_msgs);
+                    for &req_idx in &indices {
+                        for msg in &reqs[req_idx].borrow().disclosed_messages {
+                            offsets.push(packed_messages.len() as u64);
+                            lengths.push(msg.len() as u64);
+                            packed_messages.extend_from_slice(msg);
+                        }
                     }
+                    kernel.proof_verify_fused_common_batch(
+                        common_points.as_slice(),
+                        &disclosed_u32,
+                        &undisclosed_u32,
+                        group_len,
+                        &s.proofs,
+                        proof_stride,
+                        &s.coefficients_le,
+                        &s.domains_be,
+                        domain_stride,
+                        &packed_messages,
+                        &offsets,
+                        &lengths,
+                        &s.packed_ph,
+                        &s.ph_offsets,
+                        &s.ph_lengths,
+                        pk_arg,
+                        &g2_gen,
+                    )
                 }
-                kernel.proof_verify_fused_common_batch(
-                    common_points.as_slice(),
-                    &disclosed_u32,
-                    &undisclosed_u32,
-                    group_len,
-                    &proofs,
-                    proof_stride,
-                    &coefficients_le,
-                    &domains_be,
-                    domain_stride,
-                    &packed_messages,
-                    &offsets,
-                    &lengths,
-                    &packed_ph,
-                    &ph_offsets,
-                    &ph_lengths,
-                    pk_arg,
-                    &g2_gen,
-                )
-            };
+            });
 
             match verify_res {
                 Ok(true) => {}
                 Ok(false) | Err(_) => return None,
-            }
-
-            if !all_same_pk {
-                let pairing_inputs: Vec<BbsPairingEqInput> = indices
-                    .iter()
-                    .map(|&req_idx| {
-                        let req = reqs[req_idx].borrow();
-                        BbsPairingEqInput {
-                            lhs_g1: req.proof[0..48].to_vec(),
-                            lhs_g2: req.public_key.clone(),
-                            rhs_g1: req.proof[48..96].to_vec(),
-                            rhs_g2: g2_gen.clone(),
-                        }
-                    })
-                    .collect();
-                let pair_res = kernel.pairing_eq_batch(&pairing_inputs, fail_fast);
-                if pair_res.failed != 0
-                    || pair_res
-                        .results
-                        .iter()
-                        .any(|item| !matches!(item.result, Ok(true)))
-                {
-                    return None;
-                }
             }
         }
 
@@ -2518,7 +2590,7 @@ impl GpuBbsEngine {
         let profile_started = Instant::now();
         let attempted = reqs.len();
         if let Some(result) =
-            self.verify_batch_pre_b_aggregate_fused_resident_gpu(kernel, reqs, plan)
+            self.verify_batch_pre_b_aggregate_fused_resident_gpu(kernel, reqs, Some(plan))
         {
             if profile {
                 eprintln!(
@@ -2739,7 +2811,13 @@ impl GpuBbsEngine {
                             let pairing_started = Instant::now();
                             let pairing_result =
                                 kernel.pairing_eq_batch(&pairing_inputs, fail_fast);
-                            if pairing_result.failed == 0 {
+                            if pairing_result.failed == 0
+                                || (pairing_result.results.len() == pairing_inputs.len()
+                                    && !pairing_result
+                                        .results
+                                        .iter()
+                                        .any(|r| matches!(r.result, Err(Error::Gpu(_)))))
+                            {
                                 if profile {
                                     eprintln!(
                                         "cubbs_verify_batch_profile items={attempted} \
@@ -2752,6 +2830,58 @@ impl GpuBbsEngine {
                                     );
                                 }
                                 return pairing_result;
+                            }
+                        } else if !fail_fast {
+                            // Isolate malformed items per-item while still verifying all valid items on GPU.
+                            let mut valid_positions = Vec::new();
+                            let mut valid_inputs = Vec::new();
+                            let mut results: Vec<Option<BbsBatchItemResult<bool>>> =
+                                vec![None; aggregate_items.len()];
+                            for (pos, item) in aggregate_items.iter().enumerate() {
+                                match verify_pairing_eq_inputs(
+                                    kernel,
+                                    self.protocol,
+                                    std::slice::from_ref(item),
+                                ) {
+                                    Ok(mut single) if single.len() == 1 => {
+                                        valid_positions.push((pos, item.0));
+                                        valid_inputs.push(single.pop().unwrap());
+                                    }
+                                    Ok(_) => {
+                                        results[pos] = Some(BbsBatchItemResult {
+                                            index: item.0,
+                                            result: Ok(false),
+                                        });
+                                    }
+                                    Err(err) => {
+                                        results[pos] = Some(BbsBatchItemResult {
+                                            index: item.0,
+                                            result: Err(err),
+                                        });
+                                    }
+                                }
+                            }
+                            if !valid_inputs.is_empty() {
+                                let gpu_res = kernel.pairing_eq_batch(&valid_inputs, false);
+                                if gpu_res.results.len() == valid_positions.len() {
+                                    for ((pos, orig_index), item_res) in
+                                        valid_positions.into_iter().zip(gpu_res.results.into_iter())
+                                    {
+                                        results[pos] = Some(BbsBatchItemResult {
+                                            index: orig_index,
+                                            result: item_res.result,
+                                        });
+                                    }
+                                    return batch_run_result(
+                                        attempted,
+                                        results.into_iter().flatten().collect(),
+                                    );
+                                }
+                            } else {
+                                return batch_run_result(
+                                    attempted,
+                                    results.into_iter().flatten().collect(),
+                                );
                             }
                         }
                     }
@@ -3164,8 +3294,60 @@ impl GpuBbsEngine {
                             }
                             let pairing_result =
                                 kernel.pairing_eq_batch(&pairing_inputs, fail_fast);
-                            if pairing_result.failed == 0 {
+                            if pairing_result.failed == 0
+                                || (pairing_result.results.len() == pairing_inputs.len()
+                                    && !pairing_result
+                                        .results
+                                        .iter()
+                                        .any(|r| matches!(r.result, Err(Error::Gpu(_)))))
+                            {
                                 return pairing_result;
+                            }
+                        } else if !fail_fast {
+                            // Isolate malformed proof/challenge items while verifying valid siblings on GPU.
+                            let mut valid_positions = Vec::new();
+                            let mut valid_inputs = Vec::new();
+                            let mut results: Vec<Option<BbsBatchItemResult<bool>>> =
+                                vec![None; aggregate_items.len()];
+                            for (pos, (orig_index, req, scalars, t1, t2, domain, meta)) in
+                                aggregate_items.iter().enumerate()
+                            {
+                                match proof_verify_challenge_and_pairing_eq_input_from_prepared(
+                                    req, scalars, t1, t2, *domain, meta,
+                                ) {
+                                    Ok(input) => {
+                                        valid_positions.push((pos, *orig_index));
+                                        valid_inputs.push(input);
+                                    }
+                                    Err(err) => {
+                                        results[pos] = Some(BbsBatchItemResult {
+                                            index: *orig_index,
+                                            result: Err(err),
+                                        });
+                                    }
+                                }
+                            }
+                            if !valid_inputs.is_empty() {
+                                let gpu_res = kernel.pairing_eq_batch(&valid_inputs, false);
+                                if gpu_res.results.len() == valid_positions.len() {
+                                    for ((pos, orig_index), item_res) in
+                                        valid_positions.into_iter().zip(gpu_res.results.into_iter())
+                                    {
+                                        results[pos] = Some(BbsBatchItemResult {
+                                            index: orig_index,
+                                            result: item_res.result,
+                                        });
+                                    }
+                                    return batch_run_result(
+                                        attempted,
+                                        results.into_iter().flatten().collect(),
+                                    );
+                                }
+                            } else {
+                                return batch_run_result(
+                                    attempted,
+                                    results.into_iter().flatten().collect(),
+                                );
                             }
                         }
                     }
@@ -3453,7 +3635,7 @@ impl GpuBbsEngine {
                 }
                 let refs = vec![req; count];
                 if let Some(result) =
-                    self.verify_batch_pre_b_aggregate_fused_resident_gpu(kernel, &refs, &plan)
+                    self.verify_batch_pre_b_aggregate_fused_resident_gpu(kernel, &refs, Some(&plan))
                 {
                     return result;
                 }
@@ -3473,6 +3655,13 @@ impl GpuBbsEngine {
         let Some(first) = reqs.first() else {
             return batch_run_result(0, Vec::new());
         };
+        if let Some(kernel) = &self.kernel {
+            if let Some(result) =
+                self.verify_batch_pre_b_aggregate_fused_resident_gpu(kernel, reqs, None)
+            {
+                return result;
+            }
+        }
         if reqs.iter().all(|req| Arc::ptr_eq(req, first)) {
             return self.verify_batch_repeated(first, reqs.len(), fail_fast);
         }
@@ -4381,6 +4570,25 @@ impl GpuBbsEngine {
         };
 
         let input_started = Instant::now();
+        if force_gpu_execution() {
+            let result = proof_verify_precomputed_items_strict_gpu(
+                kernel,
+                attempted,
+                &aggregate_items,
+                None,
+                fail_fast,
+            );
+            return BbsProofVerifyBatchProfile {
+                result,
+                message_scalar_ms,
+                msm_terms_ms,
+                msm_ms,
+                challenge_pairing_input_ms: 0.0,
+                pairing_ms: elapsed_ms(input_started),
+                fallback_finalize_ms: 0.0,
+                total_ms: elapsed_ms(total_started),
+            };
+        }
         let pairing_inputs = aggregate_items
             .iter()
             .map(|(_, req, scalars, t1, t2, domain, meta)| {

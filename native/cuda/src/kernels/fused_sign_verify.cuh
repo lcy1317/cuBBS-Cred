@@ -151,6 +151,14 @@ struct CuBbsCommonMsmTransient {
   cudaError_t alloc(const CuBbsFusedCommonPointsCache &cached,
                     size_t term_count, size_t output_count, bool is_large,
                     cudaStream_t stream) {
+    if (cached.device_limlee_affines != nullptr || cached.use_pippenger_large) {
+      large_window4 = false;
+      large_glv = false;
+      large_glv_wnaf = false;
+      large_pippenger = false;
+      large_window8 = false;
+      return cudaSuccess;
+    }
     large_window4 = is_large;
     large_glv = is_large && cached.device_point_glv_multiples != nullptr &&
                 !bbs_large_shape_pippenger_enabled() &&
@@ -221,6 +229,11 @@ static cudaError_t cubbs_bbs_launch_cached_common_msm_range(
   }
   const uint32_t threads = fused_common_points_adaptive_threads(term_count, output_count);
   const uint32_t blocks = static_cast<uint32_t>(output_count);
+  if (cached.use_pippenger_large) {
+    return cubbs_bbs_launch_pippenger_large_glv_msm(
+        cached.device_points, device_scalars_le, term_count, output_count,
+        device_outputs, stream);
+  }
   if (cached.device_limlee_affines != nullptr) {
     return cubbs_bbs_launch_glv_limlee(
         cached.device_limlee_affines, cached.device_limlee_offsets,
@@ -592,9 +605,7 @@ __global__ static void cubbs_bbs_sign_e_and_inv_kernel(
     uint32_t b0[8], b1[8], b2[8];
     ctx.init_after_zpad();
     ctx.update(sk_be, 32u);
-    for (size_t m = 0u; m < message_count; ++m) {
-      ctx.update_scalar_le_as_be(row_scalars + ((2u + m) * 32u));
-    }
+    ctx.update_scalars_le_as_be_bulk(row_scalars + 64u, message_count);
     ctx.update(dom_be, 32u);
     ctx.push_byte(0u);
     ctx.push_byte(48u);
@@ -778,26 +789,29 @@ int32_t cubbs_bbs_cuda_sign_fused_common_batch(
   CuBbsCommonMsmTransient msm_transient;
 
   const size_t total_scalars = item_count * term_count;
-  if (err == cudaSuccess && item->packed_messages_len > 0u)
-    err = cudaMallocAsync(&d_messages, item->packed_messages_len, stream);
-  if (err == cudaSuccess && total_messages > 0u)
-    err = cudaMallocAsync(&d_offsets, total_messages * sizeof(uint64_t), stream);
-  if (err == cudaSuccess && total_messages > 0u)
-    err = cudaMallocAsync(&d_lengths, total_messages * sizeof(uint64_t), stream);
-  if (err == cudaSuccess)
-    err = cudaMallocAsync(&d_aux_in, std::max<size_t>(1u, aux_in_bytes), stream);
-  if (err == cudaSuccess)
-    err = cudaMallocAsync(&d_scalars_le, total_scalars * 32u, stream);
-  if (err == cudaSuccess)
-    err = cudaMallocAsync(&d_row_scales_le, item_count * 32u, stream);
-  if (err == cudaSuccess)
-    err = cudaMallocAsync(&d_invalid, sizeof(uint32_t), stream);
-  if (err == cudaSuccess)
-    err = cudaMallocAsync(&d_outputs, item_count * sizeof(cubbs_sppark_bucket_t), stream);
-  if (err == cudaSuccess)
-    err = cudaMallocAsync(&d_signatures, sig_bytes, stream);
-  if (err == cudaSuccess)
+  auto &arena = cubbs_bbs_thread_device_arena();
+  const size_t arena_bytes =
+      CuBbsDeviceArena::align_up(item->packed_messages_len) +
+      CuBbsDeviceArena::align_up(total_messages * sizeof(uint64_t)) * 2u +
+      CuBbsDeviceArena::align_up(std::max<size_t>(1u, aux_in_bytes)) +
+      CuBbsDeviceArena::align_up(total_scalars * 32u) +
+      CuBbsDeviceArena::align_up(item_count * 32u) +
+      CuBbsDeviceArena::align_up(sizeof(uint32_t)) +
+      CuBbsDeviceArena::align_up(item_count * sizeof(cubbs_sppark_bucket_t)) +
+      CuBbsDeviceArena::align_up(sig_bytes);
+  if (err == cudaSuccess) err = arena.reserve_and_reset(arena_bytes);
+  if (err == cudaSuccess) {
+    d_messages = arena.alloc<uint8_t>(item->packed_messages_len);
+    d_offsets = arena.alloc<uint64_t>(total_messages);
+    d_lengths = arena.alloc<uint64_t>(total_messages);
+    d_aux_in = arena.alloc<uint8_t>(std::max<size_t>(1u, aux_in_bytes));
+    d_scalars_le = arena.alloc<uint8_t>(total_scalars * 32u);
+    d_row_scales_le = arena.alloc<uint8_t>(item_count * 32u);
+    d_invalid = arena.alloc<uint32_t>(1u);
+    d_outputs = arena.alloc<cubbs_sppark_bucket_t>(item_count);
+    d_signatures = arena.alloc<uint8_t>(sig_bytes);
     err = msm_transient.alloc(*cached, term_count, item_count, large_window4, stream);
+  }
 
   // Async H2D transfers.
   if (err == cudaSuccess && item->packed_messages_len > 0u)
@@ -914,17 +928,8 @@ int32_t cubbs_bbs_cuda_sign_fused_common_batch(
     for (int i = 0; i < 7; ++i) (void)cudaEventDestroy(ev[i]);
   }
 
-  // Free transient allocations asynchronously on stream.
+  // Free legacy MSM transient allocations if any (arena buffers stay persistent).
   msm_transient.free_async(stream);
-  if (d_signatures != nullptr) (void)cudaFreeAsync(d_signatures, stream);
-  if (d_outputs != nullptr) (void)cudaFreeAsync(d_outputs, stream);
-  if (d_invalid != nullptr) (void)cudaFreeAsync(d_invalid, stream);
-  if (d_row_scales_le != nullptr) (void)cudaFreeAsync(d_row_scales_le, stream);
-  if (d_scalars_le != nullptr) (void)cudaFreeAsync(d_scalars_le, stream);
-  if (d_aux_in != nullptr) (void)cudaFreeAsync(d_aux_in, stream);
-  if (d_lengths != nullptr) (void)cudaFreeAsync(d_lengths, stream);
-  if (d_offsets != nullptr) (void)cudaFreeAsync(d_offsets, stream);
-  if (d_messages != nullptr) (void)cudaFreeAsync(d_messages, stream);
 
   if (err != cudaSuccess) return CUBBS_BBS_GPU_ERR_INTERNAL;
   if (*pipe_ws.invalid_flag != 0u) return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
@@ -1410,13 +1415,14 @@ int32_t cubbs_bbs_cuda_verify_pre_b_aggregate_fused(
     result->bytes_written = 0u;
     return CUBBS_BBS_GPU_SUCCESS;
   }
+  const bool unique_pk = (item_count > 1u && item->public_key.len == item_count * 96u);
   if (term_count < 2u || item->common_points == nullptr ||
       item->signatures == nullptr || item->coefficients_le == nullptr ||
       item->domains_be == nullptr ||
       (item->domain_stride != 0u && item->domain_stride != 32u) ||
       item->message_dst.len > 255u ||
       (item->message_dst.len > 0u && item->message_dst.data == nullptr) ||
-      item->public_key.len != 96u || item->public_key.data == nullptr ||
+      (!unique_pk && item->public_key.len != 96u) || item->public_key.data == nullptr ||
       item->g2_generator.len != 96u || item->g2_generator.data == nullptr) {
     return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
   }
@@ -1461,16 +1467,17 @@ int32_t cubbs_bbs_cuda_verify_pre_b_aggregate_fused(
   auto &dual_ws = cubbs_same_points_dual_msm_workspace();
   const cudaStream_t stream_b = host_ws.execution_stream(
       cached->stream != nullptr ? cached->stream : static_cast<cudaStream_t>(0));
-  configure_cubbs_async_mempool();
 
-  // Prepare G2 lines (thread-local cached by 96-byte compressed key).
-  if (!pipe_ws.pk_valid ||
-      std::memcmp(pipe_ws.pk_key, item->public_key.data, 96u) != 0) {
-    int32_t g2_st = cubbs_bbs_blst_get_prepared_g2_lines(
-        item->public_key, pipe_ws.pk_lines);
-    if (g2_st != CUBBS_BBS_GPU_SUCCESS) return g2_st;
-    std::memcpy(pipe_ws.pk_key, item->public_key.data, 96u);
-    pipe_ws.pk_valid = true;
+  // Prepare G2 lines (for Same-PK cache pk_lines; for Unique-PK only G2 generator lines!).
+  if (!unique_pk) {
+    if (!pipe_ws.pk_valid ||
+        std::memcmp(pipe_ws.pk_key, item->public_key.data, 96u) != 0) {
+      int32_t g2_st = cubbs_bbs_blst_get_prepared_g2_lines(
+          item->public_key, pipe_ws.pk_lines);
+      if (g2_st != CUBBS_BBS_GPU_SUCCESS) return g2_st;
+      std::memcpy(pipe_ws.pk_key, item->public_key.data, 96u);
+      pipe_ws.pk_valid = true;
+    }
   }
   if (!pipe_ws.g2_valid ||
       std::memcmp(pipe_ws.g2_key, item->g2_generator.data, 96u) != 0) {
@@ -1481,18 +1488,32 @@ int32_t cubbs_bbs_cuda_verify_pre_b_aggregate_fused(
     pipe_ws.g2_valid = true;
   }
 
-  // Stage messages + coefficients + domains + e_be into pinned host memory,
-  // and kick off Stream B (H2S -> B scalar reduction -> 1-row B-MSM) IMMEDIATELY
-  // so it overlaps with host A_i decode + Dual A-MSM on dual_ws.stream!
+  // Fast zero-alloc check whether A_0..A_{B-1} match the GPU-cached affine points.
+  bool matches_cached = (dual_ws.point_key.size() == item_count * 48u &&
+                         dual_ws.capacity >= item_count);
+  if (matches_cached) {
+    const char *cached_bytes = dual_ws.point_key.data();
+    for (size_t i = 0u; i < item_count; ++i) {
+      if (std::memcmp(cached_bytes + (i * 48u), item->signatures + (i * 80u), 48u) != 0) {
+        matches_cached = false;
+        break;
+      }
+    }
+  }
+  const bool need_gpu_decode_a = !matches_cached;
+
   const size_t dom_bytes = item->domain_stride == 0u ? 32u : item_count * 32u;
   const size_t coef_bytes = item_count * 32u;
   const size_t e_bytes = item_count * 32u;
+  const size_t a_comp_bytes = need_gpu_decode_a ? (item_count * 48u) : 0u;
+  const size_t pks_comp_bytes = unique_pk ? (item_count * 96u) : 0u;
   const size_t mixed_meta_bytes = mixed_counts
       ? (item_count * (sizeof(uint32_t) + sizeof(uint64_t)))
       : 0u;
   const size_t aux_in_bytes =
-      coef_bytes + dom_bytes + e_bytes + item->message_dst.len + mixed_meta_bytes + 16u;
-  const size_t aux_out_bytes = 2u * sizeof(cubbs_sppark_plain_affine_t) + sizeof(uint32_t);
+      coef_bytes + dom_bytes + e_bytes + a_comp_bytes + pks_comp_bytes +
+      item->message_dst.len + mixed_meta_bytes + 64u;
+  const size_t aux_out_bytes = 32u;
 
   cudaError_t err = pipe_ws.ensure_messages(item->packed_messages_len);
   if (err == cudaSuccess && total_messages > 0u)
@@ -1510,63 +1531,148 @@ int32_t cubbs_bbs_cuda_verify_pre_b_aggregate_fused(
       std::memcpy(pipe_ws.lengths, item->message_lengths, total_messages * sizeof(uint64_t));
   }
 
-  uint8_t *h_coef = pipe_ws.aux_in;
-  uint8_t *h_dom = h_coef + coef_bytes;
-  uint8_t *h_e = h_dom + dom_bytes;
-  uint8_t *h_msg_dst = h_e + e_bytes;
-  size_t aligned_meta_off = (static_cast<size_t>(h_msg_dst - pipe_ws.aux_in) +
-                             item->message_dst.len + 7u) & ~size_t{7u};
-  uint64_t *h_item_starts = reinterpret_cast<uint64_t *>(pipe_ws.aux_in + aligned_meta_off);
-  uint32_t *h_item_counts = reinterpret_cast<uint32_t *>(h_item_starts + (mixed_counts ? item_count : 0u));
+  size_t aux_off = 0u;
+  auto push_aux = [&](size_t bytes, size_t align) -> size_t {
+    aux_off = (aux_off + align - 1u) & ~(align - 1u);
+    const size_t start = aux_off;
+    aux_off += bytes;
+    return start;
+  };
+  const size_t off_coef = push_aux(coef_bytes, 8u);
+  const size_t off_dom = push_aux(dom_bytes, 8u);
+  const size_t off_e = push_aux(e_bytes, 8u);
+  const size_t off_a_comp = push_aux(a_comp_bytes, 8u);
+  const size_t off_pks_comp = push_aux(pks_comp_bytes, 8u);
+  const size_t off_item_starts = push_aux(mixed_counts ? item_count * sizeof(uint64_t) : 0u, 8u);
+  const size_t off_item_counts = push_aux(mixed_counts ? item_count * sizeof(uint32_t) : 0u, 4u);
+  const size_t off_msg_dst = push_aux(item->message_dst.len, 1u);
 
-  std::memcpy(h_coef, item->coefficients_le, coef_bytes);
-  std::memcpy(h_dom, item->domains_be, dom_bytes);
+  std::memcpy(pipe_ws.aux_in + off_coef, item->coefficients_le, coef_bytes);
+  std::memcpy(pipe_ws.aux_in + off_dom, item->domains_be, dom_bytes);
   for (size_t i = 0u; i < item_count; ++i) {
-    std::memcpy(h_e + (i * 32u), item->signatures + (i * 80u) + 48u, 32u);
+    const uint8_t *sig = item->signatures + (i * 80u);
+    std::memcpy(pipe_ws.aux_in + off_e + (i * 32u), sig + 48u, 32u);
+    if (need_gpu_decode_a) {
+      std::memcpy(pipe_ws.aux_in + off_a_comp + (i * 48u), sig, 48u);
+    }
   }
-  if (item->message_dst.len > 0u)
-    std::memcpy(h_msg_dst, item->message_dst.data, item->message_dst.len);
+  if (unique_pk) {
+    std::memcpy(pipe_ws.aux_in + off_pks_comp, item->public_key.data, pks_comp_bytes);
+  }
   if (mixed_counts) {
-    std::memcpy(h_item_starts, item->item_message_starts, item_count * sizeof(uint64_t));
-    std::memcpy(h_item_counts, item->item_message_counts, item_count * sizeof(uint32_t));
+    std::memcpy(pipe_ws.aux_in + off_item_starts, item->item_message_starts, item_count * sizeof(uint64_t));
+    std::memcpy(pipe_ws.aux_in + off_item_counts, item->item_message_counts, item_count * sizeof(uint32_t));
+  }
+  if (item->message_dst.len > 0u) {
+    std::memcpy(pipe_ws.aux_in + off_msg_dst, item->message_dst.data, item->message_dst.len);
   }
 
-  // Allocate Stream B device buffers & launch Stream B asynchronously.
+  static const bool pippenger_enabled = []() {
+    const char *env = std::getenv("CUBBS_BBS_VERIFY_PIPPENGER");
+    return env == nullptr || env_flag_enabled("CUBBS_BBS_VERIFY_PIPPENGER");
+  }();
+  const bool use_pippenger = pippenger_enabled && item_count >= 128u;
+  const uint32_t chunks = static_cast<uint32_t>((item_count + 2047u) / 2048u);
+
+  // Ensure persistent dual_ws buffers for GPU-cached A_i points + small-B tables.
+  if (dual_ws.capacity < item_count) {
+    if (dual_ws.points != nullptr) (void)cudaFree(dual_ws.points);
+    if (dual_ws.scalars != nullptr) (void)cudaFree(dual_ws.scalars);
+    if (dual_ws.components != nullptr) (void)cudaFree(dual_ws.components);
+    if (dual_ws.products != nullptr) (void)cudaFree(dual_ws.products);
+    if (dual_ws.tables != nullptr) (void)cudaFree(dual_ws.tables);
+    dual_ws.points = nullptr;
+    dual_ws.scalars = nullptr;
+    dual_ws.components = nullptr;
+    dual_ws.products = nullptr;
+    dual_ws.tables = nullptr;
+    dual_ws.capacity = 0u;
+    dual_ws.point_key.clear();
+    err = cudaMalloc(&dual_ws.points, item_count * sizeof(*dual_ws.points));
+    if (err == cudaSuccess) err = cudaMalloc(&dual_ws.scalars, item_count * 64u);
+    if (err == cudaSuccess) err = cudaMalloc(&dual_ws.components, item_count * 64u);
+    if (err == cudaSuccess) err = cudaMalloc(&dual_ws.products, item_count * 2u * sizeof(*dual_ws.products));
+    if (err == cudaSuccess) err = cudaMalloc(&dual_ws.tables, item_count * 9u * sizeof(*dual_ws.tables));
+    if (err == cudaSuccess) dual_ws.capacity = item_count;
+  }
+  if (err == cudaSuccess && dual_ws.aggregate_lane_capacity < 1u) {
+    if (dual_ws.buckets != nullptr) (void)cudaFree(dual_ws.buckets);
+    if (dual_ws.window_sums != nullptr) (void)cudaFree(dual_ws.window_sums);
+    if (dual_ws.outputs != nullptr) (void)cudaFree(dual_ws.outputs);
+    dual_ws.buckets = nullptr;
+    dual_ws.window_sums = nullptr;
+    dual_ws.outputs = nullptr;
+    dual_ws.aggregate_lane_capacity = 0u;
+    const size_t bucket_count = 2u * CUBBS_DUAL_MSM_WINDOWS * CUBBS_DUAL_MSM_BUCKETS;
+    err = cudaMalloc(&dual_ws.buckets, bucket_count * sizeof(*dual_ws.buckets));
+    if (err == cudaSuccess)
+      err = cudaMalloc(&dual_ws.window_sums, 2u * CUBBS_DUAL_MSM_WINDOWS * sizeof(*dual_ws.window_sums));
+    if (err == cudaSuccess)
+      err = cudaMalloc(&dual_ws.outputs, 2u * sizeof(*dual_ws.outputs));
+    if (err == cudaSuccess) dual_ws.aggregate_lane_capacity = 1u;
+  }
+
+  // Allocate all transient device buffers from persistent thread-local arena (0 cudaMallocAsync!).
+  auto &arena = cubbs_bbs_thread_device_arena();
+  const size_t arena_bytes =
+      CuBbsDeviceArena::align_up(item->packed_messages_len) +
+      CuBbsDeviceArena::align_up(total_messages * sizeof(uint64_t)) * 2u +
+      CuBbsDeviceArena::align_up(total_messages * 32u) +
+      CuBbsDeviceArena::align_up(std::max<size_t>(1u, aux_off)) +
+      CuBbsDeviceArena::align_up(term_count * 32u) +
+      CuBbsDeviceArena::align_up(sizeof(cubbs_sppark_bucket_t)) +
+      CuBbsDeviceArena::align_up(sizeof(uint32_t)) * 2u +
+      CuBbsDeviceArena::align_up(2u * sizeof(cubbs_sppark_plain_affine_t)) +
+      CuBbsDeviceArena::align_up(sizeof(uint8_t)) +
+      (use_pippenger
+           ? (CuBbsDeviceArena::align_up(51u * item_count * sizeof(int16_t)) +
+              CuBbsDeviceArena::align_up(51u * chunks * sizeof(cubbs_sppark_bucket_t)))
+           : 0u) +
+      (unique_pk
+           ? (CuBbsDeviceArena::align_up(item_count * sizeof(cubbs_sppark_bucket_t)) +
+              CuBbsDeviceArena::align_up(item_count * sizeof(cubbs_sppark_plain_affine_t)))
+           : 0u);
+  if (err == cudaSuccess) err = arena.reserve_and_reset(arena_bytes);
+
   uint8_t *d_messages = nullptr;
   uint64_t *d_offsets = nullptr;
   uint64_t *d_lengths = nullptr;
-  uint8_t *d_aux_in = nullptr;
   uint8_t *d_msg_scalars_le = nullptr;
+  uint8_t *d_aux_in = nullptr;
   uint8_t *d_agg_b_scalars_le = nullptr;
   cubbs_sppark_bucket_t *d_b_output = nullptr;
   uint32_t *d_invalid = nullptr;
   cubbs_sppark_plain_affine_t *d_pair_affines = nullptr;
   uint32_t *d_inf_flag = nullptr;
+  uint8_t *d_eq_out = nullptr;
+  int16_t *d_digits = nullptr;
+  cubbs_sppark_bucket_t *d_win_chunk_sums = nullptr;
+  cubbs_sppark_bucket_t *d_scaled_a_xyzz = nullptr;
+  cubbs_sppark_plain_affine_t *d_scaled_a_affines = nullptr;
   CuBbsCommonMsmTransient msm_transient;
 
-  if (err == cudaSuccess && item->packed_messages_len > 0u)
-    err = cudaMallocAsync(&d_messages, item->packed_messages_len, stream_b);
-  if (err == cudaSuccess && total_messages > 0u) {
-    err = cudaMallocAsync(&d_offsets, total_messages * sizeof(uint64_t), stream_b);
-    if (err == cudaSuccess)
-      err = cudaMallocAsync(&d_lengths, total_messages * sizeof(uint64_t), stream_b);
-    if (err == cudaSuccess)
-      err = cudaMallocAsync(&d_msg_scalars_le, total_messages * 32u, stream_b);
-  }
-  if (err == cudaSuccess)
-    err = cudaMallocAsync(&d_aux_in, aux_in_bytes, stream_b);
-  if (err == cudaSuccess)
-    err = cudaMallocAsync(&d_agg_b_scalars_le, term_count * 32u, stream_b);
-  if (err == cudaSuccess)
-    err = cudaMallocAsync(&d_b_output, sizeof(cubbs_sppark_bucket_t), stream_b);
-  if (err == cudaSuccess)
-    err = cudaMallocAsync(&d_invalid, sizeof(uint32_t), stream_b);
-  if (err == cudaSuccess)
-    err = cudaMallocAsync(&d_pair_affines, 2u * sizeof(cubbs_sppark_plain_affine_t), stream_b);
-  if (err == cudaSuccess)
-    err = cudaMallocAsync(&d_inf_flag, sizeof(uint32_t), stream_b);
-  if (err == cudaSuccess)
+  if (err == cudaSuccess) {
+    d_messages = arena.alloc<uint8_t>(item->packed_messages_len);
+    d_offsets = arena.alloc<uint64_t>(total_messages);
+    d_lengths = arena.alloc<uint64_t>(total_messages);
+    d_msg_scalars_le = arena.alloc<uint8_t>(total_messages * 32u);
+    d_aux_in = arena.alloc<uint8_t>(std::max<size_t>(1u, aux_off));
+    d_agg_b_scalars_le = arena.alloc<uint8_t>(term_count * 32u);
+    d_b_output = arena.alloc<cubbs_sppark_bucket_t>(1u);
+    d_invalid = arena.alloc<uint32_t>(1u);
+    d_pair_affines = arena.alloc<cubbs_sppark_plain_affine_t>(2u);
+    d_inf_flag = arena.alloc<uint32_t>(1u);
+    d_eq_out = arena.alloc<uint8_t>(1u);
+    if (use_pippenger) {
+      d_digits = arena.alloc<int16_t>(51u * item_count);
+      d_win_chunk_sums = arena.alloc<cubbs_sppark_bucket_t>(51u * chunks);
+    }
+    if (unique_pk) {
+      d_scaled_a_xyzz = arena.alloc<cubbs_sppark_bucket_t>(item_count);
+      d_scaled_a_affines = arena.alloc<cubbs_sppark_plain_affine_t>(item_count);
+    }
     err = msm_transient.alloc(*cached, term_count, 1u, large_window4, stream_b);
+  }
 
   if (err == cudaSuccess && item->packed_messages_len > 0u)
     err = cudaMemcpyAsync(d_messages, pipe_ws.messages, item->packed_messages_len,
@@ -1581,22 +1687,25 @@ int32_t cubbs_bbs_cuda_verify_pre_b_aggregate_fused(
                             cudaMemcpyHostToDevice, stream_b);
   }
   if (err == cudaSuccess)
-    err = cudaMemcpyAsync(d_aux_in, pipe_ws.aux_in, aux_in_bytes,
+    err = cudaMemcpyAsync(d_aux_in, pipe_ws.aux_in, aux_off,
                           cudaMemcpyHostToDevice, stream_b);
   if (err == cudaSuccess)
     err = cudaMemsetAsync(d_invalid, 0, sizeof(uint32_t), stream_b);
 
-  const uint8_t *d_coef = d_aux_in;
-  const uint8_t *d_dom = d_coef + coef_bytes;
-  const uint8_t *d_e = d_dom + dom_bytes;
-  const uint8_t *d_msg_dst = d_e + e_bytes;
+  const uint8_t *d_coef = d_aux_in + off_coef;
+  const uint8_t *d_dom = d_aux_in + off_dom;
+  const uint8_t *d_e = d_aux_in + off_e;
+  const uint8_t *d_a_comp = d_aux_in + off_a_comp;
+  const uint8_t *d_pks_comp = d_aux_in + off_pks_comp;
   const uint64_t *d_item_starts = mixed_counts
-      ? reinterpret_cast<const uint64_t *>(d_aux_in + aligned_meta_off)
+      ? reinterpret_cast<const uint64_t *>(d_aux_in + off_item_starts)
       : nullptr;
   const uint32_t *d_item_counts = mixed_counts
-      ? reinterpret_cast<const uint32_t *>(d_item_starts + item_count)
+      ? reinterpret_cast<const uint32_t *>(d_aux_in + off_item_counts)
       : nullptr;
+  const uint8_t *d_msg_dst = d_aux_in + off_msg_dst;
 
+  // Stage 1: GPU H2S + random-coefficient B-scalar reduction + 1-row B-MSM.
   if (err == cudaSuccess && total_messages > 0u) {
     constexpr uint32_t h2s_threads = 128u;
     const uint32_t h2s_blocks = static_cast<uint32_t>(
@@ -1621,238 +1730,140 @@ int32_t cubbs_bbs_cuda_verify_pre_b_aggregate_fused(
         d_b_output, stream_b);
   }
 
-  // While Stream B runs H2S + scalar reduction + 1-row B-MSM on GPU,
-  // decode/lookup A_0..A_{B-1} on CPU and launch Dual A-MSM on stream_b!
-  // (Notice: running Dual A-MSM on stream_b after H2S or on dual_ws.stream
-  // both overlap host decode with GPU H2S!)
-  int32_t a_decode_status = CUBBS_BBS_GPU_SUCCESS;
-  std::string point_key;
-  bool upload_points = false;
-  std::vector<cubbs_sppark_plain_affine_t> host_points;
-  if (err == cudaSuccess) {
-    // Fast zero-alloc check against cached dual_ws.point_key before copying or decoding.
-    bool matches_cached = (dual_ws.point_key.size() == item_count * 48u);
-    if (matches_cached) {
-      const char *cached_bytes = dual_ws.point_key.data();
-      for (size_t i = 0u; i < item_count; ++i) {
-        if (std::memcmp(cached_bytes + (i * 48u), item->signatures + (i * 80u), 48u) != 0) {
-          matches_cached = false;
-          break;
-        }
-      }
-    }
-    upload_points = !matches_cached;
-    if (upload_points) {
-      point_key.resize(item_count * 48u);
-      std::vector<CuBbsBbsGpuByteSlice> a_slices(item_count);
-      for (size_t i = 0u; i < item_count; ++i) {
-        const uint8_t *a_ptr = item->signatures + (i * 80u);
-        std::memcpy(&point_key[i * 48u], a_ptr, 48u);
-        a_slices[i] = CuBbsBbsGpuByteSlice{a_ptr, 48u};
-      }
-      host_points.resize(item_count);
-      a_decode_status = load_or_decode_cached_g1_affines(
-          a_slices.data(), item_count, host_points.data());
+  // Stage 2: 100% GPU G1 decompression + Scott subgroup check on cache miss (0 CPU!).
+  if (err == cudaSuccess && need_gpu_decode_a) {
+    constexpr uint32_t dec_threads = 64u;
+    const uint32_t dec_blocks = static_cast<uint32_t>((item_count + dec_threads - 1u) / dec_threads);
+    cubbs_bbs_g1_uncompress_strided_kernel<<<dec_blocks, dec_threads, 0, stream_b>>>(
+        d_a_comp, item_count, 48u, 1u, true, dual_ws.points, d_invalid);
+    err = cudaGetLastError();
+    if (err == cudaSuccess && !use_pippenger) {
+      constexpr uint32_t table_threads = 128u;
+      const uint32_t table_blocks = static_cast<uint32_t>(
+          (item_count + table_threads - 1u) / table_threads);
+      cubbs_bbs_proof_verify_radix16_tables_kernel
+          <<<table_blocks, table_threads, 0u, stream_b>>>(
+              dual_ws.points, item_count, dual_ws.tables);
+      err = cudaGetLastError();
     }
   }
 
-  if (err == cudaSuccess && a_decode_status == CUBBS_BBS_GPU_SUCCESS) {
-    if (dual_ws.capacity < item_count) {
-      if (dual_ws.points != nullptr) cudaFree(dual_ws.points);
-      if (dual_ws.scalars != nullptr) cudaFree(dual_ws.scalars);
-      if (dual_ws.components != nullptr) cudaFree(dual_ws.components);
-      if (dual_ws.products != nullptr) cudaFree(dual_ws.products);
-      if (dual_ws.tables != nullptr) cudaFree(dual_ws.tables);
-      dual_ws.points = nullptr;
-      dual_ws.scalars = nullptr;
-      dual_ws.components = nullptr;
-      dual_ws.products = nullptr;
-      dual_ws.tables = nullptr;
-      dual_ws.capacity = 0u;
-      dual_ws.point_key.clear();
-      upload_points = true;
-      if (host_points.empty()) {
-        std::vector<CuBbsBbsGpuByteSlice> a_slices(item_count);
-        for (size_t i = 0u; i < item_count; ++i) {
-          a_slices[i] = CuBbsBbsGpuByteSlice{item->signatures + (i * 80u), 48u};
-        }
-        host_points.resize(item_count);
-        a_decode_status = load_or_decode_cached_g1_affines(
-            a_slices.data(), item_count, host_points.data());
-      }
-      if (a_decode_status == CUBBS_BBS_GPU_SUCCESS) {
-        err = cudaMalloc(&dual_ws.points, item_count * sizeof(*dual_ws.points));
-        if (err == cudaSuccess) err = cudaMalloc(&dual_ws.scalars, item_count * 64u);
-        if (err == cudaSuccess) err = cudaMalloc(&dual_ws.components, item_count * 64u);
-        if (err == cudaSuccess)
-          err = cudaMalloc(&dual_ws.products, item_count * 2u * sizeof(*dual_ws.products));
-        if (err == cudaSuccess)
-          err = cudaMalloc(&dual_ws.tables, item_count * 9u * sizeof(*dual_ws.tables));
-        if (err == cudaSuccess) dual_ws.capacity = item_count;
-      }
+  // Stage 3: Dual A-MSM (sum r_i A_i, sum (-r_i e_i) A_i).
+  if (err == cudaSuccess && use_pippenger) {
+    constexpr uint32_t r_threads = 128u;
+    const uint32_t r_blocks = static_cast<uint32_t>(
+        (item_count + r_threads - 1u) / r_threads);
+    cubbs_bbs_verify_pippenger_recode_kernel<<<r_blocks, r_threads, 0u, stream_b>>>(
+        d_e, d_coef, item_count, d_digits, d_invalid);
+    err = cudaGetLastError();
+    if (err == cudaSuccess) {
+      const dim3 bucket_grid(17u, 3u, chunks);
+      cubbs_bbs_verify_pippenger_buckets_s8_kernel<<<bucket_grid, 128u, 0u, stream_b>>>(
+          dual_ws.points, 0u, d_digits, 17u * item_count, item_count, chunks,
+          d_win_chunk_sums);
+      err = cudaGetLastError();
     }
-    if (err == cudaSuccess && a_decode_status == CUBBS_BBS_GPU_SUCCESS &&
-        dual_ws.aggregate_lane_capacity < 1u) {
-      if (dual_ws.buckets != nullptr) cudaFree(dual_ws.buckets);
-      if (dual_ws.window_sums != nullptr) cudaFree(dual_ws.window_sums);
-      if (dual_ws.outputs != nullptr) cudaFree(dual_ws.outputs);
-      dual_ws.buckets = nullptr;
-      dual_ws.window_sums = nullptr;
-      dual_ws.outputs = nullptr;
-      dual_ws.aggregate_lane_capacity = 0u;
-      const size_t bucket_count =
-          2u * CUBBS_DUAL_MSM_WINDOWS * CUBBS_DUAL_MSM_BUCKETS;
-      err = cudaMalloc(&dual_ws.buckets, bucket_count * sizeof(*dual_ws.buckets));
-      if (err == cudaSuccess)
-        err = cudaMalloc(&dual_ws.window_sums,
-                         2u * CUBBS_DUAL_MSM_WINDOWS * sizeof(*dual_ws.window_sums));
-      if (err == cudaSuccess)
-        err = cudaMalloc(&dual_ws.outputs, 2u * sizeof(*dual_ws.outputs));
-      if (err == cudaSuccess) dual_ws.aggregate_lane_capacity = 1u;
+    if (err == cudaSuccess) {
+      cubbs_bbs_verify_pippenger_combine_s8_kernel<<<1u, 32u, 0u, stream_b>>>(
+          d_win_chunk_sums, chunks, 3u, true, dual_ws.outputs);
+      err = cudaGetLastError();
     }
-
-    if (err == cudaSuccess && a_decode_status == CUBBS_BBS_GPU_SUCCESS) {
-      static const bool pippenger_enabled = []() {
-        const char *env = std::getenv("CUBBS_BBS_VERIFY_PIPPENGER");
-        return env == nullptr || env_flag_enabled("CUBBS_BBS_VERIFY_PIPPENGER");
-      }();
-      const bool use_pippenger = pippenger_enabled && item_count >= 128u;
-
-      if (upload_points) {
-        err = cudaMemcpyAsync(
-            dual_ws.points, host_points.data(),
-            item_count * sizeof(host_points[0]), cudaMemcpyHostToDevice, stream_b);
-        if (err == cudaSuccess && !use_pippenger) {
-          constexpr uint32_t table_threads = 128u;
-          const uint32_t table_blocks = static_cast<uint32_t>(
-              (item_count + table_threads - 1u) / table_threads);
-          cubbs_bbs_proof_verify_radix16_tables_kernel
-              <<<table_blocks, table_threads, 0u, stream_b>>>(
-                  dual_ws.points, item_count, dual_ws.tables);
-          err = cudaGetLastError();
-        }
-      }
-      if (err == cudaSuccess && use_pippenger) {
-        const uint32_t chunks =
-            static_cast<uint32_t>((item_count + 2047u) / 2048u);
-        int16_t *d_digits = nullptr;
-        cubbs_sppark_bucket_t *d_win_chunk_sums = nullptr;
-        err = cudaMallocAsync(&d_digits, 51u * item_count * sizeof(int16_t), stream_b);
-        if (err == cudaSuccess) {
-          err = cudaMallocAsync(
-              &d_win_chunk_sums,
-              51u * chunks * sizeof(cubbs_sppark_bucket_t), stream_b);
-        }
-        if (err == cudaSuccess) {
-          constexpr uint32_t r_threads = 128u;
-          const uint32_t r_blocks = static_cast<uint32_t>(
-              (item_count + r_threads - 1u) / r_threads);
-          cubbs_bbs_verify_pippenger_recode_kernel<<<r_blocks, r_threads, 0u, stream_b>>>(
-              d_e, d_coef, item_count, d_digits, d_invalid);
-          err = cudaGetLastError();
-        }
-        if (err == cudaSuccess) {
-          const dim3 bucket_grid(17u, 3u, chunks);
-          cubbs_bbs_verify_pippenger_buckets_s8_kernel<<<bucket_grid, 128u, 0u, stream_b>>>(
-              dual_ws.points, 0u, d_digits, 17u * item_count, item_count, chunks,
-              d_win_chunk_sums);
-          err = cudaGetLastError();
-        }
-        if (err == cudaSuccess) {
-          cubbs_bbs_verify_pippenger_combine_s8_kernel<<<1u, 32u, 0u, stream_b>>>(
-              d_win_chunk_sums, chunks, 3u, true, dual_ws.outputs);
-          err = cudaGetLastError();
-        }
-        if (d_win_chunk_sums != nullptr) (void)cudaFreeAsync(d_win_chunk_sums, stream_b);
-        if (d_digits != nullptr) (void)cudaFreeAsync(d_digits, stream_b);
-      } else if (err == cudaSuccess) {
-        constexpr uint32_t s_threads = 256u;
-        const uint32_t s_blocks = static_cast<uint32_t>(
-            (item_count + s_threads - 1u) / s_threads);
-        cubbs_bbs_verify_build_dual_a_scalars_kernel<<<s_blocks, s_threads, 0u, stream_b>>>(
-            d_e, d_coef, item_count, dual_ws.scalars, d_invalid);
-        err = cudaGetLastError();
-        if (err == cudaSuccess) {
-          constexpr uint32_t threads = 128u;
-          const size_t product_count = item_count * 2u;
-          const uint32_t blocks = static_cast<uint32_t>(
-              (product_count + threads - 1u) / threads);
-          cubbs_bbs_g1_dual_msm_decompose_kernel<<<blocks, threads, 0u, stream_b>>>(
-              dual_ws.scalars, product_count, dual_ws.components);
-          err = cudaGetLastError();
-          if (err == cudaSuccess) {
-            cubbs_bbs_g1_dual_msm_same_points_table_mul_kernel<<<blocks, threads, 0u, stream_b>>>(
-                dual_ws.tables, dual_ws.components, item_count, dual_ws.products);
-            err = cudaGetLastError();
-          }
-          if (err == cudaSuccess) {
-            const dim3 reduce_grid(1u, 2u, 1u);
-            cubbs_bbs_g1_dual_msm_reduce_all_kernel<128u><<<reduce_grid, 128u, 0u, stream_b>>>(
-                dual_ws.products, item_count, dual_ws.outputs);
-            err = cudaGetLastError();
-          }
-        }
-      }
-      // Combine rhs = b_agg + ae_agg, normalize (a_agg, rhs_agg) to affine,
-      // and launch single fused GPU pairing directly on stream_b (1 sync total!).
-      uint8_t *d_eq_out = nullptr;
+  } else if (err == cudaSuccess) {
+    constexpr uint32_t s_threads = 256u;
+    const uint32_t s_blocks = static_cast<uint32_t>(
+        (item_count + s_threads - 1u) / s_threads);
+    cubbs_bbs_verify_build_dual_a_scalars_kernel<<<s_blocks, s_threads, 0u, stream_b>>>(
+        d_e, d_coef, item_count, dual_ws.scalars, d_invalid);
+    err = cudaGetLastError();
+    if (err == cudaSuccess) {
+      constexpr uint32_t threads = 128u;
+      const size_t product_count = item_count * 2u;
+      const uint32_t blocks = static_cast<uint32_t>(
+          (product_count + threads - 1u) / threads);
+      cubbs_bbs_g1_dual_msm_decompose_kernel<<<blocks, threads, 0u, stream_b>>>(
+          dual_ws.scalars, product_count, dual_ws.components);
+      err = cudaGetLastError();
       if (err == cudaSuccess) {
-        err = cudaMallocAsync(&d_eq_out, sizeof(uint8_t), stream_b);
-      }
-      if (err == cudaSuccess) {
-        cubbs_bbs_verify_finalize_pair_affines_kernel<<<1u, 32u, 0u, stream_b>>>(
-            dual_ws.outputs, d_b_output, d_pair_affines, d_inf_flag);
+        cubbs_bbs_g1_dual_msm_same_points_table_mul_kernel<<<blocks, threads, 0u, stream_b>>>(
+            dual_ws.tables, dual_ws.components, item_count, dual_ws.products);
         err = cudaGetLastError();
       }
       if (err == cudaSuccess) {
-        const int32_t pair_launch = cubbs_bbs_cuda_launch_pairing_eq_single_on_stream(
-            &d_pair_affines[0], &d_pair_affines[1],
-            pipe_ws.pk_lines, pipe_ws.g2_lines,
-            item->public_key.data, item->g2_generator.data,
-            d_eq_out, stream_b);
+        const dim3 reduce_grid(1u, 2u, 1u);
+        cubbs_bbs_g1_dual_msm_reduce_all_kernel<128u><<<reduce_grid, 128u, 0u, stream_b>>>(
+            dual_ws.products, item_count, dual_ws.outputs);
+        err = cudaGetLastError();
+      }
+    }
+  }
+
+  // Stage 4: Finalize (a_agg, S_g2 = sum r_i*(B_i - e_i*A_i)) and run GPU pairing!
+  if (err == cudaSuccess) {
+    cubbs_bbs_verify_finalize_pair_affines_kernel<<<1u, 32u, 0u, stream_b>>>(
+        dual_ws.outputs, d_b_output, d_pair_affines, d_inf_flag);
+    err = cudaGetLastError();
+  }
+  if (err == cudaSuccess) {
+    if (!unique_pk) {
+      const int32_t pair_launch = cubbs_bbs_cuda_launch_pairing_eq_single_on_stream(
+          &d_pair_affines[0], &d_pair_affines[1],
+          pipe_ws.pk_lines, pipe_ws.g2_lines,
+          item->public_key.data, item->g2_generator.data,
+          d_eq_out, stream_b);
+      if (pair_launch != CUBBS_BBS_GPU_SUCCESS) err = cudaErrorUnknown;
+    } else {
+      // Unique-PK GPU-resident randomized multi-pairing:
+      //   prod_i e(r_i * A_i, pk_i) * e(-S_g2, G_2) == 1 (ONE FinalExp, 0 CPU G2 decode!).
+      constexpr uint32_t sc_threads = 64u;
+      const uint32_t sc_blocks = static_cast<uint32_t>((item_count + sc_threads - 1u) / sc_threads);
+      cubbs_bbs_g1_scale_128bit_to_xyzz_kernel<<<sc_blocks, sc_threads, 0, stream_b>>>(
+          dual_ws.points, 1u, d_coef, item_count, d_scaled_a_xyzz);
+      err = cudaGetLastError();
+      if (err == cudaSuccess) {
+        cubbs_bbs_xyzz_to_plain_affine_batch64_kernel<<<sc_blocks, 64u, 0, stream_b>>>(
+            d_scaled_a_xyzz, d_scaled_a_affines, item_count);
+        err = cudaGetLastError();
+      }
+      if (err == cudaSuccess) {
+        const int32_t pair_launch = cubbs_bbs_cuda_launch_pairing_unique_pk_on_stream(
+            d_scaled_a_affines, &d_pair_affines[1], d_pks_comp,
+            item->public_key.data, item_count,
+            pipe_ws.g2_lines, item->g2_generator.data, d_invalid, d_eq_out, stream_b);
         if (pair_launch != CUBBS_BBS_GPU_SUCCESS) err = cudaErrorUnknown;
       }
-      if (err == cudaSuccess) {
-        err = cudaMemcpyAsync(pipe_ws.aux_out, d_inf_flag, sizeof(uint32_t),
-                              cudaMemcpyDeviceToHost, stream_b);
-      }
-      if (err == cudaSuccess) {
-        err = cudaMemcpyAsync(pipe_ws.aux_out + sizeof(uint32_t), d_eq_out,
-                              sizeof(uint8_t), cudaMemcpyDeviceToHost, stream_b);
-      }
-      if (err == cudaSuccess) {
-        err = cudaMemcpyAsync(pipe_ws.invalid_flag, d_invalid, sizeof(uint32_t),
-                              cudaMemcpyDeviceToHost, stream_b);
-      }
-      if (d_eq_out != nullptr) (void)cudaFreeAsync(d_eq_out, stream_b);
     }
   }
-
+  if (err == cudaSuccess) {
+    err = cudaMemcpyAsync(pipe_ws.aux_out, d_inf_flag, sizeof(uint32_t),
+                          cudaMemcpyDeviceToHost, stream_b);
+  }
+  if (err == cudaSuccess) {
+    err = cudaMemcpyAsync(pipe_ws.aux_out + sizeof(uint32_t), d_eq_out,
+                          sizeof(uint8_t), cudaMemcpyDeviceToHost, stream_b);
+  }
+  if (err == cudaSuccess) {
+    err = cudaMemcpyAsync(pipe_ws.invalid_flag, d_invalid, sizeof(uint32_t),
+                          cudaMemcpyDeviceToHost, stream_b);
+  }
   if (err == cudaSuccess) {
     err = cudaStreamSynchronize(stream_b);
   }
 
   msm_transient.free_async(stream_b);
-  if (d_inf_flag != nullptr) (void)cudaFreeAsync(d_inf_flag, stream_b);
-  if (d_pair_affines != nullptr) (void)cudaFreeAsync(d_pair_affines, stream_b);
-  if (d_invalid != nullptr) (void)cudaFreeAsync(d_invalid, stream_b);
-  if (d_b_output != nullptr) (void)cudaFreeAsync(d_b_output, stream_b);
-  if (d_agg_b_scalars_le != nullptr) (void)cudaFreeAsync(d_agg_b_scalars_le, stream_b);
-  if (d_aux_in != nullptr) (void)cudaFreeAsync(d_aux_in, stream_b);
-  if (d_msg_scalars_le != nullptr) (void)cudaFreeAsync(d_msg_scalars_le, stream_b);
-  if (d_lengths != nullptr) (void)cudaFreeAsync(d_lengths, stream_b);
-  if (d_offsets != nullptr) (void)cudaFreeAsync(d_offsets, stream_b);
-  if (d_messages != nullptr) (void)cudaFreeAsync(d_messages, stream_b);
 
-  if (a_decode_status != CUBBS_BBS_GPU_SUCCESS) return a_decode_status;
   if (err != cudaSuccess) return CUBBS_BBS_GPU_ERR_INTERNAL;
-  if (upload_points) dual_ws.point_key = std::move(point_key);
   if (*pipe_ws.invalid_flag != 0u) return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
+  if (unique_pk) {
+    cubbs_bbs_cuda_confirm_unique_pk_lines_cache(item->public_key.data, item_count);
+  }
+  if (need_gpu_decode_a) {
+    dual_ws.point_key.resize(item_count * 48u);
+    std::memcpy(&dual_ws.point_key[0], pipe_ws.aux_in + off_a_comp, item_count * 48u);
+  }
 
   uint32_t inf_flag = 0u;
   std::memcpy(&inf_flag, pipe_ws.aux_out, sizeof(uint32_t));
   if (inf_flag != 0u) {
-    // Rare degenerate aggregate point at infinity -> return invalid so caller falls back.
     return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
   }
 

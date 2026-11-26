@@ -1377,6 +1377,178 @@ fn cuda_abi_does_not_advertise_legacy_prepare_b_stub() {
     assert!(kernel.can_g1_msm());
 }
 
+#[test]
+#[ignore = "requires a real CUDA device; run with CUBBS_BBS_FORCE_GPU=1 CUBBS_BBS_REQUIRE_HARDWARE_GPU=1 CUBBS_BBS_GPU_LIBRARY=<absolute .so>"]
+fn loaded_gpu_unique_pk_verify_and_proof_verify_and_subgroup_rejection() {
+    use bls12_381_plus::{G1Affine, G2Affine};
+
+    let gpu = GpuBbsEngine::new();
+    let kernel = gpu.kernel.as_ref().expect("CUDA kernel must be loaded");
+    assert_eq!(kernel.backend_kind, gpu_abi::CUBBS_BBS_GPU_BACKEND_KIND_CUDA);
+    let engine = BbsEngine::GpuRequestedCpuFallback(gpu);
+
+    let mut rng = rand::thread_rng();
+    let count = 16usize;
+    let m = 32usize;
+    let hdr = header();
+    let ph = b"unique-pk-subgroup-test-ph".to_vec();
+    let disclosed_indexes: Vec<usize> = (0..m).step_by(2).collect();
+
+    let mut sign_reqs = Vec::with_capacity(count);
+    for i in 0..count {
+        let kp = engine.generate_keypair(&mut rng).unwrap();
+        let msgs: Vec<Vec<u8>> = (0..m)
+            .map(|j| format!("unique-item-{i}-msg-{j}").into_bytes())
+            .collect();
+        sign_reqs.push(SignRequest {
+            secret_key: kp.secret_key,
+            public_key: kp.public_key,
+            header: hdr.clone(),
+            messages: msgs,
+        });
+    }
+    let signed = engine.sign_batch(sign_reqs.clone(), false);
+    assert_eq!(signed.succeeded, count);
+    assert_eq!(signed.failed, 0);
+
+    let verify_reqs: Vec<VerifyRequest> = sign_reqs
+        .iter()
+        .zip(signed.results.iter())
+        .map(|(s, r)| VerifyRequest {
+            public_key: s.public_key.clone(),
+            signature: r.result.as_ref().unwrap().clone(),
+            header: s.header.clone(),
+            messages: s.messages.clone(),
+        })
+        .collect();
+
+    // 1. Cold + warm Unique-PK Verify (tests GPU G1/G2 uncompress + Scott subgroup + Multi-Miller + cache hit).
+    for _ in 0..2 {
+        let res = engine.verify_batch(verify_reqs.clone(), false);
+        assert_eq!(res.succeeded, count);
+        assert_eq!(res.failed, 0);
+        assert!(res.results.iter().all(|r| matches!(r.result, Ok(true))));
+    }
+
+    // 2. ProofGen + cold & warm Unique-PK ProofVerify.
+    let pg_reqs: Vec<ProofGenRequest> = verify_reqs
+        .iter()
+        .map(|v| ProofGenRequest {
+            public_key: v.public_key.clone(),
+            signature: v.signature.clone(),
+            header: v.header.clone(),
+            presentation_header: ph.clone(),
+            messages: v.messages.clone(),
+            disclosed_indexes: disclosed_indexes.clone(),
+        })
+        .collect();
+    let proofs = engine.proof_gen_batch(pg_reqs, false);
+    assert_eq!(proofs.succeeded, count);
+    assert_eq!(proofs.failed, 0);
+
+    let pv_reqs: Vec<ProofVerifyRequest> = verify_reqs
+        .iter()
+        .zip(proofs.results.iter())
+        .map(|(v, p)| ProofVerifyRequest {
+            public_key: v.public_key.clone(),
+            proof: p.result.as_ref().unwrap().clone(),
+            header: v.header.clone(),
+            presentation_header: ph.clone(),
+            disclosed_messages: disclosed_indexes
+                .iter()
+                .map(|&idx| v.messages[idx].clone())
+                .collect(),
+            disclosed_indexes: disclosed_indexes.clone(),
+            total_message_count: m,
+        })
+        .collect();
+    for _ in 0..2 {
+        let res = engine.proof_verify_batch(pv_reqs.clone(), false);
+        assert_eq!(res.succeeded, count);
+        assert_eq!(res.failed, 0);
+        assert!(res.results.iter().all(|r| matches!(r.result, Ok(true))));
+    }
+
+    // 3. Find a valid ON-CURVE G1 point NOT in G1 subgroup, and a valid ON-CURVE G2 point NOT in G2 subgroup.
+    let mut non_subgroup_g1 = [0u8; 48];
+    let mut found_g1 = false;
+    for byte in 1u8..=255u8 {
+        let mut cand = [0u8; 48];
+        cand[0] = 0x80;
+        cand[47] = byte;
+        let ct = G1Affine::from_compressed_unchecked(&cand);
+        if bool::from(ct.is_some()) {
+            let pt = ct.unwrap();
+            if !bool::from(pt.is_identity()) && !bool::from(pt.is_torsion_free()) {
+                non_subgroup_g1 = cand;
+                found_g1 = true;
+                break;
+            }
+        }
+    }
+    assert!(found_g1, "must find on-curve non-subgroup G1 point");
+
+    let mut non_subgroup_g2 = [0u8; 96];
+    let mut found_g2 = false;
+    for byte in 1u8..=255u8 {
+        let mut cand = [0u8; 96];
+        cand[0] = 0x80;
+        cand[95] = byte;
+        let ct = G2Affine::from_compressed_unchecked(&cand);
+        if bool::from(ct.is_some()) {
+            let pt = ct.unwrap();
+            if !bool::from(pt.is_identity()) && !bool::from(pt.is_torsion_free()) {
+                non_subgroup_g2 = cand;
+                found_g2 = true;
+                break;
+            }
+        }
+    }
+    assert!(found_g2, "must find on-curve non-subgroup G2 point");
+
+    // 4a. Tampering rejection in Unique-PK Verify: swapped PK, infinity A, non-subgroup G1 A.
+    let mut tampered_v = verify_reqs.clone();
+    tampered_v[0].public_key = verify_reqs[1].public_key.clone(); // mismatched PK
+    tampered_v[2].signature[0..48].fill(0);
+    tampered_v[2].signature[0] = 0xc0; // G1 infinity
+    tampered_v[3].signature[0..48].copy_from_slice(&non_subgroup_g1); // on-curve non-subgroup G1
+    let tv_res = engine.verify_batch(tampered_v, false);
+    assert!(!matches!(tv_res.results[0].result, Ok(true)));
+    assert!(matches!(tv_res.results[1].result, Ok(true)));
+    assert!(!matches!(tv_res.results[2].result, Ok(true)));
+    assert!(!matches!(tv_res.results[3].result, Ok(true)));
+    for i in 4..count {
+        assert!(matches!(tv_res.results[i].result, Ok(true)), "item {i} must stay valid");
+    }
+
+    // 4b. Non-subgroup G2 PK must be rejected by GPU Unique-PK Verify (never Ok(true)).
+    let mut tampered_v_g2 = verify_reqs.clone();
+    tampered_v_g2[4].public_key.copy_from_slice(&non_subgroup_g2); // on-curve non-subgroup G2
+    let tv_g2_res = engine.verify_batch(tampered_v_g2, false);
+    assert!(!matches!(tv_g2_res.results[4].result, Ok(true)));
+
+    // 5a. Tampering rejection in Unique-PK ProofVerify: swapped PK isolates bad item while keeping siblings valid.
+    let mut tampered_pv = pv_reqs.clone();
+    tampered_pv[0].public_key = pv_reqs[1].public_key.clone();
+    let tpv_res = engine.proof_verify_batch(tampered_pv, false);
+    assert!(!matches!(tpv_res.results[0].result, Ok(true)));
+    for i in 1..count {
+        assert!(matches!(tpv_res.results[i].result, Ok(true)), "item {i} must stay valid");
+    }
+
+    // 5b. Non-subgroup G1 Abar must be rejected by GPU Unique-PK ProofVerify (never Ok(true)).
+    let mut tampered_pv_g1 = pv_reqs.clone();
+    tampered_pv_g1[2].proof[0..48].copy_from_slice(&non_subgroup_g1);
+    let tpv_g1_res = engine.proof_verify_batch(tampered_pv_g1, false);
+    assert!(!matches!(tpv_g1_res.results[2].result, Ok(true)));
+
+    // 5c. Non-subgroup G2 PK must be rejected by GPU Unique-PK ProofVerify (never Ok(true)).
+    let mut tampered_pv_g2 = pv_reqs.clone();
+    tampered_pv_g2[3].public_key.copy_from_slice(&non_subgroup_g2);
+    let tpv_g2_res = engine.proof_verify_batch(tampered_pv_g2, false);
+    assert!(!matches!(tpv_g2_res.results[3].result, Ok(true)));
+}
+
 fn hex_to_bytes(hex: &str) -> Vec<u8> {
     assert_eq!(hex.len() % 2, 0);
     (0..hex.len())

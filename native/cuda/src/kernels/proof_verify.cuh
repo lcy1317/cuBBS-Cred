@@ -41,7 +41,8 @@ int32_t cubbs_bbs_cuda_proof_verify_msm_pair_matrix(
       common_points, common_term_count, &cached, tiled_common, affine_common,
       affine_common ? 9u : 0u, universal_common);
   if (status != CUBBS_BBS_GPU_SUCCESS ||
-      (cached->device_limlee_affines == nullptr &&
+      (!cached->use_pippenger_large &&
+       cached->device_limlee_affines == nullptr &&
        cached->device_fixed_glv_affine_comb8 == nullptr &&
        cached->device_fixed_glv_affine_comb9 == nullptr &&
        cached->device_fixed_glv_affine_comb10 == nullptr &&
@@ -301,7 +302,11 @@ int32_t cubbs_bbs_cuda_proof_verify_msm_pair_matrix(
   if (error == cudaSuccess) {
     const uint32_t common_threads =
         fused_common_points_adaptive_threads(common_term_count, output_count);
-    if (cached->device_limlee_affines != nullptr) {
+    if (cached->use_pippenger_large) {
+      error = cubbs_bbs_launch_pippenger_large_glv_msm(
+          cached->device_points, device_common_scalars, common_term_count,
+          output_count, device_t2, stream);
+    } else if (cached->device_limlee_affines != nullptr) {
       error = cubbs_bbs_launch_glv_limlee(
           cached->device_limlee_affines, cached->device_limlee_offsets,
           cached->device_limlee_c_total, device_common_scalars,

@@ -144,6 +144,15 @@ int32_t cubbs_bbs_cuda_launch_pairing_eq_single_on_stream(
     const uint8_t *lhs_g2_key, const uint8_t *rhs_g2_key,
     uint8_t *d_eq_out, void *cuda_stream);
 
+int32_t cubbs_bbs_cuda_launch_pairing_unique_pk_on_stream(
+    const void *d_lhs_g1_affines, const void *d_rhs_g1_agg,
+    const uint8_t *d_pks_compressed, const uint8_t *h_pks_compressed,
+    size_t item_count, const uint8_t *g2_lines, const uint8_t *g2_key,
+    uint32_t *d_invalid_flag, uint8_t *d_eq_out, void *cuda_stream);
+
+void cubbs_bbs_cuda_confirm_unique_pk_lines_cache(
+    const uint8_t *h_pks_compressed, size_t item_count);
+
 int32_t cubbs_bbs_cuda_proof_gen_t2_prepare(
     struct CuBbsBbsGpuProofGenT2PrepareItem *items, size_t item_count,
     CuBbsBbsGpuResult *results);

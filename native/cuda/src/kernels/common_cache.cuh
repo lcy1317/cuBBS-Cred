@@ -26,6 +26,7 @@ struct CuBbsFusedCommonPointsCache {
   uint32_t limlee_group_size{0u};
   uint32_t limlee_v_sub{0u};
   size_t limlee_total_entries{0u};
+  bool use_pippenger_large{false};
   uint8_t *device_scalars{nullptr};
   cubbs_sppark_bucket_t *device_outputs{nullptr};
   // Dedicated CUDA stream so launches for different point-set groups can
@@ -211,7 +212,11 @@ static bool bbs_limlee_comb_enabled() {
 
 static cudaError_t build_limlee_table_for_cache(
     CuBbsFusedCommonPointsCache *cached, size_t term_count) {
-  uint32_t group_size = 15u;
+  // L2-optimal group sizes on RTX 5060 Ti (32 MB L2):
+  //   - M=64 (<= 70 terms): g=14, v=4 -> 5 groups = 20 subtables, HALF table size (12.8 MB vs 25.2 MB)!
+  //   - M=256 (71..1024 terms): g=15 -> 18 groups (26.7 MB, fits in 32 MB L2!)
+  //   - M=2048 (> 1024 terms): g=16, v=1 -> 129 groups (-5.8% fewer adds & GDDR7 reads!)
+  uint32_t group_size = (term_count <= 70u) ? 14u : ((term_count > 1024u) ? 16u : 15u);
   if (const char *genv = std::getenv("CUBBS_BBS_LIMLEE_GROUP_SIZE")) {
     const unsigned long parsed = std::strtoul(genv, nullptr, 10);
     if (parsed >= 8ul && parsed <= CUBBS_LIMLEE_MAX_GROUP_SIZE) {
@@ -405,6 +410,26 @@ static int32_t get_fused_common_points_cache(
                                                 cudaStreamNonBlocking);
       }
       if (cuda_status != cudaSuccess) return CUBBS_BBS_GPU_ERR_INTERNAL;
+      retain_fused_common_points_cache(key, cached);
+      *cached_out = cached;
+      return CUBBS_BBS_GPU_SUCCESS;
+    }
+    const bool use_pip_large =
+        term_count > 2100u &&
+        (std::getenv("CUBBS_BBS_LARGE_PIPPENGER") == nullptr ||
+         env_flag_enabled("CUBBS_BBS_LARGE_PIPPENGER"));
+    if (use_pip_large) {
+      cudaError_t cuda_status = cudaMalloc(&cached->device_points, point_bytes);
+      if (cuda_status == cudaSuccess) {
+        cuda_status = cudaMemcpy(cached->device_points, decoded_points.data(),
+                                 point_bytes, cudaMemcpyHostToDevice);
+      }
+      if (cuda_status == cudaSuccess) {
+        cuda_status = cudaStreamCreateWithFlags(&cached->stream,
+                                                cudaStreamNonBlocking);
+      }
+      if (cuda_status != cudaSuccess) return CUBBS_BBS_GPU_ERR_INTERNAL;
+      cached->use_pippenger_large = true;
       retain_fused_common_points_cache(key, cached);
       *cached_out = cached;
       return CUBBS_BBS_GPU_SUCCESS;

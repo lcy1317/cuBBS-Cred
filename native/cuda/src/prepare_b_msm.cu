@@ -543,10 +543,13 @@ static bool g1_msm_items_have_common_points(const CuBbsG1MsmInput *items,
 // separate CUDA translation unit because it has an independent workspace,
 // stream policy, and optimization lifecycle.
 #include "kernels/common_base.cuh"
+#include "kernels/device_arena.cuh"
 #include "kernels/large_msm.cuh"
 #include "kernels/comb_msm.cuh"
 #include "kernels/comb_precompute.cuh"
 #include "kernels/limlee_msm.cuh"
+#include "kernels/pippenger_large_msm.cuh"
+#include "kernels/gpu_g1_decompress.cuh"
 #include "kernels/affine_msm.cuh"
 #include "kernels/common_cache.cuh"
 #include "kernels/common_reference.cuh"
