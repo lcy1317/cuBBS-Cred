@@ -1,6 +1,12 @@
 .env
 task.list
 
+# Local agent configuration and paper-data index.
+.agent/
+.agents/
+.codex/
+/PAPER_DATA.md
+
 # Build and dependency outputs are reproducible and must stay local.
 /target/
 /dist/
