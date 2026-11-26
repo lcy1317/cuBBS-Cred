@@ -19,12 +19,9 @@ pub mod planner;
 pub mod reference;
 
 use std::{
-    collections::{hash_map::Entry, HashMap, HashSet, VecDeque},
+    collections::{hash_map::Entry, HashMap, VecDeque},
     fmt,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex, OnceLock, RwLock,
-    },
+    sync::{Arc, Mutex, OnceLock, RwLock},
     thread,
     time::Instant,
 };
@@ -35,8 +32,8 @@ use cubbs_bbs_protocol::{
         ciphersuites::{BbsCiphersuite as _, Bls12381Sha256},
         keys::{BBSplusPublicKey, BBSplusSecretKey},
         proof::{
-            BBSplusProofGenT2CompressedState, BBSplusProofGenT2MsmTerms, BBSplusProofGenT2State,
-            BBSplusProofVerifyMsmTerms, BBSplusProofVerifyPrecomputedItem,
+            BBSplusProofGenT2MsmTerms, BBSplusProofGenT2State, BBSplusProofVerifyMsmTerms,
+            BBSplusProofVerifyPrecomputedItem,
         },
         signature::{BBSplusPrepareBMsmTerms, BBSplusPreparedB},
     },
@@ -292,28 +289,6 @@ pub struct GpuMsmBenchRun {
     pub output_count: usize,
 }
 
-/// Input for the GPU proof-gen t2Prepare (6 fixed G1 scalar multiplications).
-/// The 7 scalars are host-precomputed for six independent base-point muls:
-/// [r2, r1*r2, r1*r2, r1*r2*e, r1*r2*e_tilde, r2*r1_tilde, r3_tilde].
-#[derive(Debug, Clone)]
-struct BbsT2PrepareGpuInput<'a> {
-    compressed_b: &'a [u8],
-    signature_a: &'a [u8],
-    scalars_be: [&'a [u8]; 7],
-    seed: &'a [u8],
-}
-
-/// Output of the GPU proof-gen t2Prepare: the 4 compressed G1 points.
-#[derive(Debug, Clone)]
-struct BbsT2PrepareGpuOutput {
-    d: Vec<u8>,
-    abar: Vec<u8>,
-    bbar: Vec<u8>,
-    t1: Vec<u8>,
-}
-
-/// Pre-computed B2 scalars/points for t2Prepare that are independent of B
-/// (generated in a background thread overlapping the GPU B-MSM).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BbsPairingEqInput {
     lhs_g1: Vec<u8>,

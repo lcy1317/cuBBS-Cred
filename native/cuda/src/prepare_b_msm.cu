@@ -52,13 +52,6 @@ typedef fr_t cubbs_sppark_scalar_t;
 #define SPPARK_DONT_INSTANTIATE_TEMPLATES
 #include <msm/pippenger.cuh>
 #endif
-
-static int32_t cubbs_bbs_cuda_g1_variable_base_single_term_batch(
-    const CuBbsG1MsmInput *items, size_t item_count,
-    CuBbsBbsGpuResult *results);
-static int32_t cubbs_bbs_cuda_g1_variable_base_generic_batch(
-    const CuBbsG1MsmInput *items, size_t item_count,
-    CuBbsBbsGpuResult *results);
 #endif
 
 static void set_result(CuBbsBbsGpuResult *results, size_t index, int32_t code,
@@ -300,194 +293,6 @@ static void configure_cubbs_async_mempool() {
   });
 }
 
-static bool bbs_homogeneous_kernel_enabled() {
-  return env_flag_default_enabled("CUBBS_BBS_BBS_HOMOGENEOUS_KERNEL");
-}
-
-static bool bbs_homogeneous_comb_enabled() {
-  return env_flag_default_enabled("CUBBS_BBS_BBS_HOMOGENEOUS_COMB");
-}
-
-static bool bbs_homogeneous_affine_comb_enabled() {
-  return env_flag_default_enabled("CUBBS_BBS_BBS_AFFINE_COMB");
-}
-
-static size_t bbs_homogeneous_comb_bits(size_t term_count) {
-  const char *configured_env =
-      std::getenv("CUBBS_BBS_BBS_HOMOGENEOUS_COMB_BITS");
-  const size_t shape_default = term_count >= 18u && term_count <= 66u
-      ? 10u
-      : (term_count >= 67u && term_count <= 160u ? 9u : 8u);
-  const size_t configured = configured_env == nullptr
-      ? shape_default
-      : env_size_or_default("CUBBS_BBS_BBS_HOMOGENEOUS_COMB_BITS",
-                            shape_default);
-  return configured == 4u || configured == 6u || configured == 8u ||
-                 configured == 9u || configured == 10u
-             ? configured
-             : 5u;
-}
-
-static size_t bbs_specialized_max_terms() {
-  // 258 terms covers a 256-message BBS shape plus the two fixed B terms.
-  return env_size_or_default(
-      "CUBBS_BBS_BBS_SPECIALIZED_MAX_TERMS", 258u);
-}
-
-static size_t bbs_specialized_cache_budget_bytes() {
-  return env_size_or_default(
-      "CUBBS_BBS_BBS_SPECIALIZED_CACHE_BUDGET_BYTES", 256u * 1024u * 1024u);
-}
-
-static bool bbs_large_shape_kernel_enabled() {
-  return env_flag_default_enabled("CUBBS_BBS_GPU_LARGE_SHAPE_KERNEL");
-}
-
-static size_t bbs_large_shape_max_terms() {
-  // 4098 terms covers 4096 BBS messages plus the two fixed B terms.
-  return env_size_or_default("CUBBS_BBS_GPU_LARGE_SHAPE_MAX_TERMS", 4098u);
-}
-
-static size_t bbs_large_shape_tile_terms() {
-  const size_t configured =
-      env_size_or_default("CUBBS_BBS_GPU_LARGE_SHAPE_TILE_TERMS", 128u);
-  return configured == 64u || configured == 128u || configured == 256u
-             ? configured
-             : 128u;
-}
-
-static bool bbs_large_shape_pippenger_enabled() {
-  return env_flag_enabled("CUBBS_BBS_GPU_LARGE_SHAPE_PIPPENGER");
-}
-
-static bool bbs_large_shape_window8_enabled() {
-  return env_flag_enabled("CUBBS_BBS_GPU_LARGE_SHAPE_WINDOW8");
-}
-
-static bool bbs_large_shape_glv_enabled() {
-  return env_flag_default_enabled("CUBBS_BBS_GPU_LARGE_SHAPE_GLV");
-}
-
-static bool bbs_large_shape_glv_wnaf_enabled() {
-  return env_flag_enabled("CUBBS_BBS_GPU_LARGE_SHAPE_GLV_WNAF");
-}
-
-static bool bbs_universal_tiled_kernel_enabled() {
-  return env_flag_default_enabled("CUBBS_BBS_GPU_UNIVERSAL_TILED_KERNEL");
-}
-
-static size_t bbs_universal_tiled_cache_budget_bytes() {
-  // The 65,538-term BBS common-point set needs about 607 MiB with both the
-  // window-4 and GLV window-4 tables enabled. Keep enough headroom for that
-  // publication shape without letting an arbitrary Route 4 request build an
-  // unbounded precomputation table. Larger shapes retain the resource-bounded
-  // universal fallback below this optimized tier.
-  return env_size_or_default(
-      "CUBBS_BBS_GPU_UNIVERSAL_TILED_CACHE_BUDGET_BYTES",
-      768u * 1024u * 1024u);
-}
-
-static size_t bbs_universal_item_tile_terms() {
-  const size_t configured = env_size_or_default(
-      "CUBBS_BBS_GPU_UNIVERSAL_ITEM_TILE_TERMS", 128u);
-  return configured == 64u || configured == 128u || configured == 256u
-             ? configured
-             : 128u;
-}
-
-static size_t bbs_universal_item_tiled_min_terms() {
-  return env_size_or_default(
-      "CUBBS_BBS_GPU_UNIVERSAL_ITEM_TILED_MIN_TERMS", 512u);
-}
-
-static size_t bbs_universal_item_partial_budget_bytes() {
-  return env_size_or_default(
-      "CUBBS_BBS_GPU_UNIVERSAL_ITEM_PARTIAL_BUDGET_BYTES",
-      256u * 1024u * 1024u);
-}
-
-#if defined(CUBBS_BBS_ENABLE_SPPARK_MSM)
-static bool bbs_specialized_common_points_supported(size_t term_count) {
-  if (term_count > bbs_specialized_max_terms()) return false;
-
-  const size_t comb_bits = bbs_homogeneous_comb_bits(term_count);
-  size_t comb_entries = 0u;
-  if (bbs_homogeneous_comb_enabled()) {
-    if (comb_bits == 4u) comb_entries = 64u * 16u;
-    else if (comb_bits == 5u) comb_entries = 52u * 17u;
-    else if (comb_bits == 6u) comb_entries = 43u * 33u;
-    else if (comb_bits == 8u) comb_entries = 32u * 129u;
-    else if (comb_bits == 9u) comb_entries = 29u * 257u;
-    else comb_entries = 26u * 513u;
-  }
-  const size_t bucket_entries = 16u + 256u + comb_entries;
-  const size_t fixed_bytes =
-      sizeof(cubbs_sppark_bucket_t::affine_t);
-  if (bucket_entries >
-      (static_cast<size_t>(-1) - fixed_bytes) /
-          sizeof(cubbs_sppark_bucket_t)) {
-    return false;
-  }
-  const size_t bytes_per_term =
-      fixed_bytes + bucket_entries * sizeof(cubbs_sppark_bucket_t);
-  const size_t budget = bbs_specialized_cache_budget_bytes();
-  return bytes_per_term == 0u || term_count <= budget / bytes_per_term;
-}
-
-static bool bbs_large_shape_kernel_supported(size_t term_count) {
-  return bbs_large_shape_kernel_enabled() &&
-         !bbs_specialized_common_points_supported(term_count) &&
-         term_count <= bbs_large_shape_max_terms();
-}
-
-static bool bbs_universal_tiled_common_supported(size_t term_count) {
-  if (!bbs_universal_tiled_kernel_enabled() || term_count == 0u ||
-      term_count > static_cast<size_t>(UINT32_MAX)) {
-    return false;
-  }
-  const size_t tile_terms = bbs_large_shape_tile_terms();
-  const size_t tile_count = (term_count + tile_terms - 1u) / tile_terms;
-  // The tiled common-point kernels use grid.y for the term tile.
-  if (tile_count == 0u || tile_count > 65535u) return false;
-
-  size_t entries_per_term = 0u;
-  const auto add_entries = [&](size_t entries) {
-    if (entries_per_term > static_cast<size_t>(-1) - entries) return false;
-    entries_per_term += entries;
-    return true;
-  };
-  // The current large-table builder always retains affine points and the
-  // ordinary window-4 table. Optional tables are counted exactly as built.
-  if (!add_entries(16u)) return false;
-  if (bbs_large_shape_glv_enabled() && !add_entries(32u)) return false;
-  if (bbs_large_shape_glv_enabled() && bbs_large_shape_glv_wnaf_enabled() &&
-      !add_entries(128u)) {
-    return false;
-  }
-  if (bbs_large_shape_window8_enabled() && !add_entries(256u)) return false;
-
-  if (entries_per_term >
-      (static_cast<size_t>(-1) -
-       sizeof(cubbs_sppark_bucket_t::affine_t)) /
-          sizeof(cubbs_sppark_bucket_t)) {
-    return false;
-  }
-  const size_t bytes_per_term = sizeof(cubbs_sppark_bucket_t::affine_t) +
-      entries_per_term * sizeof(cubbs_sppark_bucket_t);
-  const size_t budget = bbs_universal_tiled_cache_budget_bytes();
-  return bytes_per_term > 0u && term_count <= budget / bytes_per_term;
-}
-#else
-static bool bbs_large_shape_kernel_supported(size_t) { return false; }
-static bool bbs_universal_tiled_common_supported(size_t) { return false; }
-#endif
-
-static size_t bbs_homogeneous_kernel_min_items(size_t /*term_count*/) {
-  const size_t shape_default = 1u;
-  return env_size_or_default("CUBBS_BBS_BBS_HOMOGENEOUS_KERNEL_MIN_ITEMS",
-                             shape_default);
-}
-
 static size_t blst_msm_worker_count(size_t item_count) {
   const unsigned int hardware = std::thread::hardware_concurrency();
   const size_t default_workers =
@@ -497,21 +302,6 @@ static size_t blst_msm_worker_count(size_t item_count) {
   if (configured == 0u) {
     return std::max<size_t>(1u, std::min(item_count, default_workers));
   }
-  return std::max<size_t>(1u, std::min(item_count, configured));
-}
-
-static size_t fused_compress_worker_count(size_t item_count) {
-  const char *configured_env = std::getenv("CUBBS_BBS_FUSED_COMPRESS_WORKERS");
-  if (configured_env == nullptr || configured_env[0] == '\0' ||
-      item_count < env_size_or_default("CUBBS_BBS_FUSED_COMPRESS_PARALLEL_MIN_ITEMS",
-                                       64u)) {
-    return 1u;
-  }
-  const unsigned int hardware = std::thread::hardware_concurrency();
-  const size_t default_workers =
-      hardware == 0u ? 8u : std::min<size_t>(8u, static_cast<size_t>(hardware));
-  const size_t configured =
-      env_size_or_default("CUBBS_BBS_FUSED_COMPRESS_WORKERS", default_workers);
   return std::max<size_t>(1u, std::min(item_count, configured));
 }
 
@@ -539,28 +329,16 @@ static bool g1_msm_items_have_common_points(const CuBbsG1MsmInput *items,
 }
 #endif
 
-// MSM implementation modules are included in dependency order. Pairing is a
-// separate CUDA translation unit because it has an independent workspace,
-// stream policy, and optimization lifecycle.
+// Slim production Opt CUDA modules included in dependency order.
 #include "kernels/common_base.cuh"
 #include "kernels/device_arena.cuh"
-#include "kernels/large_msm.cuh"
-#include "kernels/comb_msm.cuh"
-#include "kernels/comb_precompute.cuh"
 #include "kernels/limlee_msm.cuh"
 #include "kernels/pippenger_large_msm.cuh"
 #include "kernels/gpu_g1_decompress.cuh"
-#include "kernels/affine_msm.cuh"
 #include "kernels/common_cache.cuh"
-#include "kernels/common_reference.cuh"
 #include "kernels/scalar_decode.cuh"
-#include "kernels/common_universal.cuh"
 #include "kernels/common_fused_runtime.cuh"
 #include "kernels/msm_dispatch.cuh"
-#include "kernels/variable_base_universal.cuh"
-#include "kernels/variable_base_specialized.cuh"
-#include "kernels/proof_verify.cuh"
-#include "kernels/proof_gen.cuh"
 #include "kernels/aggregate_dual_msm.cuh"
 #define CUBBS_BBS_SHA256_DEVICE_ONLY
 #include "sha256.cuh"

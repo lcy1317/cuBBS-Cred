@@ -132,306 +132,6 @@ static cudaError_t cubbs_bbs_launch_xyzz_to_compressed(
 }
 
 // ============================================================================
-// Shared Cached Common-Points MSM Kernel Launcher
-// ============================================================================
-
-struct CuBbsCommonMsmTransient {
-  int8_t *large_wnaf_digits{nullptr};
-  cubbs_sppark_bucket_t *large_partials{nullptr};
-  cubbs_sppark_bucket_t *large_bucket_partials{nullptr};
-  cubbs_sppark_bucket_t *large_window_partials{nullptr};
-  size_t large_tile_terms{0u};
-  size_t large_tile_count{0u};
-  bool large_glv{false};
-  bool large_glv_wnaf{false};
-  bool large_pippenger{false};
-  bool large_window8{false};
-  bool large_window4{false};
-
-  cudaError_t alloc(const CuBbsFusedCommonPointsCache &cached,
-                    size_t term_count, size_t output_count, bool is_large,
-                    cudaStream_t stream) {
-    if (cached.device_limlee_affines != nullptr || cached.use_pippenger_large) {
-      large_window4 = false;
-      large_glv = false;
-      large_glv_wnaf = false;
-      large_pippenger = false;
-      large_window8 = false;
-      return cudaSuccess;
-    }
-    large_window4 = is_large;
-    large_glv = is_large && cached.device_point_glv_multiples != nullptr &&
-                !bbs_large_shape_pippenger_enabled() &&
-                !bbs_large_shape_window8_enabled();
-    large_glv_wnaf = large_glv && cached.device_point_glv_wnaf_multiples != nullptr;
-    large_tile_terms = bbs_large_shape_tile_terms();
-    large_tile_count = is_large
-        ? (term_count + large_tile_terms - 1u) / large_tile_terms
-        : 0u;
-    large_pippenger = is_large && bbs_large_shape_pippenger_enabled();
-    large_window8 = is_large && !large_pippenger &&
-                    cached.device_point_multiples8 != nullptr;
-
-    cudaError_t err = cudaSuccess;
-    if (large_glv_wnaf) {
-      err = cudaMallocAsync(&large_wnaf_digits, output_count * term_count * 260u, stream);
-    }
-    if (err == cudaSuccess && is_large && !large_pippenger && !large_window8) {
-      err = cudaMallocAsync(
-          &large_partials,
-          output_count * large_tile_count * sizeof(*large_partials), stream);
-    }
-    if (err == cudaSuccess && large_pippenger) {
-      err = cudaMallocAsync(
-          &large_bucket_partials,
-          output_count * 64u * large_tile_count * 15u *
-              sizeof(*large_bucket_partials),
-          stream);
-    }
-    if (err == cudaSuccess && large_pippenger) {
-      err = cudaMallocAsync(
-          &large_window_partials,
-          output_count * 64u * sizeof(*large_window_partials), stream);
-    }
-    return err;
-  }
-
-  void free_async(cudaStream_t stream) {
-    if (large_wnaf_digits != nullptr) (void)cudaFreeAsync(large_wnaf_digits, stream);
-    if (large_partials != nullptr) (void)cudaFreeAsync(large_partials, stream);
-    if (large_bucket_partials != nullptr) (void)cudaFreeAsync(large_bucket_partials, stream);
-    if (large_window_partials != nullptr) (void)cudaFreeAsync(large_window_partials, stream);
-    large_wnaf_digits = nullptr;
-    large_partials = nullptr;
-    large_bucket_partials = nullptr;
-    large_window_partials = nullptr;
-  }
-};
-
-static cudaError_t cubbs_bbs_launch_cached_common_msm_range(
-    const CuBbsFusedCommonPointsCache &cached,
-    CuBbsCommonMsmTransient &transient,
-    const uint8_t *device_scalars_le,
-    size_t term_count,
-    size_t output_count,
-    cubbs_sppark_bucket_t *device_outputs,
-    cudaStream_t stream) {
-  if (output_count == 0u) return cudaSuccess;
-  if (transient.large_glv_wnaf) {
-    constexpr uint32_t recode_threads = 128u;
-    const size_t total_scalars = output_count * term_count;
-    const uint32_t recode_blocks = static_cast<uint32_t>(
-        (total_scalars + recode_threads - 1u) / recode_threads);
-    cubbs_bbs_glv_wnaf8_recode_kernel<<<recode_blocks, recode_threads, 0, stream>>>(
-        device_scalars_le, total_scalars, transient.large_wnaf_digits);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) return err;
-  }
-  const uint32_t threads = fused_common_points_adaptive_threads(term_count, output_count);
-  const uint32_t blocks = static_cast<uint32_t>(output_count);
-  if (cached.use_pippenger_large) {
-    return cubbs_bbs_launch_pippenger_large_glv_msm(
-        cached.device_points, device_scalars_le, term_count, output_count,
-        device_outputs, stream);
-  }
-  if (cached.device_limlee_affines != nullptr) {
-    return cubbs_bbs_launch_glv_limlee(
-        cached.device_limlee_affines, cached.device_limlee_offsets,
-        cached.device_limlee_c_total, device_scalars_le, term_count,
-        output_count, cached.limlee_num_groups, cached.limlee_group_size,
-        cached.limlee_v_sub, stream, device_outputs);
-  }
-  if (term_count >= 18u && cached.device_fixed_glv_affine_comb9 != nullptr) {
-    return cubbs_bbs_launch_glv_affine_comb<9u>(
-        cached.device_fixed_glv_affine_comb9, device_scalars_le, term_count,
-        output_count, stream, device_outputs);
-  }
-  if (term_count >= 18u && cached.device_fixed_glv_affine_comb10 != nullptr) {
-    return cubbs_bbs_launch_glv_affine_comb<10u>(
-        cached.device_fixed_glv_affine_comb10, device_scalars_le, term_count,
-        output_count, stream, device_outputs);
-  }
-  if (term_count >= 18u && cached.device_fixed_glv_affine_comb8 != nullptr) {
-    return cubbs_bbs_launch_glv_affine_comb<8u>(
-        cached.device_fixed_glv_affine_comb8, device_scalars_le, term_count,
-        output_count, stream, device_outputs);
-  }
-  if (term_count >= 18u && cached.device_fixed_affine_comb9 != nullptr) {
-    return cubbs_bbs_launch_affine_comb<9u>(
-        cached.device_fixed_affine_comb9, device_scalars_le, term_count,
-        output_count, threads, stream, device_outputs);
-  }
-  if (term_count >= 18u && cached.device_fixed_affine_comb10 != nullptr) {
-    return cubbs_bbs_launch_affine_comb<10u>(
-        cached.device_fixed_affine_comb10, device_scalars_le, term_count,
-        output_count, threads, stream, device_outputs);
-  }
-  if (term_count >= 18u && cached.device_fixed_affine_comb8 != nullptr) {
-    return cubbs_bbs_launch_affine_comb<8u>(
-        cached.device_fixed_affine_comb8, device_scalars_le, term_count,
-        output_count, threads, stream, device_outputs);
-  }
-  if (transient.large_glv) {
-    constexpr uint32_t glv_threads = 128u;
-    const dim3 tiled_grid(blocks, static_cast<uint32_t>(transient.large_tile_count));
-    if (transient.large_glv_wnaf) {
-      cubbs_bbs_g1_msm_large_glv_wnaf8_tiled_kernel<glv_threads>
-          <<<tiled_grid, glv_threads, 0, stream>>>(
-              cached.device_point_glv_wnaf_multiples,
-              transient.large_wnaf_digits, term_count,
-              transient.large_tile_terms, transient.large_tile_count,
-              output_count, transient.large_partials);
-    } else {
-      cubbs_bbs_g1_msm_large_glv_window4_tiled_kernel<glv_threads>
-          <<<tiled_grid, glv_threads, 0, stream>>>(
-              cached.device_point_glv_multiples, device_scalars_le, term_count,
-              transient.large_tile_terms, transient.large_tile_count,
-              output_count, transient.large_partials);
-    }
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) return err;
-    constexpr uint32_t reduce_threads = 32u;
-    cubbs_bbs_g1_msm_large_reduce_kernel<reduce_threads>
-        <<<blocks, reduce_threads, 0, stream>>>(
-            transient.large_partials, transient.large_tile_count,
-            output_count, device_outputs);
-    return cudaGetLastError();
-  }
-  if (transient.large_window8) {
-    constexpr uint32_t large_threads = 256u;
-    cubbs_bbs_g1_msm_common_points_window8_precomputed_kernel<large_threads>
-        <<<blocks, large_threads, 0, stream>>>(
-            cached.device_point_multiples8, device_scalars_le, term_count,
-            output_count, device_outputs);
-    return cudaGetLastError();
-  }
-  if (transient.large_pippenger) {
-    constexpr uint32_t bucket_threads = 128u;
-    const dim3 bucket_grid(blocks, 64u, static_cast<uint32_t>(transient.large_tile_count));
-    cubbs_bbs_g1_msm_large_pippenger_locked_buckets_kernel<bucket_threads>
-        <<<bucket_grid, bucket_threads, 0, stream>>>(
-            cached.device_points, device_scalars_le, term_count,
-            transient.large_tile_terms, transient.large_tile_count,
-            output_count, transient.large_bucket_partials);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) return err;
-    constexpr uint32_t window_threads = 32u;
-    const dim3 window_grid(blocks, 64u);
-    cubbs_bbs_g1_msm_large_pippenger_windows_kernel<window_threads>
-        <<<window_grid, window_threads, 0, stream>>>(
-            transient.large_bucket_partials, transient.large_tile_count,
-            output_count, transient.large_window_partials);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) return err;
-    cubbs_bbs_g1_msm_large_pippenger_rows_kernel<<<blocks, 1u, 0, stream>>>(
-        transient.large_window_partials, output_count, device_outputs);
-    return cudaGetLastError();
-  }
-  if (transient.large_window4) {
-    constexpr uint32_t tile_threads = 128u;
-    const dim3 tiled_grid(blocks, static_cast<uint32_t>(transient.large_tile_count));
-    cubbs_bbs_g1_msm_large_window4_tiled_kernel<tile_threads>
-        <<<tiled_grid, tile_threads, 0, stream>>>(
-            cached.device_point_multiples, device_scalars_le, term_count,
-            transient.large_tile_terms, transient.large_tile_count,
-            output_count, transient.large_partials);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) return err;
-    constexpr uint32_t reduce_threads = 32u;
-    cubbs_bbs_g1_msm_large_reduce_kernel<reduce_threads>
-        <<<blocks, reduce_threads, 0, stream>>>(
-            transient.large_partials, transient.large_tile_count,
-            output_count, device_outputs);
-    return cudaGetLastError();
-  }
-  if (cached.device_fixed_comb9 != nullptr) {
-    if (threads == 32u)
-      cubbs_bbs_g1_msm_fixed_signed_comb9_kernel<32u><<<blocks, 32u, 0, stream>>>(
-          cached.device_fixed_comb9, device_scalars_le, term_count, output_count, device_outputs);
-    else if (threads == 64u)
-      cubbs_bbs_g1_msm_fixed_signed_comb9_kernel<64u><<<blocks, 64u, 0, stream>>>(
-          cached.device_fixed_comb9, device_scalars_le, term_count, output_count, device_outputs);
-    else
-      cubbs_bbs_g1_msm_fixed_signed_comb9_kernel<128u><<<blocks, 128u, 0, stream>>>(
-          cached.device_fixed_comb9, device_scalars_le, term_count, output_count, device_outputs);
-    return cudaGetLastError();
-  }
-  if (cached.device_fixed_comb10 != nullptr) {
-    if (threads == 32u)
-      cubbs_bbs_g1_msm_fixed_signed_comb10_kernel<32u><<<blocks, 32u, 0, stream>>>(
-          cached.device_fixed_comb10, device_scalars_le, term_count, output_count, device_outputs);
-    else if (threads == 64u)
-      cubbs_bbs_g1_msm_fixed_signed_comb10_kernel<64u><<<blocks, 64u, 0, stream>>>(
-          cached.device_fixed_comb10, device_scalars_le, term_count, output_count, device_outputs);
-    else
-      cubbs_bbs_g1_msm_fixed_signed_comb10_kernel<128u><<<blocks, 128u, 0, stream>>>(
-          cached.device_fixed_comb10, device_scalars_le, term_count, output_count, device_outputs);
-    return cudaGetLastError();
-  }
-  if (cached.device_fixed_comb8 != nullptr) {
-    if (threads == 32u)
-      cubbs_bbs_g1_msm_fixed_signed_comb8_kernel<32u><<<blocks, 32u, 0, stream>>>(
-          cached.device_fixed_comb8, device_scalars_le, term_count, output_count, device_outputs);
-    else if (threads == 64u)
-      cubbs_bbs_g1_msm_fixed_signed_comb8_kernel<64u><<<blocks, 64u, 0, stream>>>(
-          cached.device_fixed_comb8, device_scalars_le, term_count, output_count, device_outputs);
-    else
-      cubbs_bbs_g1_msm_fixed_signed_comb8_kernel<128u><<<blocks, 128u, 0, stream>>>(
-          cached.device_fixed_comb8, device_scalars_le, term_count, output_count, device_outputs);
-    return cudaGetLastError();
-  }
-  if (cached.device_fixed_comb6 != nullptr) {
-    if (threads == 32u)
-      cubbs_bbs_g1_msm_fixed_signed_comb6_kernel<32u><<<blocks, 32u, 0, stream>>>(
-          cached.device_fixed_comb6, device_scalars_le, term_count, output_count, device_outputs);
-    else if (threads == 64u)
-      cubbs_bbs_g1_msm_fixed_signed_comb6_kernel<64u><<<blocks, 64u, 0, stream>>>(
-          cached.device_fixed_comb6, device_scalars_le, term_count, output_count, device_outputs);
-    else
-      cubbs_bbs_g1_msm_fixed_signed_comb6_kernel<128u><<<blocks, 128u, 0, stream>>>(
-          cached.device_fixed_comb6, device_scalars_le, term_count, output_count, device_outputs);
-    return cudaGetLastError();
-  }
-  if (cached.device_fixed_comb5 != nullptr) {
-    if (threads == 32u)
-      cubbs_bbs_g1_msm_fixed_signed_comb5_kernel<32u><<<blocks, 32u, 0, stream>>>(
-          cached.device_fixed_comb5, device_scalars_le, term_count, output_count, device_outputs);
-    else if (threads == 64u)
-      cubbs_bbs_g1_msm_fixed_signed_comb5_kernel<64u><<<blocks, 64u, 0, stream>>>(
-          cached.device_fixed_comb5, device_scalars_le, term_count, output_count, device_outputs);
-    else
-      cubbs_bbs_g1_msm_fixed_signed_comb5_kernel<128u><<<blocks, 128u, 0, stream>>>(
-          cached.device_fixed_comb5, device_scalars_le, term_count, output_count, device_outputs);
-    return cudaGetLastError();
-  }
-  if (cached.device_fixed_comb4 != nullptr) {
-    if (threads == 32u)
-      cubbs_bbs_g1_msm_fixed_comb4_kernel<32u><<<blocks, 32u, 0, stream>>>(
-          cached.device_fixed_comb4, device_scalars_le, term_count, output_count, device_outputs);
-    else if (threads == 64u)
-      cubbs_bbs_g1_msm_fixed_comb4_kernel<64u><<<blocks, 64u, 0, stream>>>(
-          cached.device_fixed_comb4, device_scalars_le, term_count, output_count, device_outputs);
-    else
-      cubbs_bbs_g1_msm_fixed_comb4_kernel<128u><<<blocks, 128u, 0, stream>>>(
-          cached.device_fixed_comb4, device_scalars_le, term_count, output_count, device_outputs);
-    return cudaGetLastError();
-  }
-  if (threads == 32u)
-    cubbs_bbs_g1_msm_common_points_window8_precomputed_kernel<32u><<<blocks, 32u, 0, stream>>>(
-        cached.device_point_multiples8, device_scalars_le, term_count, output_count, device_outputs);
-  else if (threads == 64u)
-    cubbs_bbs_g1_msm_common_points_window8_precomputed_kernel<64u><<<blocks, 64u, 0, stream>>>(
-        cached.device_point_multiples8, device_scalars_le, term_count, output_count, device_outputs);
-  else if (threads == 256u)
-    cubbs_bbs_g1_msm_common_points_window8_precomputed_kernel<256u><<<blocks, 256u, 0, stream>>>(
-        cached.device_point_multiples8, device_scalars_le, term_count, output_count, device_outputs);
-  else
-    cubbs_bbs_g1_msm_common_points_window8_precomputed_kernel<128u><<<blocks, 128u, 0, stream>>>(
-        cached.device_point_multiples8, device_scalars_le, term_count, output_count, device_outputs);
-  return cudaGetLastError();
-}
-
-// ============================================================================
 // Thread-local Pinned Staging Workspace for Fused Sign & Verify
 // ============================================================================
 
@@ -732,29 +432,9 @@ int32_t cubbs_bbs_cuda_sign_fused_common_batch(
 
   cubbs_bbs_ensure_cuda_device_schedule();
 
-  // Select the exact same cached common-points route as msm_dispatch.cuh.
-  bool large_window4 = false;
-  bool universal_window4 = false;
-  if (bbs_homogeneous_kernel_enabled() &&
-      bbs_specialized_common_points_supported(term_count) &&
-      item_count >= bbs_homogeneous_kernel_min_items(term_count)) {
-    large_window4 = false;
-  } else if (bbs_large_shape_kernel_supported(term_count)) {
-    large_window4 = true;
-  } else if (bbs_universal_tiled_common_supported(term_count)) {
-    large_window4 = true;
-    universal_window4 = true;
-  } else {
-    return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
-  }
-
   std::shared_ptr<CuBbsFusedCommonPointsCache> cached;
-  const bool affine_common =
-      !large_window4 && term_count >= 18u && item_count >= 16u &&
-      bbs_homogeneous_affine_comb_enabled();
   int32_t cache_status = get_fused_common_points_cache(
-      item->common_points, term_count, &cached, large_window4, affine_common,
-      0u, universal_window4);
+      item->common_points, term_count, &cached);
   if (cache_status != CUBBS_BBS_GPU_SUCCESS) {
     return cache_status;
   }
@@ -818,7 +498,6 @@ int32_t cubbs_bbs_cuda_sign_fused_common_batch(
   uint32_t *d_invalid = nullptr;
   cubbs_sppark_bucket_t *d_outputs = nullptr;
   uint8_t *d_signatures = nullptr;
-  CuBbsCommonMsmTransient msm_transient;
 
   const size_t total_scalars = item_count * term_count;
   const size_t d_off_bytes = meta_u64
@@ -847,7 +526,6 @@ int32_t cubbs_bbs_cuda_sign_fused_common_batch(
     d_invalid = arena.alloc<uint32_t>(1u);
     d_outputs = arena.alloc<cubbs_sppark_bucket_t>(item_count);
     d_signatures = arena.alloc<uint8_t>(sig_bytes);
-    err = msm_transient.alloc(*cached, term_count, item_count, large_window4, stream);
   }
 
   // Async H2D transfers.
@@ -921,8 +599,7 @@ int32_t cubbs_bbs_cuda_sign_fused_common_batch(
   // Kernel 4: Cached common-points MSM -> A_i in xyzz_t.
   if (err == cudaSuccess) {
     err = cubbs_bbs_launch_cached_common_msm_range(
-        *cached, msm_transient, d_scalars_le, term_count, item_count,
-        d_outputs, stream);
+        *cached, d_scalars_le, term_count, item_count, d_outputs, stream);
   }
   if (sign_profile && err == cudaSuccess) (void)cudaEventRecord(ev[4], stream);
 
@@ -964,17 +641,13 @@ int32_t cubbs_bbs_cuda_sign_fused_common_batch(
     for (int i = 0; i < 7; ++i) (void)cudaEventDestroy(ev[i]);
   }
 
-  // Free legacy MSM transient allocations if any (arena buffers stay persistent).
-  msm_transient.free_async(stream);
-
   if (err != cudaSuccess) return CUBBS_BBS_GPU_ERR_INTERNAL;
   if (*pipe_ws.invalid_flag != 0u) return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
 
   std::memcpy(item->signatures_out, pipe_ws.aux_out, sig_bytes);
-  const uint8_t route = universal_window4
-      ? CUBBS_BBS_MSM_ROUTE_CUBBS_UNIVERSAL
-      : (large_window4 ? CUBBS_BBS_MSM_ROUTE_CUBBS_LARGE
-                       : CUBBS_BBS_MSM_ROUTE_CUBBS_COMMON_POINTS);
+  const uint8_t route = cached->use_pippenger_large
+      ? CUBBS_BBS_MSM_ROUTE_CUBBS_LARGE
+      : CUBBS_BBS_MSM_ROUTE_CUBBS_COMMON_POINTS;
   for (size_t row = 0u; row < item_count; ++row) {
     set_result_route(results, row, CUBBS_BBS_GPU_SUCCESS, 80u, route);
   }
@@ -1621,27 +1294,9 @@ int32_t cubbs_bbs_cuda_verify_pre_b_aggregate_fused(
 
   cubbs_bbs_ensure_cuda_device_schedule();
 
-  // Check cached common-points route for 1-row B-MSM.
-  bool large_window4 = false;
-  bool universal_window4 = false;
-  if (bbs_homogeneous_kernel_enabled() &&
-      bbs_specialized_common_points_supported(term_count)) {
-    large_window4 = false;
-  } else if (bbs_large_shape_kernel_supported(term_count)) {
-    large_window4 = true;
-  } else if (bbs_universal_tiled_common_supported(term_count)) {
-    large_window4 = true;
-    universal_window4 = true;
-  } else {
-    return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
-  }
-
   std::shared_ptr<CuBbsFusedCommonPointsCache> cached;
-  const bool affine_common =
-      !large_window4 && term_count >= 18u && bbs_homogeneous_affine_comb_enabled();
   int32_t cache_status = get_fused_common_points_cache(
-      item->common_points, term_count, &cached, large_window4, affine_common,
-      0u, universal_window4);
+      item->common_points, term_count, &cached);
   if (cache_status != CUBBS_BBS_GPU_SUCCESS) return cache_status;
 
   auto &host_ws = cubbs_fused_pinned_host_workspace();
@@ -1857,7 +1512,6 @@ int32_t cubbs_bbs_cuda_verify_pre_b_aggregate_fused(
   cubbs_sppark_bucket_t *d_win_chunk_sums = nullptr;
   cubbs_sppark_bucket_t *d_scaled_a_xyzz = nullptr;
   cubbs_sppark_plain_affine_t *d_scaled_a_affines = nullptr;
-  CuBbsCommonMsmTransient msm_transient;
 
   if (err == cudaSuccess) {
     d_messages = arena.alloc<uint8_t>(item->packed_messages_len);
@@ -1880,7 +1534,6 @@ int32_t cubbs_bbs_cuda_verify_pre_b_aggregate_fused(
       d_scaled_a_xyzz = arena.alloc<cubbs_sppark_bucket_t>(item_count);
       d_scaled_a_affines = arena.alloc<cubbs_sppark_plain_affine_t>(item_count);
     }
-    err = msm_transient.alloc(*cached, term_count, 1u, large_window4, stream_b);
   }
 
   if (err == cudaSuccess && item->packed_messages_len > 0u)
@@ -1963,8 +1616,7 @@ int32_t cubbs_bbs_cuda_verify_pre_b_aggregate_fused(
   }
   if (err == cudaSuccess) {
     err = cubbs_bbs_launch_cached_common_msm_range(
-        *cached, msm_transient, d_agg_b_scalars_le, term_count, 1u,
-        d_b_output, stream_b);
+        *cached, d_agg_b_scalars_le, term_count, 1u, d_b_output, stream_b);
   }
 
   // Stage 2: 100% GPU G1 decompression + Scott subgroup check on cache miss (0 CPU!).
@@ -2096,8 +1748,6 @@ int32_t cubbs_bbs_cuda_verify_pre_b_aggregate_fused(
   if (err == cudaSuccess) {
     err = cudaStreamSynchronize(stream_b);
   }
-
-  msm_transient.free_async(stream_b);
 
   if (err != cudaSuccess) return CUBBS_BBS_GPU_ERR_INTERNAL;
   if (*pipe_ws.invalid_flag != 0u) return CUBBS_BBS_GPU_ERR_INVALID_INPUT;

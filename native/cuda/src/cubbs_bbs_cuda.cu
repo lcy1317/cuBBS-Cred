@@ -835,17 +835,6 @@ static bool cuda_canary_ok() {
   return status == cudaSuccess && host_out == 0x0BB52023u;
 }
 
-static void mark_unimplemented(CuBbsBbsGpuResult *results, size_t item_count) {
-  if (results == nullptr) {
-    return;
-  }
-  for (size_t i = 0; i < item_count; ++i) {
-    results[i].code = CUBBS_BBS_GPU_ERR_INTERNAL;
-    results[i].value = 0;
-    results[i].bytes_written = 0;
-  }
-}
-
 static int32_t validate_common_points_groups(
     CuBbsBbsGpuG1MsmCommonPointsBatchItem *items, size_t group_count,
     size_t *total_outputs) {
@@ -913,17 +902,6 @@ cubbs_bbs_gpu_backend_info_v2(uint32_t abi_version,
   // claim BBS hardware acceleration until sign/verify/proof kernels are
   // implemented and validated against zkryptium vectors.
   info_out->hardware_acceleration = 0;
-  return CUBBS_BBS_GPU_SUCCESS;
-}
-
-extern "C" int32_t cubbs_bbs_gpu_sign_batch_v2(
-    uint32_t abi_version, CuBbsBbsGpuSignItem *items, size_t item_count,
-    CuBbsBbsGpuResult *results) {
-  if (!abi_ok(abi_version) || (item_count > 0 && items == nullptr) ||
-      (item_count > 0 && results == nullptr)) {
-    return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
-  }
-  mark_unimplemented(results, item_count);
   return CUBBS_BBS_GPU_SUCCESS;
 }
 
@@ -1126,76 +1104,6 @@ extern "C" int32_t cubbs_bbs_gpu_g1_msm_fused_common_points_batch_v2(
   return CUBBS_BBS_GPU_SUCCESS;
 }
 
-extern "C" int32_t
-cubbs_bbs_gpu_g1_msm_common_points_plus_variable_batch_v2(
-    uint32_t abi_version,
-    CuBbsBbsGpuG1MsmCommonPointsPlusVariableItem *items,
-    size_t group_count, CuBbsBbsGpuResult *results) {
-  if (!abi_ok(abi_version) || (group_count > 0u && items == nullptr) ||
-      (group_count > 0u && results == nullptr)) {
-    return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
-  }
-  size_t result_cursor = 0u;
-  for (size_t group = 0u; group < group_count; ++group) {
-    auto &item = items[group];
-    if ((item.term_count > 0u &&
-         (item.points == nullptr || item.scalar_rows == nullptr)) ||
-        (item.output_count > 0u &&
-         (item.variable_points == nullptr || item.variable_scalars == nullptr ||
-          item.point_outs == nullptr))) {
-      return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
-    }
-    if (item.term_count > SIZE_MAX / 32u ||
-        item.output_count > SIZE_MAX - result_cursor ||
-        (item.term_count != 0u && item.output_count > SIZE_MAX / item.term_count)) {
-      return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
-    }
-    for (size_t row = 0u; row < item.output_count; ++row) {
-      if (item.point_outs[row].data == nullptr || item.point_outs[row].capacity < 48u)
-        return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
-    }
-    const int32_t status =
-        cubbs_bbs_cuda_g1_msm_fused_common_points_plus_variable_matrix(
-            item.points, item.term_count, item.scalar_rows, item.output_count,
-            item.variable_points, item.variable_scalars, item.point_outs,
-            results + result_cursor);
-    if (status != CUBBS_BBS_GPU_SUCCESS) return status;
-    for (size_t row = 0u; row < item.output_count; ++row) {
-      if (results[result_cursor + row].code == CUBBS_BBS_GPU_SUCCESS) {
-        item.point_outs[row].len = results[result_cursor + row].bytes_written;
-      }
-    }
-    result_cursor += item.output_count;
-  }
-  return CUBBS_BBS_GPU_SUCCESS;
-}
-
-extern "C" int32_t cubbs_bbs_gpu_proof_verify_msm_pair_batch_v2(
-    uint32_t abi_version, CuBbsBbsGpuProofVerifyMsmPairItem *items,
-    size_t group_count, CuBbsBbsGpuResult *results) {
-  if (!abi_ok(abi_version) || (group_count > 0u && items == nullptr) ||
-      (group_count > 0u && results == nullptr)) {
-    return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
-  }
-  size_t result_cursor = 0u;
-  for (size_t group = 0u; group < group_count; ++group) {
-    auto &item = items[group];
-    const int32_t status = cubbs_bbs_cuda_proof_verify_msm_pair_matrix(
-        item.common_points, item.common_term_count, item.common_scalar_rows,
-        item.proof_points, item.proof_scalars, item.output_count, item.t1_outs,
-        item.t2_outs, results + result_cursor);
-    if (status != CUBBS_BBS_GPU_SUCCESS) return status;
-    for (size_t row = 0u; row < item.output_count; ++row) {
-      if (results[result_cursor + row].code == CUBBS_BBS_GPU_SUCCESS) {
-        item.t1_outs[row].len = 48u;
-        item.t2_outs[row].len = 48u;
-      }
-    }
-    result_cursor += item.output_count;
-  }
-  return CUBBS_BBS_GPU_SUCCESS;
-}
-
 extern "C" int32_t cubbs_bbs_gpu_g1_dual_msm_same_points_batch_v2(
     uint32_t abi_version, CuBbsBbsGpuG1DualMsmSamePointsItem *items,
     size_t item_count, CuBbsBbsGpuResult *results) {
@@ -1257,64 +1165,6 @@ extern "C" int32_t cubbs_bbs_gpu_g1_dual_msm_same_points_lanes_batch_v2(
     results[item_index].bytes_written = output_bytes * 2u;
   }
   return CUBBS_BBS_GPU_SUCCESS;
-}
-
-extern "C" int32_t cubbs_bbs_gpu_verify_batch_v2(
-    uint32_t abi_version, const CuBbsBbsGpuVerifyItem *items, size_t item_count,
-    CuBbsBbsGpuResult *results) {
-  if (!abi_ok(abi_version) || (item_count > 0 && items == nullptr) ||
-      (item_count > 0 && results == nullptr)) {
-    return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
-  }
-  mark_unimplemented(results, item_count);
-  return CUBBS_BBS_GPU_SUCCESS;
-}
-
-extern "C" int32_t cubbs_bbs_gpu_proof_gen_batch_v2(
-    uint32_t abi_version, CuBbsBbsGpuProofGenItem *items, size_t item_count,
-    CuBbsBbsGpuResult *results) {
-  if (!abi_ok(abi_version) || (item_count > 0 && items == nullptr) ||
-      (item_count > 0 && results == nullptr)) {
-    return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
-  }
-  mark_unimplemented(results, item_count);
-  return CUBBS_BBS_GPU_SUCCESS;
-}
-
-extern "C" int32_t cubbs_bbs_gpu_proof_verify_batch_v2(
-    uint32_t abi_version, const CuBbsBbsGpuProofVerifyItem *items,
-    size_t item_count, CuBbsBbsGpuResult *results) {
-  if (!abi_ok(abi_version) || (item_count > 0 && items == nullptr) ||
-      (item_count > 0 && results == nullptr)) {
-    return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
-  }
-  mark_unimplemented(results, item_count);
-  return CUBBS_BBS_GPU_SUCCESS;
-}
-
-extern "C" int32_t cubbs_bbs_gpu_proof_gen_t2_prepare_batch_v2(
-    uint32_t abi_version, CuBbsBbsGpuProofGenT2PrepareItem *items,
-    size_t item_count, CuBbsBbsGpuResult *results) {
-  if (!abi_ok(abi_version) || (item_count > 0 && items == nullptr) ||
-      (item_count > 0 && results == nullptr)) {
-    return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
-  }
-  // Validate fixed-length inputs up front; the native body re-checks per item.
-  for (size_t i = 0; i < item_count; ++i) {
-    bool ok = items[i].compressed_b.len == 48u && items[i].signature_a.len == 48u &&
-              items[i].d_out.capacity >= 48u && items[i].abar_out.capacity >= 48u &&
-              items[i].bbar_out.capacity >= 48u && items[i].t1_out.capacity >= 48u;
-    for (size_t s = 0; s < 7u && ok; ++s) {
-      ok = items[i].scalars_be[s].len == 32u && items[i].scalars_be[s].data != nullptr;
-    }
-    if (!ok) {
-      results[i].code = CUBBS_BBS_GPU_ERR_INVALID_INPUT;
-      results[i].value = 0u;
-      results[i].bytes_written = 0u;
-      return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
-    }
-  }
-  return cubbs_bbs_cuda_proof_gen_t2_prepare(items, item_count, results);
 }
 
 extern "C" int32_t cubbs_bbs_gpu_sign_fused_common_batch_v2(

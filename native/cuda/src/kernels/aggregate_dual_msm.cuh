@@ -396,15 +396,11 @@ int32_t cubbs_bbs_cuda_g1_dual_msm_same_scalars_lanes(
     point_slices[item_count + i] = rhs_points[i];
   }
   std::vector<cubbs_sppark_plain_affine_t> host_points(item_count * 2u);
-  int32_t status = CUBBS_BBS_GPU_SUCCESS;
-  if (!load_cached_proof_pair_affines(lhs_points, rhs_points, item_count,
-                                      &host_points)) {
-    status = cubbs_bbs_blst_decode_g1_points(
-        point_slices.data(), point_slices.size(),
-        reinterpret_cast<uint8_t *>(host_points.data()),
-        sizeof(cubbs_sppark_plain_affine_t));
-    if (status != CUBBS_BBS_GPU_SUCCESS) return status;
-  }
+  int32_t status = cubbs_bbs_blst_decode_g1_points(
+      point_slices.data(), point_slices.size(),
+      reinterpret_cast<uint8_t *>(host_points.data()),
+      sizeof(cubbs_sppark_plain_affine_t));
+  if (status != CUBBS_BBS_GPU_SUCCESS) return status;
   std::vector<uint8_t> host_scalars(item_count * 32u);
   status = cubbs_fused_decode_scalars_parallel(
       scalars, item_count, host_scalars.data());
@@ -604,8 +600,9 @@ int32_t cubbs_bbs_cuda_g1_dual_msm_same_points_lanes(
   }
 
   std::vector<cubbs_sppark_plain_affine_t> host_points(term_count);
-  int32_t status =
-      load_or_decode_cached_g1_affines(points, term_count, host_points.data());
+  int32_t status = cubbs_bbs_blst_decode_g1_points(
+      points, term_count, reinterpret_cast<uint8_t *>(host_points.data()),
+      sizeof(host_points[0]));
   if (status != CUBBS_BBS_GPU_SUCCESS) return status;
   std::vector<uint8_t> host_scalars(term_count * 64u);
   status = cubbs_fused_decode_scalars_parallel(

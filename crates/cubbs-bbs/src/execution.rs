@@ -79,48 +79,6 @@ pub(super) fn merge_batch_results_with_fail_fast<T>(
     batch_run_result(attempted, results)
 }
 
-pub(super) fn proof_gen_requests_are_mixed(reqs: &[ProofGenRequest]) -> bool {
-    let Some(first) = reqs.first() else {
-        return false;
-    };
-    reqs.iter().skip(1).any(|req| {
-        req.public_key != first.public_key
-            || req.header != first.header
-            || req.presentation_header != first.presentation_header
-            || req.messages.len() != first.messages.len()
-            || req.disclosed_indexes != first.disclosed_indexes
-    })
-}
-
-pub(super) fn proof_gen_shape_batching_eligible(reqs: &[ProofGenRequest]) -> bool {
-    if reqs.len() < proof_bbs_mixed_shape_min_batch() || !proof_gen_requests_are_mixed(reqs) {
-        return false;
-    }
-    let min_groups = proof_bbs_mixed_shape_min_groups();
-    let mut shapes = HashSet::with_capacity(min_groups);
-    for req in reqs {
-        shapes.insert((req.messages.len(), req.disclosed_indexes.as_slice()));
-        if shapes.len() >= min_groups {
-            return true;
-        }
-    }
-    false
-}
-
-pub(super) fn proof_verify_requests_are_mixed(reqs: &[ProofVerifyRequest]) -> bool {
-    let Some(first) = reqs.first() else {
-        return false;
-    };
-    reqs.iter().skip(1).any(|req| {
-        req.public_key != first.public_key
-            || req.header != first.header
-            || req.presentation_header != first.presentation_header
-            || req.total_message_count != first.total_message_count
-            || req.disclosed_indexes != first.disclosed_indexes
-            || req.disclosed_messages.len() != first.disclosed_messages.len()
-    })
-}
-
 pub(super) fn elapsed_ms(started: Instant) -> f64 {
     started.elapsed().as_secs_f64() * 1000.0
 }
@@ -259,14 +217,6 @@ pub(super) type ProofGenT2PreparedItem = (
     Vec<BBSplusMessage>,
     Vec<u8>,
     BBSplusProofGenT2State,
-);
-
-pub(super) type ProofGenT2CompressedPreparedItem = (
-    usize,
-    ProofGenRequest,
-    Vec<BBSplusMessage>,
-    Vec<u8>,
-    BBSplusProofGenT2CompressedState,
 );
 
 pub(super) type ProofVerifyPrecomputedMsmItem = (
@@ -927,142 +877,6 @@ pub(super) fn prepare_proof_gen_t2_msm_terms_batch(
     prepare_proof_gen_t2_msm_terms_batch_with_domains(cpu, prepared, prepared_b, b_terms, None)
 }
 
-pub(super) fn proof_gen_homogeneous_packed_batch(
-    kernel: &GpuKernelLibrary,
-    engine: &GpuBbsEngine,
-    prepared: &[(usize, ProofGenRequest, Vec<BBSplusMessage>)],
-    attempted: usize,
-    fail_fast: bool,
-) -> Option<BbsBatchRunResult<Vec<u8>>> {
-    let profile = std::env::var_os("CUBBS_BBS_GPU_PROOF_GEN_PROFILE").is_some();
-    let total_started = Instant::now();
-    if !gpu_proof_gen_t2_prepare_for_shape(
-        prepared.len(),
-        prepared
-            .first()
-            .map(|(_, req, _)| req.messages.len())
-            .unwrap_or(0),
-    ) || !kernel.can_g1_msm_common_points()
-        || !kernel.can_proof_gen_t2_prepare()
-        || !gpu_proof_gen_t2_prepare_enabled()
-    {
-        return None;
-    }
-    let (_, first_req, first_scalars) = prepared.first()?;
-    if !proof_gen_gpu_t2_msm_enabled(first_scalars.len())
-        || prepared.iter().any(|(_, req, scalars)| {
-            req.public_key != first_req.public_key
-                || req.header != first_req.header
-                || req.messages.len() != first_req.messages.len()
-                || req.disclosed_indexes != first_req.disclosed_indexes
-                || scalars.len() != first_scalars.len()
-        })
-    {
-        return None;
-    }
-    let terms_req = SignRequest {
-        secret_key: Vec::new(),
-        public_key: first_req.public_key.clone(),
-        header: first_req.header.clone(),
-        messages: first_req.messages.clone(),
-    };
-    let template = match engine
-        .prepare_b_msm_terms_for_prehashed_message_scalars_cached(&terms_req, first_scalars)
-    {
-        Ok(template) => template,
-        Err(error) => return Some(batch_call_error(attempted, error, fail_fast)),
-    };
-    if template.compressed_points.len() != first_scalars.len() + 2 {
-        return Some(batch_call_error(
-            attempted,
-            Error::Gpu("proof-gen packed B template shape mismatch".to_owned()),
-            fail_fast,
-        ));
-    }
-    let domain = match template.scalar_be.get(1) {
-        Some(bytes) => match parse_message_scalar_bytes(bytes) {
-            Ok(value) => value.value,
-            Err(error) => return Some(batch_call_error(attempted, error, fail_fast)),
-        },
-        None => {
-            return Some(batch_call_error(
-                attempted,
-                Error::Gpu("proof-gen packed B template missing domain".to_owned()),
-                fail_fast,
-            ))
-        }
-    };
-    let one = Scalar::from(1u64).to_bytes_be();
-    let domain_be = domain.to_bytes_be();
-    let scalar_row_stride = template.compressed_points.len() * 32;
-    let mut packed = Vec::with_capacity(prepared.len() * scalar_row_stride);
-    for (_, _, scalars) in prepared {
-        packed.extend_from_slice(&one);
-        packed.extend_from_slice(&domain_be);
-        for scalar in scalars {
-            packed.extend_from_slice(&scalar.value.to_bytes_be());
-        }
-    }
-    let pack_ms = elapsed_ms(total_started);
-    let b_started = Instant::now();
-    let prepared_b = kernel.g1_msm_common_points_packed(
-        &template.compressed_points,
-        &packed,
-        prepared.len(),
-        fail_fast,
-    );
-    if prepared_b.failed != 0 || prepared_b.results.len() != prepared.len() {
-        return Some(batch_call_error(
-            attempted,
-            Error::Gpu("proof-gen packed B MSM failed".to_owned()),
-            fail_fast,
-        ));
-    }
-    let b_msm_ms = elapsed_ms(b_started);
-    let t2_started = Instant::now();
-    let domains = vec![domain; prepared.len()];
-    let (states, t2_results) = match prepare_proof_gen_t2_with_gpu_fixed_muls(
-        kernel,
-        engine.protocol,
-        prepared.to_vec(),
-        prepared_b.results,
-        domains,
-        Some(&template.compressed_points),
-        fail_fast,
-    ) {
-        Ok(value) => value,
-        Err(error) => return Some(batch_call_error(attempted, error, fail_fast)),
-    };
-    let t2_prepare_ms = elapsed_ms(t2_started);
-    if t2_results.failed != 0 || t2_results.results.len() != states.len() {
-        return Some(batch_call_error(
-            attempted,
-            Error::Gpu("proof-gen packed T2 MSM failed".to_owned()),
-            fail_fast,
-        ));
-    }
-    let finalize_started = Instant::now();
-    let result = finalize_proof_gen_t2_compressed_batch(
-        engine.protocol,
-        Some(kernel),
-        attempted,
-        states,
-        t2_results.results,
-        fail_fast,
-    );
-    if profile {
-        eprintln!(
-            "cubbs_proof_gen_gpu_profile items={} pack_ms={pack_ms:.6} \
-             b_msm_ms={b_msm_ms:.6} t2_prepare_ms={t2_prepare_ms:.6} \
-             finalize_ms={:.6} total_ms={:.6}",
-            prepared.len(),
-            elapsed_ms(finalize_started),
-            elapsed_ms(total_started),
-        );
-    }
-    Some(result)
-}
-
 pub(super) fn prepare_proof_gen_t2_msm_terms_batch_with_domains(
     cpu: CuBbsProtocolEngine,
     prepared: Vec<(usize, ProofGenRequest, Vec<BBSplusMessage>)>,
@@ -1145,314 +959,6 @@ pub(super) fn prepare_proof_gen_t2_msm_terms_batch_with_domains(
     }
 
     Ok((states_and_items, t2_terms))
-}
-
-/// GPU proof-gen t2Prepare: the 6 fixed G1 scalar multiplications run on the
-/// device. Host precomputes random scalars + the 7 scalar multipliers (cheap,
-/// ~3us/proof); the GPU does the 6 expensive G1 muls (~215us each on CPU);
-/// then the state + t2_terms are assembled via the zkryptium helper.
-pub(super) fn prepare_proof_gen_t2_with_gpu_fixed_muls(
-    kernel: &GpuKernelLibrary,
-    cpu: CuBbsProtocolEngine,
-    prepared: Vec<(usize, ProofGenRequest, Vec<BBSplusMessage>)>,
-    prepared_b: Vec<BbsBatchItemResult<Vec<u8>>>,
-    domains: Vec<Scalar>,
-    expanded_t2_points: Option<&[Vec<u8>]>,
-    fail_fast: bool,
-) -> Result<(
-    Vec<ProofGenT2CompressedPreparedItem>,
-    BbsBatchRunResult<Vec<u8>>,
-)> {
-    use bls12_381_plus::ff::Field;
-    let profile = std::env::var_os("CUBBS_BBS_GPU_PROOF_GEN_T2_PROFILE").is_some();
-    let total_started = Instant::now();
-    let n = prepared.len();
-    if domains.len() != n {
-        return Err(Error::Gpu("proof-gen domain count mismatch".to_owned()));
-    }
-
-    // Phase 1 (host, parallel): per proof, generate random scalars + 7
-    // multipliers, extract signature.A (compressed) and e (scalar) from the
-    // raw 80-byte signature [A(48) || e(32)].
-    struct Prep {
-        index: usize,
-        req: ProofGenRequest,
-        scalars: Vec<BBSplusMessage>,
-        compressed_b: Vec<u8>,
-        scalars_be: [[u8; 32]; 7],
-        domain: Scalar,
-        random_scalars: Vec<Scalar>,
-    }
-    let items_vec: Vec<(
-        (usize, ProofGenRequest, Vec<BBSplusMessage>),
-        BbsBatchItemResult<Vec<u8>>,
-    )> = prepared
-        .into_iter()
-        .zip(prepared_b)
-        .map(|((index, req, scalars), pb)| ((index, req, scalars), pb))
-        .collect();
-
-    let build_prep = |(((index, req, scalars), pb), domain): (
-        (
-            (usize, ProofGenRequest, Vec<BBSplusMessage>),
-            BbsBatchItemResult<Vec<u8>>,
-        ),
-        Scalar,
-    )|
-     -> Result<Prep> {
-        let compressed_b = pb.result?;
-        if req.signature.len() != SIGNATURE_LEN {
-            return Err(Error::Gpu(
-                "proof-gen t2 GPU: bad signature length".to_owned(),
-            ));
-        }
-        let e_arr = <[u8; 32]>::try_from(&req.signature[48..80])
-            .map_err(|_| Error::Gpu("proof-gen t2 GPU: bad signature e slice".to_owned()))?;
-        let e_ct = Scalar::from_be_bytes(&e_arr);
-        if bool::from(e_ct.is_none()) {
-            return Err(Error::Gpu("proof-gen t2 GPU: bad signature e".to_owned()));
-        }
-        let e = e_ct.unwrap();
-        let l = scalars.len();
-        let r = req.disclosed_indexes.len();
-        let u = l
-            .checked_sub(r)
-            .ok_or(Error::Gpu("proof-gen t2 GPU: R>L".to_owned()))?;
-        let mut rng = rand::thread_rng();
-        let random_scalars: Vec<Scalar> = (0..5 + u).map(|_| Scalar::random(&mut rng)).collect();
-        let r1 = random_scalars[0];
-        let r2 = random_scalars[1];
-        let e_tilde = random_scalars[2];
-        let r1_tilde = random_scalars[3];
-        let r3_tilde = random_scalars[4];
-        let r1r2 = r1 * r2;
-        let scalars_be = [
-            r2.to_be_bytes(),
-            r1r2.to_be_bytes(),
-            r1r2.to_be_bytes(),
-            (r1r2 * e).to_be_bytes(),
-            (r1r2 * e_tilde).to_be_bytes(),
-            (r2 * r1_tilde).to_be_bytes(),
-            r3_tilde.to_be_bytes(),
-        ];
-        Ok(Prep {
-            index,
-            req,
-            scalars,
-            compressed_b,
-            scalars_be,
-            domain,
-            random_scalars,
-        })
-    };
-    let prep_items = items_vec.into_iter().zip(domains).collect::<Vec<_>>();
-    let preps = if prep_items.len() >= proof_gpu_prepare_parallel_min_batch() {
-        let chunks = into_proof_gen_worker_chunks(prep_items);
-        thread::scope(|scope| {
-            chunks
-                .into_iter()
-                .map(|chunk| {
-                    let build_prep = &build_prep;
-                    scope.spawn(move || {
-                        chunk
-                            .into_iter()
-                            .map(build_prep)
-                            .collect::<Result<Vec<_>>>()
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|handle| handle.join().expect("proof-gen prep worker panicked"))
-                .collect::<Result<Vec<_>>>()
-                .map(|chunks| chunks.into_iter().flatten().collect::<Vec<_>>())
-        })?
-    } else {
-        prep_items
-            .into_iter()
-            .map(build_prep)
-            .collect::<Result<Vec<_>>>()?
-    };
-    let host_prep_ms = elapsed_ms(total_started);
-
-    // Phase 2 (GPU): dispatch the 6 fixed muls.
-    let gpu_started = Instant::now();
-    let proof_gen_seed = [0u8; 32];
-    let gpu_inputs: Vec<BbsT2PrepareGpuInput<'_>> = preps
-        .iter()
-        .map(|p| BbsT2PrepareGpuInput {
-            compressed_b: &p.compressed_b,
-            signature_a: &p.req.signature[..48],
-            scalars_be: std::array::from_fn(|index| p.scalars_be[index].as_slice()),
-            seed: &proof_gen_seed,
-        })
-        .collect();
-    let early_t2_terms = preps
-        .iter()
-        .map(|prep| {
-            cpu.proof_gen_t2_terms_from_compressed_b(
-                prep.scalars.len(),
-                &prep.req.disclosed_indexes,
-                &prep.random_scalars,
-                &prep.compressed_b,
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
-    // T2 contains one variable-base term, B*r3_tilde. For homogeneous
-    // batches B is itself an MSM over the cached B generators. Distribute
-    // r3_tilde through those coefficients and merge the remaining hidden
-    // generator terms, turning T2 into one fixed/common-points MSM. This
-    // removes a per-proof variable-base scalar multiplication and its
-    // per-row radix-16 table build from the CUDA hot path.
-    let expanded_t2 = expanded_t2_points
-        .filter(|_| gpu_proof_gen_expanded_t2_enabled())
-        .and_then(|common_points| {
-            if common_points.len()
-                != preps
-                    .first()
-                    .map(|prep| prep.scalars.len() + 2)
-                    .unwrap_or_default()
-            {
-                return None;
-            }
-            let point_positions = common_points
-                .iter()
-                .enumerate()
-                .map(|(index, point)| (point.as_slice(), index))
-                .collect::<HashMap<_, _>>();
-            let mut packed = Vec::with_capacity(preps.len() * common_points.len() * 32);
-            for (prep, terms) in preps.iter().zip(&early_t2_terms) {
-                if terms.compressed_points.first() != Some(&prep.compressed_b)
-                    || terms.compressed_points.len() != terms.scalar_be.len()
-                {
-                    return None;
-                }
-                let multiplier = parse_message_scalar_bytes(terms.scalar_be.first()?)
-                    .ok()?
-                    .value;
-                let mut scalars = Vec::with_capacity(common_points.len());
-                scalars.push(multiplier);
-                scalars.push(prep.domain * multiplier);
-                scalars.extend(
-                    prep.scalars
-                        .iter()
-                        .map(|message| message.value * multiplier),
-                );
-                for (point, scalar) in terms.compressed_points.iter().zip(&terms.scalar_be).skip(1)
-                {
-                    let &position = point_positions.get(point.as_slice())?;
-                    let scalar = parse_message_scalar_bytes(scalar).ok()?.value;
-                    scalars[position] += scalar;
-                }
-                for scalar in scalars {
-                    packed.extend_from_slice(&scalar.to_bytes_be());
-                }
-            }
-            Some((common_points, packed))
-        });
-    let (gpu_result, fixed_muls_ms, t2_results, t2_msm_ms) = thread::scope(|scope| {
-        let gpu_handle = scope.spawn(|| {
-            let started = Instant::now();
-            let result = kernel.proof_gen_t2_prepare_batch(&gpu_inputs, true);
-            (result, elapsed_ms(started))
-        });
-        let t2_started = Instant::now();
-        let t2_results = match expanded_t2.as_ref() {
-            Some((common_points, packed)) => {
-                kernel.g1_msm_common_points_packed(common_points, packed, preps.len(), fail_fast)
-            }
-            None => g1_msm_batch_split_variable_term_grouped(kernel, &early_t2_terms, 0, fail_fast)
-                .unwrap_or_else(|| {
-                    g1_msm_batch_grouped_by_points(kernel, &early_t2_terms, fail_fast)
-                }),
-        };
-        let t2_msm_ms = elapsed_ms(t2_started);
-        let (gpu_result, fixed_muls_ms) = gpu_handle
-            .join()
-            .expect("proof-gen fixed-mul worker panicked");
-        (gpu_result, fixed_muls_ms, t2_results, t2_msm_ms)
-    });
-    if gpu_result.failed > 0 {
-        return Err(Error::Gpu(format!(
-            "proof-gen t2 GPU fixed-muls failed: {}/{}",
-            gpu_result.failed, gpu_result.attempted
-        )));
-    }
-    let gpu_ms = elapsed_ms(gpu_started);
-
-    // Phase 3 (host): assemble compressed state from the 4 GPU points.
-    let assemble_started = Instant::now();
-    let assemble_item = |(prep, item): (Prep, BbsBatchItemResult<BbsT2PrepareGpuOutput>)|
-     -> Result<ProofGenT2CompressedPreparedItem> {
-        let out = item.result?;
-        let Prep {
-            index,
-            req,
-            scalars,
-            compressed_b,
-            domain,
-            random_scalars,
-            ..
-        } = prep;
-        let state = cpu.proof_gen_state_from_precomputed_compressed_points(
-            &req,
-            &scalars,
-            random_scalars,
-            out.d,
-            out.abar,
-            out.bbar,
-            out.t1,
-            domain,
-        )?;
-        Ok((index, req, scalars, compressed_b, state))
-    };
-    let pairs = preps
-        .into_iter()
-        .zip(gpu_result.results)
-        .collect::<Vec<_>>();
-    let assembled = if pairs.len() >= proof_gpu_prepare_parallel_min_batch() {
-        let chunks = into_proof_gen_worker_chunks(pairs);
-        thread::scope(|scope| {
-            chunks
-                .into_iter()
-                .map(|chunk| {
-                    let assemble_item = &assemble_item;
-                    scope.spawn(move || {
-                        chunk
-                            .into_iter()
-                            .map(assemble_item)
-                            .collect::<Result<Vec<_>>>()
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .expect("proof-gen GPU T2 assemble worker panicked")
-                })
-                .collect::<Result<Vec<_>>>()
-                .map(|chunks| chunks.into_iter().flatten().collect::<Vec<_>>())
-        })?
-    } else {
-        pairs
-            .into_iter()
-            .map(assemble_item)
-            .collect::<Result<Vec<_>>>()?
-    };
-    let states_and_items = assembled;
-    if profile {
-        eprintln!(
-            "cubbs_proof_gen_t2_gpu_profile items={} host_prep_ms={:.6} fixed_muls_ms={:.6} t2_msm_ms={:.6} gpu_ms={:.6} assemble_ms={:.6} total_ms={:.6}",
-            n,
-            host_prep_ms,
-            fixed_muls_ms,
-            t2_msm_ms,
-            gpu_ms,
-            elapsed_ms(assemble_started),
-            elapsed_ms(total_started),
-        );
-    }
-    Ok((states_and_items, t2_results))
 }
 
 pub(super) fn prepare_proof_gen_t2_msm_terms_item(
@@ -2020,29 +1526,6 @@ pub(super) fn g1_msm_batch_proof_verify_pairs_inner(
                     fail_fast,
                     None,
                 );
-            }
-        }
-    }
-
-    let has_large_t2 = all_terms
-        .iter()
-        .skip(1)
-        .step_by(2)
-        .any(|terms| terms.compressed_points.len() > 258);
-    let item_count = all_terms.len() / 2;
-    let max_t2_terms = all_terms
-        .iter()
-        .skip(1)
-        .step_by(2)
-        .map(|terms| terms.compressed_points.len())
-        .max()
-        .unwrap_or(0);
-    if kernel.can_proof_verify_msm_pair()
-        && (has_large_t2 || gpu_proof_verify_msm_pair_enabled(item_count, max_t2_terms))
-    {
-        if let Some(result) = kernel.proof_verify_msm_pair_batch(all_terms, fail_fast) {
-            if result.failed == 0 {
-                return result;
             }
         }
     }
@@ -2811,13 +2294,6 @@ pub(super) fn g1_msm_batch_split_variable_term(
     variable_index: usize,
     fail_fast: bool,
 ) -> Option<BbsBatchRunResult<Vec<u8>>> {
-    if gpu_common_plus_variable_msm_enabled() && kernel.can_g1_msm_common_points_plus_variable() {
-        if let Some(result) =
-            kernel.g1_msm_common_points_plus_variable_batch(terms, variable_index, fail_fast)
-        {
-            return Some(result);
-        }
-    }
     let (common_terms, variable_terms) = split_variable_msm_terms(terms, variable_index)?;
     let (common_results, variable_results) =
         if terms.len() >= gpu_split_variable_parallel_min_batch() {
@@ -3157,118 +2633,6 @@ pub(super) fn finalize_proof_gen_t2_batch(
         }
     }
 
-    batch_run_result(attempted, results)
-}
-
-pub(super) fn finalize_proof_gen_t2_compressed_batch(
-    cpu: CuBbsProtocolEngine,
-    kernel: Option<&GpuKernelLibrary>,
-    attempted: usize,
-    states_and_items: Vec<ProofGenT2CompressedPreparedItem>,
-    t2_results: Vec<BbsBatchItemResult<Vec<u8>>>,
-    fail_fast: bool,
-) -> BbsBatchRunResult<Vec<u8>> {
-    let items = states_and_items
-        .into_iter()
-        .zip(t2_results)
-        .map(|((index, req, _scalars, _compressed_b, state), t2_item)| (index, req, state, t2_item))
-        .collect::<Vec<_>>();
-    if let Some(kernel) = kernel
-        .filter(|kernel| kernel.can_precompute_message_scalars() && gpu_challenge_scalar_enabled())
-    {
-        let challenge_inputs = items
-            .iter()
-            .map(|(_, req, state, t2_item)| {
-                let t2 = t2_item.result.as_ref().map_err(Clone::clone)?;
-                cpu.proof_gen_challenge_input_compressed_state_and_t2(req, state, t2)
-            })
-            .collect::<Result<Vec<_>>>();
-        if let Ok(challenge_inputs) = challenge_inputs {
-            if let Ok(challenges) =
-                gpu_precompute_challenge_scalars(kernel, challenge_inputs, fail_fast)
-            {
-                if challenges.len() == items.len() {
-                    let mut results = thread::scope(|scope| {
-                        into_proof_gen_worker_chunks(
-                            items.into_iter().zip(challenges).collect::<Vec<_>>(),
-                        )
-                        .into_iter()
-                        .map(|chunk| {
-                            scope.spawn(move || {
-                                chunk
-                                    .into_iter()
-                                    .map(|((index, req, state, t2_item), challenge)| {
-                                        let result = t2_item.result.and_then(|_| {
-                                            cpu.proof_gen_finalize_compressed_state_with_challenge(
-                                                req, state, challenge,
-                                            )
-                                        });
-                                        BbsBatchItemResult { index, result }
-                                    })
-                                    .collect::<Vec<_>>()
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .map(|handle| {
-                            handle
-                                .join()
-                                .expect("compressed GPU challenge finalize worker panicked")
-                        })
-                        .flatten()
-                        .collect::<Vec<_>>()
-                    });
-                    results.sort_by_key(|item| item.index);
-                    return batch_run_result(attempted, results);
-                }
-            }
-        }
-    }
-    let mut results = if items.len() >= proof_gen_finalize_parallel_min_batch() {
-        let chunks = into_proof_gen_worker_chunks(items);
-        thread::scope(|scope| {
-            chunks
-                .into_iter()
-                .map(|chunk| {
-                    scope.spawn(move || {
-                        chunk
-                            .into_iter()
-                            .map(|(index, req, state, t2_item)| {
-                                let result = t2_item.result.and_then(|t2| {
-                                    cpu.proof_gen_finalize_compressed_state_and_t2(req, state, t2)
-                                });
-                                BbsBatchItemResult { index, result }
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .expect("compressed proof-gen finalize worker panicked")
-                })
-                .flatten()
-                .collect::<Vec<_>>()
-        })
-    } else {
-        items
-            .into_iter()
-            .map(|(index, req, state, t2_item)| {
-                let result = t2_item
-                    .result
-                    .and_then(|t2| cpu.proof_gen_finalize_compressed_state_and_t2(req, state, t2));
-                BbsBatchItemResult { index, result }
-            })
-            .collect::<Vec<_>>()
-    };
-    results.sort_by_key(|item| item.index);
-    if fail_fast {
-        if let Some(first_error) = results.iter().position(|item| item.result.is_err()) {
-            results.truncate(first_error + 1);
-        }
-    }
     batch_run_result(attempted, results)
 }
 
@@ -3763,13 +3127,6 @@ pub(super) fn byte_buffer(bytes: &mut [u8]) -> gpu_abi::CuBbsBbsGpuByteBuffer {
     }
 }
 
-pub(super) fn index_slice(indexes: &[usize]) -> gpu_abi::CuBbsBbsGpuIndexSlice {
-    gpu_abi::CuBbsBbsGpuIndexSlice {
-        data: indexes.as_ptr(),
-        len: indexes.len(),
-    }
-}
-
 pub(super) fn empty_gpu_results(count: usize) -> Vec<gpu_abi::CuBbsBbsGpuResult> {
     (0..count)
         .map(|_| gpu_abi::CuBbsBbsGpuResult {
@@ -3778,10 +3135,6 @@ pub(super) fn empty_gpu_results(count: usize) -> Vec<gpu_abi::CuBbsBbsGpuResult>
             bytes_written: 0,
         })
         .collect()
-}
-
-pub(super) fn proof_capacity(message_count: usize, disclosed_count: usize) -> usize {
-    512 + (message_count * 48) + (disclosed_count * 48)
 }
 
 pub(super) fn bbs_message_scalar_dst() -> Vec<u8> {
@@ -3872,14 +3225,6 @@ pub(super) fn gpu_proof_verify_split_msm_enabled() -> bool {
         .unwrap_or(true)
 }
 
-pub(super) fn gpu_proof_verify_msm_pair_enabled(item_count: usize, max_t2_terms: usize) -> bool {
-    std::env::var("CUBBS_BBS_GPU_PROOF_VERIFY_MSM_PAIR")
-        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
-        // A single short proof does not amortize the fused-pair launch. Longer
-        // T2 rows do, while every multi-item batch benefits from the fused ABI.
-        .unwrap_or(item_count >= 2 || max_t2_terms >= 32)
-}
-
 pub(super) fn gpu_verify_dual_same_points_enabled(item_count: usize) -> bool {
     gpu_verify_dual_same_points_enabled_from_env(
         std::env::var("CUBBS_BBS_GPU_VERIFY_DUAL_SAME_POINTS")
@@ -3916,12 +3261,6 @@ pub(super) fn gpu_split_variable_msm_enabled() -> bool {
         .unwrap_or(true)
 }
 
-pub(super) fn gpu_common_plus_variable_msm_enabled() -> bool {
-    std::env::var("CUBBS_BBS_GPU_COMMON_PLUS_VARIABLE_MSM")
-        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
-        .unwrap_or(true)
-}
-
 pub(super) fn gpu_split_variable_msm_min_terms() -> usize {
     std::env::var("CUBBS_BBS_GPU_SPLIT_VARIABLE_MSM_MIN_TERMS")
         .ok()
@@ -3941,41 +3280,6 @@ pub(super) fn gpu_mixed_shape_parallel_min_groups() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(2)
-}
-
-pub(super) fn proof_mixed_shape_parallel_streams(primary: &str, tuned_default: usize) -> usize {
-    std::env::var(primary)
-        .or_else(|_| std::env::var("CUBBS_BBS_PROOF_MIXED_SHAPE_PARALLEL_STREAMS"))
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(tuned_default)
-}
-
-pub(super) fn proof_gen_mixed_shape_parallel_streams(tuned_default: usize) -> usize {
-    proof_mixed_shape_parallel_streams(
-        "CUBBS_BBS_PROOF_GEN_MIXED_SHAPE_PARALLEL_STREAMS",
-        tuned_default,
-    )
-}
-
-pub(super) fn proof_verify_mixed_shape_parallel_streams(tuned_default: usize) -> usize {
-    proof_mixed_shape_parallel_streams(
-        "CUBBS_BBS_PROOF_VERIFY_MIXED_SHAPE_PARALLEL_STREAMS",
-        tuned_default,
-    )
-}
-
-pub(super) fn proof_bbs_mixed_shape_batching_enabled() -> bool {
-    std::env::var("CUBBS_BBS_PROOF_MIXED_SHAPE_BATCHING")
-        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO" | ""))
-        .unwrap_or(true)
-}
-
-pub(super) fn sign_shape_batching_enabled() -> bool {
-    std::env::var("CUBBS_BBS_SIGN_SHAPE_BATCHING")
-        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO" | ""))
-        .unwrap_or(true)
 }
 
 pub(super) fn proof_verify_shape_grouping_enabled() -> bool {
@@ -4081,20 +3385,6 @@ pub(super) fn sign_prepared_cache_max_batch() -> usize {
         .unwrap_or(24)
 }
 
-pub(super) fn proof_bbs_mixed_shape_min_batch() -> usize {
-    std::env::var("CUBBS_BBS_PROOF_MIXED_SHAPE_MIN_BATCH")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(2)
-}
-
-pub(super) fn proof_bbs_mixed_shape_min_groups() -> usize {
-    std::env::var("CUBBS_BBS_PROOF_MIXED_SHAPE_MIN_GROUPS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(2)
-}
-
 pub(super) fn gpu_point_group_parallel_min_groups() -> usize {
     std::env::var("CUBBS_BBS_GPU_POINT_GROUP_PARALLEL_MIN_GROUPS")
         .ok()
@@ -4112,34 +3402,6 @@ pub(super) fn gpu_common_points_msm_abi_enabled() -> bool {
     std::env::var("CUBBS_BBS_GPU_COMMON_POINTS_MSM_ABI")
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
-}
-
-/// Enable the GPU proof-gen t2Prepare (6 fixed G1 scalar multiplications on
-/// the device). Shape and capability checks still gate the specialized path;
-/// the GPU path falls back to CPU preparation if disabled or failing.
-pub(super) fn gpu_proof_gen_t2_prepare_enabled() -> bool {
-    std::env::var("CUBBS_BBS_GPU_PROOF_GEN_T2_PREPARE")
-        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
-        .unwrap_or(true)
-}
-
-pub(super) fn gpu_proof_gen_expanded_t2_enabled() -> bool {
-    std::env::var("CUBBS_BBS_GPU_PROOF_GEN_EXPANDED_T2")
-        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
-        .unwrap_or(true)
-}
-
-pub(super) fn gpu_proof_gen_t2_prepare_for_shape(item_count: usize, message_count: usize) -> bool {
-    if force_gpu_execution() {
-        return true;
-    }
-    if let Ok(value) = std::env::var("CUBBS_BBS_GPU_PROOF_GEN_T2_PREPARE_MIN_ITEMS") {
-        return value
-            .parse::<usize>()
-            .map(|minimum| item_count >= minimum)
-            .unwrap_or(false);
-    }
-    item_count >= 2 || message_count >= 32
 }
 
 pub(super) fn gpu_proof_gen_b_common_points_msm_abi_enabled() -> bool {

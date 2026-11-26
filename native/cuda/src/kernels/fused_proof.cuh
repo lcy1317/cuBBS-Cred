@@ -751,31 +751,14 @@ int32_t cubbs_bbs_cuda_proof_gen_fused_common_batch(
 
   // Acquire cached common-points table for B (M+2) and optionally T2 undisclosed (U).
   std::shared_ptr<CuBbsFusedCommonPointsCache> cached_b;
-  const bool large_b = bbs_large_shape_kernel_supported(term_count);
-  const bool universal_b = !large_b &&
-                           !bbs_specialized_common_points_supported(term_count) &&
-                           bbs_universal_tiled_common_supported(term_count);
-  const bool tiled_b = large_b || universal_b;
-  const bool affine_b = !tiled_b && term_count >= 18u && item_count >= 16u &&
-                        bbs_homogeneous_affine_comb_enabled();
   int32_t status = get_fused_common_points_cache(
-      item->common_points, term_count, &cached_b, tiled_b, affine_b,
-      affine_b ? 9u : 0u, universal_b);
+      item->common_points, term_count, &cached_b);
   if (status != CUBBS_BBS_GPU_SUCCESS || cached_b == nullptr) return status;
 
   std::shared_ptr<CuBbsFusedCommonPointsCache> cached_u;
-  bool tiled_u = false;
   if (U > 0u) {
-    const bool large_u = bbs_large_shape_kernel_supported(U);
-    const bool universal_u = !large_u &&
-                             !bbs_specialized_common_points_supported(U) &&
-                             bbs_universal_tiled_common_supported(U);
-    tiled_u = large_u || universal_u;
-    const bool affine_u = !tiled_u && U >= 18u && item_count >= 16u &&
-                          bbs_homogeneous_affine_comb_enabled();
     status = get_fused_common_points_cache(
-        item->undisclosed_points, U, &cached_u, tiled_u, affine_u,
-        affine_u ? 9u : 0u, universal_u);
+        item->undisclosed_points, U, &cached_u);
     if (status != CUBBS_BBS_GPU_SUCCESS || cached_u == nullptr) return status;
   }
 
@@ -912,8 +895,6 @@ int32_t cubbs_bbs_cuda_proof_gen_fused_common_batch(
   uint8_t *d_pts5_compressed = nullptr;
   uint8_t *d_proofs_out = nullptr;
   uint32_t *d_invalid = nullptr;
-  CuBbsCommonMsmTransient trans_b;
-  CuBbsCommonMsmTransient trans_u;
 
   if (err == cudaSuccess) {
     d_messages = arena.alloc<uint8_t>(item->packed_messages_len);
@@ -934,8 +915,6 @@ int32_t cubbs_bbs_cuda_proof_gen_fused_common_batch(
     d_pts5_compressed = arena.alloc<uint8_t>(item_count * 240u);
     d_proofs_out = arena.alloc<uint8_t>(proofs_out_bytes);
     d_invalid = arena.alloc<uint32_t>(1u);
-    err = trans_b.alloc(*cached_b, term_count, item_count, tiled_b, stream);
-    if (err == cudaSuccess && U > 0u) err = trans_u.alloc(*cached_u, U, item_count, tiled_u, stream);
   }
   if (err == cudaSuccess && need_gpu_decode_a) {
     err = a_cache.ensure(item_count);
@@ -988,7 +967,7 @@ int32_t cubbs_bbs_cuda_proof_gen_fused_common_batch(
   // Stage 2: Lim-Lee/Pippenger B-MSM + B affine normalization + Radix-32 table + ChaCha20 prep.
   if (err == cudaSuccess) {
     err = cubbs_bbs_launch_cached_common_msm_range(
-        *cached_b, trans_b, d_b_scalars_le, term_count, item_count, d_b_xyzz, stream);
+        *cached_b, d_b_scalars_le, term_count, item_count, d_b_xyzz, stream);
   }
   if (err == cudaSuccess) {
     const uint32_t norm_blocks = static_cast<uint32_t>((item_count + 63u) / 64u);
@@ -1038,7 +1017,7 @@ int32_t cubbs_bbs_cuda_proof_gen_fused_common_batch(
   }
   if (err == cudaSuccess && U > 0u) {
     err = cubbs_bbs_launch_cached_common_msm_range(
-        *cached_u, trans_u, d_m_tilde_le, U, item_count, d_t2_common_xyzz, stream);
+        *cached_u, d_m_tilde_le, U, item_count, d_t2_common_xyzz, stream);
     if (err == cudaSuccess) {
       constexpr uint32_t t = 128u;
       const uint32_t b = static_cast<uint32_t>((item_count + t - 1u) / t);
@@ -1078,9 +1057,6 @@ int32_t cubbs_bbs_cuda_proof_gen_fused_common_batch(
   if (err == cudaSuccess) {
     err = cudaStreamSynchronize(stream);
   }
-
-  trans_u.free_async(stream);
-  trans_b.free_async(stream);
 
   if (err != cudaSuccess) return CUBBS_BBS_GPU_ERR_INTERNAL;
   if (*pipe_ws.invalid_flag != 0u) return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
@@ -1422,16 +1398,8 @@ int32_t cubbs_bbs_cuda_proof_verify_fused_common_batch(
   }
 
   std::shared_ptr<CuBbsFusedCommonPointsCache> cached;
-  const bool large_common = bbs_large_shape_kernel_supported(term_count);
-  const bool universal_common = !large_common &&
-                                !bbs_specialized_common_points_supported(term_count) &&
-                                bbs_universal_tiled_common_supported(term_count);
-  const bool tiled_common = large_common || universal_common;
-  const bool affine_common = !tiled_common && term_count >= 18u && item_count >= 16u &&
-                             bbs_homogeneous_affine_comb_enabled();
   int32_t status = get_fused_common_points_cache(
-      item->common_points, term_count, &cached, tiled_common, affine_common,
-      affine_common ? 9u : 0u, universal_common);
+      item->common_points, term_count, &cached);
   if (status != CUBBS_BBS_GPU_SUCCESS || cached == nullptr) return status;
 
   const cudaStream_t stream = cubbs_fused_pinned_host_workspace().execution_stream(
@@ -1576,7 +1544,6 @@ int32_t cubbs_bbs_cuda_proof_verify_fused_common_batch(
   cubbs_sppark_plain_affine_t *d_scaled_abar_affines = nullptr;
   uint32_t *d_flags = nullptr; // [0]=invalid, [1]=challenge_fail, [2]=inf_flag
   uint8_t *d_eq_out = nullptr;
-  CuBbsCommonMsmTransient trans_c;
 
   if (err == cudaSuccess) {
     d_messages = arena.alloc<uint8_t>(item->packed_disclosed_messages_len);
@@ -1603,7 +1570,6 @@ int32_t cubbs_bbs_cuda_proof_verify_fused_common_batch(
       d_scaled_abar_affines = arena.alloc<cubbs_sppark_plain_affine_t>(item_count);
     }
     d_flags = arena.alloc<uint32_t>(3u);
-    err = trans_c.alloc(*cached, term_count, item_count, tiled_common, stream);
   }
   if (err == cudaSuccess && need_gpu_decode_pts) {
     err = pts_cache.ensure(total_pts);
@@ -1663,7 +1629,7 @@ int32_t cubbs_bbs_cuda_proof_verify_fused_common_batch(
   }
   if (err == cudaSuccess) {
     err = cubbs_bbs_launch_cached_common_msm_range(
-        *cached, trans_c, d_common_scalars_le, term_count, item_count, d_t2_xyzz, stream);
+        *cached, d_common_scalars_le, term_count, item_count, d_t2_xyzz, stream);
   }
 
   // Stage 1b: 100% GPU G1 decompression + Scott subgroup check + Radix-16 tables on cache miss!
@@ -1778,8 +1744,6 @@ int32_t cubbs_bbs_cuda_proof_verify_fused_common_batch(
   if (err == cudaSuccess) {
     err = cudaStreamSynchronize(stream);
   }
-
-  trans_c.free_async(stream);
 
   if (err != cudaSuccess) return CUBBS_BBS_GPU_ERR_INTERNAL;
 

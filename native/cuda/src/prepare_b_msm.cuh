@@ -53,21 +53,6 @@ int32_t cubbs_bbs_cuda_g1_msm_fused_common_points_matrix(
     const uint8_t *scalar_rows_be, size_t scalar_row_stride,
     CuBbsBbsGpuByteBuffer *point_outs, CuBbsBbsGpuResult *results);
 
-int32_t cubbs_bbs_cuda_g1_msm_fused_common_points_plus_variable_matrix(
-    const CuBbsBbsGpuByteSlice *points, size_t term_count,
-    const CuBbsBbsGpuByteSlice *scalar_rows, size_t output_count,
-    const CuBbsBbsGpuByteSlice *variable_points,
-    const CuBbsBbsGpuByteSlice *variable_scalars,
-    CuBbsBbsGpuByteBuffer *point_outs, CuBbsBbsGpuResult *results);
-
-int32_t cubbs_bbs_cuda_proof_verify_msm_pair_matrix(
-    const CuBbsBbsGpuByteSlice *common_points, size_t common_term_count,
-    const CuBbsBbsGpuByteSlice *common_scalar_rows,
-    const CuBbsBbsGpuByteSlice *proof_points,
-    const CuBbsBbsGpuByteSlice *proof_scalars, size_t output_count,
-    CuBbsBbsGpuByteBuffer *t1_outs, CuBbsBbsGpuByteBuffer *t2_outs,
-    CuBbsBbsGpuResult *results);
-
 int32_t cubbs_bbs_cuda_g1_dual_msm_same_scalars_lanes(
     const CuBbsBbsGpuByteSlice *lhs_points,
     const CuBbsBbsGpuByteSlice *rhs_points,
@@ -152,10 +137,6 @@ int32_t cubbs_bbs_cuda_launch_pairing_unique_pk_on_stream(
 
 void cubbs_bbs_cuda_confirm_unique_pk_lines_cache(
     const uint8_t *h_pks_compressed, size_t item_count);
-
-int32_t cubbs_bbs_cuda_proof_gen_t2_prepare(
-    struct CuBbsBbsGpuProofGenT2PrepareItem *items, size_t item_count,
-    CuBbsBbsGpuResult *results);
 
 int32_t cubbs_bbs_cuda_sign_fused_common_batch(
     const struct CuBbsBbsGpuSignFusedCommonBatchItem *item,

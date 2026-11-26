@@ -19,10 +19,6 @@ pub(super) enum CompactMsgMeta<'a> {
 #[derive(Clone)]
 pub(super) struct GpuKernelLibrary {
     pub(super) _library: Arc<Library>,
-    pub(super) sign_batch: gpu_abi::CuBbsBbsGpuSignBatchV2,
-    pub(super) verify_batch: gpu_abi::CuBbsBbsGpuVerifyBatchV2,
-    pub(super) proof_gen_batch: gpu_abi::CuBbsBbsGpuProofGenBatchV2,
-    pub(super) proof_verify_batch: gpu_abi::CuBbsBbsGpuProofVerifyBatchV2,
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) messages_to_scalar_batch: Option<gpu_abi::CuBbsBbsGpuMessagesToScalarBatchV2>,
     pub(super) sign_e_from_resident_scalars_batch:
@@ -30,9 +26,6 @@ pub(super) struct GpuKernelLibrary {
     pub(super) prepare_b_batch: Option<gpu_abi::CuBbsBbsGpuPrepareBBatchV2>,
     pub(super) g1_msm_batch: Option<gpu_abi::CuBbsBbsGpuG1MsmBatchV2>,
     pub(super) g1_msm_common_points_batch: Option<gpu_abi::CuBbsBbsGpuG1MsmCommonPointsBatchV2>,
-    pub(super) g1_msm_common_points_plus_variable_batch:
-        Option<gpu_abi::CuBbsBbsGpuG1MsmCommonPointsPlusVariableBatchV2>,
-    pub(super) proof_verify_msm_pair_batch: Option<gpu_abi::CuBbsBbsGpuProofVerifyMsmPairBatchV2>,
     pub(super) g1_dual_msm_same_points_batch:
         Option<gpu_abi::CuBbsBbsGpuG1DualMsmSamePointsBatchV2>,
     pub(super) g1_dual_msm_same_points_lanes_batch:
@@ -40,7 +33,6 @@ pub(super) struct GpuKernelLibrary {
     pub(super) g1_add_batch: Option<gpu_abi::CuBbsBbsGpuG1AddBatchV2>,
     pub(super) pairing_eq_batch: Option<gpu_abi::CuBbsBbsGpuPairingEqBatchV2>,
     pub(super) pairing_eq_aggregate: Option<gpu_abi::CuBbsBbsGpuPairingEqAggregateV2>,
-    pub(super) proof_gen_t2_prepare_batch: Option<gpu_abi::CuBbsBbsGpuProofGenT2PrepareBatchV2>,
     pub(super) sign_fused_common_batch: Option<gpu_abi::CuBbsBbsGpuSignFusedCommonBatchV2>,
     pub(super) verify_pre_b_aggregate_fused:
         Option<gpu_abi::CuBbsBbsGpuVerifyPreBAggregateFusedV2>,
@@ -322,32 +314,6 @@ impl GpuKernelLibrary {
     pub(super) fn load_from_path(path: &std::ffi::OsStr) -> Result<Self> {
         let library = unsafe { Library::new(path) }
             .map_err(|error| Error::Gpu(format!("failed to load GPU library: {error}")))?;
-        let sign_batch = unsafe {
-            *library
-                .get::<gpu_abi::CuBbsBbsGpuSignBatchV2>(gpu_abi::CUBBS_BBS_GPU_SIGN_BATCH_SYMBOL)
-                .map_err(|error| Error::Gpu(format!("missing GPU sign symbol: {error}")))?
-        };
-        let verify_batch = unsafe {
-            *library
-                .get::<gpu_abi::CuBbsBbsGpuVerifyBatchV2>(
-                    gpu_abi::CUBBS_BBS_GPU_VERIFY_BATCH_SYMBOL,
-                )
-                .map_err(|error| Error::Gpu(format!("missing GPU verify symbol: {error}")))?
-        };
-        let proof_gen_batch = unsafe {
-            *library
-                .get::<gpu_abi::CuBbsBbsGpuProofGenBatchV2>(
-                    gpu_abi::CUBBS_BBS_GPU_PROOF_GEN_BATCH_SYMBOL,
-                )
-                .map_err(|error| Error::Gpu(format!("missing GPU proof-gen symbol: {error}")))?
-        };
-        let proof_verify_batch = unsafe {
-            *library
-                .get::<gpu_abi::CuBbsBbsGpuProofVerifyBatchV2>(
-                    gpu_abi::CUBBS_BBS_GPU_PROOF_VERIFY_BATCH_SYMBOL,
-                )
-                .map_err(|error| Error::Gpu(format!("missing GPU proof-verify symbol: {error}")))?
-        };
         let messages_to_scalar_batch = unsafe {
             library
                 .get::<gpu_abi::CuBbsBbsGpuMessagesToScalarBatchV2>(
@@ -386,22 +352,6 @@ impl GpuKernelLibrary {
                 .ok()
                 .map(|symbol| *symbol)
         };
-        let g1_msm_common_points_plus_variable_batch = unsafe {
-            library
-                .get::<gpu_abi::CuBbsBbsGpuG1MsmCommonPointsPlusVariableBatchV2>(
-                    gpu_abi::CUBBS_BBS_GPU_G1_MSM_COMMON_POINTS_PLUS_VARIABLE_BATCH_SYMBOL,
-                )
-                .ok()
-                .map(|symbol| *symbol)
-        };
-        let proof_verify_msm_pair_batch = unsafe {
-            library
-                .get::<gpu_abi::CuBbsBbsGpuProofVerifyMsmPairBatchV2>(
-                    gpu_abi::CUBBS_BBS_GPU_PROOF_VERIFY_MSM_PAIR_BATCH_SYMBOL,
-                )
-                .ok()
-                .map(|symbol| *symbol)
-        };
         let g1_dual_msm_same_points_batch = unsafe {
             library
                 .get::<gpu_abi::CuBbsBbsGpuG1DualMsmSamePointsBatchV2>(
@@ -436,14 +386,6 @@ impl GpuKernelLibrary {
             library
                 .get::<gpu_abi::CuBbsBbsGpuPairingEqAggregateV2>(
                     gpu_abi::CUBBS_BBS_GPU_PAIRING_EQ_AGGREGATE_SYMBOL,
-                )
-                .ok()
-                .map(|symbol| *symbol)
-        };
-        let proof_gen_t2_prepare_batch = unsafe {
-            library
-                .get::<gpu_abi::CuBbsBbsGpuProofGenT2PrepareBatchV2>(
-                    gpu_abi::CUBBS_BBS_GPU_PROOF_GEN_T2_PREPARE_BATCH_SYMBOL,
                 )
                 .ok()
                 .map(|symbol| *symbol)
@@ -516,23 +458,16 @@ impl GpuKernelLibrary {
 
         Ok(Self {
             _library: Arc::new(library),
-            sign_batch,
-            verify_batch,
-            proof_gen_batch,
-            proof_verify_batch,
             messages_to_scalar_batch,
             sign_e_from_resident_scalars_batch,
             prepare_b_batch,
             g1_msm_batch,
             g1_msm_common_points_batch,
-            g1_msm_common_points_plus_variable_batch,
-            proof_verify_msm_pair_batch,
             g1_dual_msm_same_points_batch,
             g1_dual_msm_same_points_lanes_batch,
             g1_add_batch,
             pairing_eq_batch,
             pairing_eq_aggregate,
-            proof_gen_t2_prepare_batch,
             sign_fused_common_batch,
             verify_pre_b_aggregate_fused,
             pipeline_pinned_scratch,
@@ -554,8 +489,6 @@ impl GpuKernelLibrary {
                     || self.prepare_b_batch.is_some()
                     || self.g1_msm_batch.is_some()
                     || self.g1_msm_common_points_batch.is_some()
-                    || self.g1_msm_common_points_plus_variable_batch.is_some()
-                    || self.proof_verify_msm_pair_batch.is_some()
                     || self.g1_dual_msm_same_points_batch.is_some()
                     || self.g1_dual_msm_same_points_lanes_batch.is_some()
                     || self.g1_add_batch.is_some()
@@ -579,14 +512,6 @@ impl GpuKernelLibrary {
         self.g1_msm_common_points_batch.is_some()
     }
 
-    pub(super) fn can_g1_msm_common_points_plus_variable(&self) -> bool {
-        self.g1_msm_common_points_plus_variable_batch.is_some()
-    }
-
-    pub(super) fn can_proof_verify_msm_pair(&self) -> bool {
-        self.proof_verify_msm_pair_batch.is_some()
-    }
-
     pub(super) fn can_g1_dual_msm_same_points(&self) -> bool {
         self.g1_dual_msm_same_points_batch.is_some()
     }
@@ -605,10 +530,6 @@ impl GpuKernelLibrary {
 
     pub(super) fn can_pairing_eq_aggregate(&self) -> bool {
         self.pairing_eq_aggregate.is_some()
-    }
-
-    pub(super) fn can_proof_gen_t2_prepare(&self) -> bool {
-        self.proof_gen_t2_prepare_batch.is_some()
     }
 
     pub(super) fn can_sign_fused_common_batch(&self) -> bool {
@@ -1651,256 +1572,6 @@ impl GpuKernelLibrary {
         })
     }
 
-    pub(super) fn g1_msm_common_points_plus_variable_batch(
-        &self,
-        terms: &[BbsMsmTerms],
-        variable_index: usize,
-        fail_fast: bool,
-    ) -> Option<BbsBatchRunResult<Vec<u8>>> {
-        let call = self.g1_msm_common_points_plus_variable_batch?;
-        let first = terms.first()?;
-        let term_count = first.compressed_points.len();
-        if terms.len() < 2
-            || variable_index >= term_count
-            || term_count <= 1
-            || term_count < gpu_split_variable_msm_min_terms()
-            || first.scalar_be.len() != term_count
-            || terms.iter().any(|term| {
-                term.compressed_points.len() != term_count
-                    || term.scalar_be.len() != term_count
-                    || term
-                        .compressed_points
-                        .iter()
-                        .enumerate()
-                        .any(|(index, point)| {
-                            index != variable_index && *point != first.compressed_points[index]
-                        })
-            })
-        {
-            return None;
-        }
-        let attempted = terms.len();
-        let point_slices = first
-            .compressed_points
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| *index != variable_index)
-            .map(|(_, point)| byte_slice(point))
-            .collect::<Vec<_>>();
-        let scalar_rows = terms
-            .iter()
-            .flat_map(|term| {
-                term.scalar_be
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, _)| *index != variable_index)
-                    .map(|(_, scalar)| byte_slice(scalar))
-            })
-            .collect::<Vec<_>>();
-        let variable_points = terms
-            .iter()
-            .map(|term| byte_slice(&term.compressed_points[variable_index]))
-            .collect::<Vec<_>>();
-        let variable_scalars = terms
-            .iter()
-            .map(|term| byte_slice(&term.scalar_be[variable_index]))
-            .collect::<Vec<_>>();
-        let mut points = (0..attempted).map(|_| vec![0u8; 48]).collect::<Vec<_>>();
-        let mut point_outs = points
-            .iter_mut()
-            .map(|point| byte_buffer(point))
-            .collect::<Vec<_>>();
-        let mut item = gpu_abi::CuBbsBbsGpuG1MsmCommonPointsPlusVariableItem {
-            points: point_slices.as_ptr(),
-            term_count: point_slices.len(),
-            scalar_rows: scalar_rows.as_ptr(),
-            variable_points: variable_points.as_ptr(),
-            variable_scalars: variable_scalars.as_ptr(),
-            output_count: attempted,
-            point_outs: point_outs.as_mut_ptr(),
-        };
-        let mut gpu_results = empty_gpu_results(attempted);
-        let status = unsafe {
-            call(
-                gpu_abi::CUBBS_BBS_GPU_ABI_VERSION,
-                &mut item,
-                1,
-                gpu_results.as_mut_ptr(),
-            )
-        };
-        if status != gpu_abi::CUBBS_BBS_GPU_SUCCESS {
-            return Some(batch_call_error(
-                attempted,
-                Error::Gpu(gpu_status_message(status)),
-                fail_fast,
-            ));
-        }
-        let point_lens = point_outs.iter().map(|out| out.len).collect::<Vec<_>>();
-        drop(point_outs);
-        Some(collect_generated_batch(
-            attempted,
-            fail_fast,
-            gpu_results,
-            points,
-            |index| point_lens[index],
-        ))
-    }
-
-    pub(super) fn proof_verify_msm_pair_batch(
-        &self,
-        all_terms: &[BbsMsmTerms],
-        fail_fast: bool,
-    ) -> Option<BbsBatchRunResult<Vec<u8>>> {
-        let call = self.proof_verify_msm_pair_batch?;
-        if all_terms.len() < 2 || !all_terms.len().is_multiple_of(2) {
-            return None;
-        }
-        let t1_terms = all_terms.iter().step_by(2).collect::<Vec<_>>();
-        let t2_terms = all_terms.iter().skip(1).step_by(2).collect::<Vec<_>>();
-        if t1_terms
-            .iter()
-            .any(|term| term.compressed_points.len() != 3 || term.scalar_be.len() != 3)
-        {
-            return None;
-        }
-        let first_t2 = *t2_terms.first()?;
-        let term_count = first_t2.compressed_points.len();
-        if term_count <= 1
-            || first_t2.scalar_be.len() != term_count
-            || term_count < gpu_split_variable_msm_min_terms()
-            || t2_terms.iter().any(|term| {
-                term.compressed_points.len() != term_count || term.scalar_be.len() != term_count
-            })
-        {
-            return None;
-        }
-        let variable_indexes = if t2_terms.len() == 1 {
-            let d = &t1_terms[0].compressed_points[2];
-            first_t2
-                .compressed_points
-                .iter()
-                .enumerate()
-                .filter_map(|(index, point)| (point == d).then_some(index))
-                .collect::<Vec<_>>()
-        } else {
-            (0..term_count)
-                .filter(|&point_index| {
-                    let base = &first_t2.compressed_points[point_index];
-                    t2_terms
-                        .iter()
-                        .skip(1)
-                        .any(|term| term.compressed_points[point_index] != *base)
-                })
-                .collect::<Vec<_>>()
-        };
-        let [variable_index] = variable_indexes.as_slice() else {
-            return None;
-        };
-        let variable_index = *variable_index;
-        if t2_terms.iter().any(|term| {
-            term.compressed_points
-                .iter()
-                .enumerate()
-                .any(|(index, point)| {
-                    index != variable_index && *point != first_t2.compressed_points[index]
-                })
-        }) || t1_terms
-            .iter()
-            .zip(t2_terms.iter())
-            .any(|(t1, t2)| t1.compressed_points[2] != t2.compressed_points[variable_index])
-        {
-            return None;
-        }
-
-        let output_count = t1_terms.len();
-        let common_points = first_t2
-            .compressed_points
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| *index != variable_index)
-            .map(|(_, point)| byte_slice(point))
-            .collect::<Vec<_>>();
-        let common_scalar_rows = t2_terms
-            .iter()
-            .flat_map(|term| {
-                term.scalar_be
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, _)| *index != variable_index)
-                    .map(|(_, scalar)| byte_slice(scalar))
-            })
-            .collect::<Vec<_>>();
-        let proof_points = t1_terms
-            .iter()
-            .flat_map(|term| term.compressed_points.iter().map(|point| byte_slice(point)))
-            .collect::<Vec<_>>();
-        let proof_scalars = t1_terms
-            .iter()
-            .zip(t2_terms.iter())
-            .flat_map(|(t1, t2)| {
-                t1.scalar_be
-                    .iter()
-                    .chain(std::iter::once(&t2.scalar_be[variable_index]))
-                    .map(|scalar| byte_slice(scalar))
-            })
-            .collect::<Vec<_>>();
-        let mut t1_outputs = (0..output_count).map(|_| vec![0u8; 48]).collect::<Vec<_>>();
-        let mut t2_outputs = (0..output_count).map(|_| vec![0u8; 48]).collect::<Vec<_>>();
-        let mut t1_buffers = t1_outputs
-            .iter_mut()
-            .map(|point| byte_buffer(point))
-            .collect::<Vec<_>>();
-        let mut t2_buffers = t2_outputs
-            .iter_mut()
-            .map(|point| byte_buffer(point))
-            .collect::<Vec<_>>();
-        let mut item = gpu_abi::CuBbsBbsGpuProofVerifyMsmPairItem {
-            common_points: common_points.as_ptr(),
-            common_term_count: common_points.len(),
-            common_scalar_rows: common_scalar_rows.as_ptr(),
-            proof_points: proof_points.as_ptr(),
-            proof_scalars: proof_scalars.as_ptr(),
-            output_count,
-            t1_outs: t1_buffers.as_mut_ptr(),
-            t2_outs: t2_buffers.as_mut_ptr(),
-        };
-        let mut gpu_results = empty_gpu_results(output_count);
-        let status = unsafe {
-            call(
-                gpu_abi::CUBBS_BBS_GPU_ABI_VERSION,
-                &mut item,
-                1,
-                gpu_results.as_mut_ptr(),
-            )
-        };
-        if status != gpu_abi::CUBBS_BBS_GPU_SUCCESS {
-            return None;
-        }
-        drop(t1_buffers);
-        drop(t2_buffers);
-
-        let mut results = Vec::with_capacity(all_terms.len());
-        for (row, gpu_result) in gpu_results.into_iter().enumerate() {
-            let row_result = if gpu_result.code == gpu_abi::CUBBS_BBS_GPU_SUCCESS {
-                Ok(())
-            } else {
-                Err(Error::Gpu(gpu_status_message(gpu_result.code)))
-            };
-            results.push(BbsBatchItemResult {
-                index: row * 2,
-                result: row_result.clone().map(|_| t1_outputs[row].clone()),
-            });
-            results.push(BbsBatchItemResult {
-                index: row * 2 + 1,
-                result: row_result.map(|_| t2_outputs[row].clone()),
-            });
-            if fail_fast && results.last().is_some_and(|item| item.result.is_err()) {
-                break;
-            }
-        }
-        Some(batch_run_result(all_terms.len(), results))
-    }
-
     pub(super) fn g1_msm_common_points_packed(
         &self,
         compressed_points: &[Vec<u8>],
@@ -2341,87 +2012,6 @@ impl GpuKernelLibrary {
         })
     }
 
-    /// GPU proof-gen t2Prepare: computes the 6 fixed G1 scalar multiplications
-    /// (d, abar, bbar, t1) on the device. Caller precomputes the 7 scalar
-    /// multipliers on the host. Returns 4 compressed G1 points per proof.
-    pub(super) fn proof_gen_t2_prepare_batch(
-        &self,
-        inputs: &[BbsT2PrepareGpuInput<'_>],
-        fail_fast: bool,
-    ) -> BbsBatchRunResult<BbsT2PrepareGpuOutput> {
-        let Some(proof_gen_t2_prepare_batch) = self.proof_gen_t2_prepare_batch else {
-            return batch_call_error(
-                inputs.len(),
-                Error::Gpu("GPU proof_gen_t2_prepare symbol is unavailable".to_owned()),
-                fail_fast,
-            );
-        };
-        let attempted = inputs.len();
-        let mut d_bufs = (0..attempted).map(|_| vec![0u8; 48]).collect::<Vec<_>>();
-        let mut abar_bufs = (0..attempted).map(|_| vec![0u8; 48]).collect::<Vec<_>>();
-        let mut bbar_bufs = (0..attempted).map(|_| vec![0u8; 48]).collect::<Vec<_>>();
-        let mut t1_bufs = (0..attempted).map(|_| vec![0u8; 48]).collect::<Vec<_>>();
-        let mut items = inputs
-            .iter()
-            .enumerate()
-            .map(|(index, input)| {
-                let mut scalars_be = [gpu_abi::CuBbsBbsGpuByteSlice {
-                    data: core::ptr::null(),
-                    len: 0,
-                }; 7];
-                for (s, scalar) in input.scalars_be.iter().enumerate() {
-                    scalars_be[s] = byte_slice(scalar);
-                }
-                gpu_abi::CuBbsBbsGpuProofGenT2PrepareItem {
-                    compressed_b: byte_slice(input.compressed_b),
-                    signature_a: byte_slice(input.signature_a),
-                    scalars_be,
-                    seed: byte_slice(input.seed),
-                    d_out: byte_buffer(&mut d_bufs[index]),
-                    abar_out: byte_buffer(&mut abar_bufs[index]),
-                    bbar_out: byte_buffer(&mut bbar_bufs[index]),
-                    t1_out: byte_buffer(&mut t1_bufs[index]),
-                }
-            })
-            .collect::<Vec<_>>();
-        let mut gpu_results = empty_gpu_results(attempted);
-        let status = unsafe {
-            proof_gen_t2_prepare_batch(
-                gpu_abi::CUBBS_BBS_GPU_ABI_VERSION,
-                items.as_mut_ptr(),
-                items.len(),
-                gpu_results.as_mut_ptr(),
-            )
-        };
-        if status != gpu_abi::CUBBS_BBS_GPU_SUCCESS {
-            return batch_call_error(attempted, Error::Gpu(gpu_status_message(status)), fail_fast);
-        }
-        let mut results = Vec::with_capacity(attempted);
-        for index in 0..attempted {
-            let r = &gpu_results[index];
-            if r.code == gpu_abi::CUBBS_BBS_GPU_SUCCESS && r.bytes_written == 48 {
-                results.push(BbsBatchItemResult {
-                    index,
-                    result: Ok(BbsT2PrepareGpuOutput {
-                        d: std::mem::take(&mut d_bufs[index]),
-                        abar: std::mem::take(&mut abar_bufs[index]),
-                        bbar: std::mem::take(&mut bbar_bufs[index]),
-                        t1: std::mem::take(&mut t1_bufs[index]),
-                    }),
-                });
-            } else {
-                results.push(BbsBatchItemResult {
-                    index,
-                    result: Err(gpu_item_error(*r)),
-                });
-                if fail_fast {
-                    break;
-                }
-            }
-        }
-        batch_run_result(attempted, results)
-    }
-
     pub(super) fn pairing_eq_batch(
         &self,
         items: &[BbsPairingEqInput],
@@ -2511,191 +2101,5 @@ impl GpuKernelLibrary {
             .collect::<Vec<_>>();
         let _ = fail_fast;
         Some(batch_run_result(items.len(), results))
-    }
-
-    pub(super) fn sign_batch(
-        &self,
-        reqs: Vec<SignRequest>,
-        fail_fast: bool,
-    ) -> BbsBatchRunResult<Vec<u8>> {
-        let attempted = reqs.len();
-        let message_slices = reqs
-            .iter()
-            .map(|req| {
-                req.messages
-                    .iter()
-                    .map(|msg| byte_slice(msg))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let mut signatures = (0..attempted)
-            .map(|_| vec![0u8; SIGNATURE_LEN])
-            .collect::<Vec<_>>();
-        let mut items = reqs
-            .iter()
-            .enumerate()
-            .map(|(index, req)| gpu_abi::CuBbsBbsGpuSignItem {
-                secret_key: byte_slice(&req.secret_key),
-                public_key: byte_slice(&req.public_key),
-                header: byte_slice(&req.header),
-                messages: message_slices[index].as_ptr(),
-                message_count: message_slices[index].len(),
-                signature_out: byte_buffer(&mut signatures[index]),
-            })
-            .collect::<Vec<_>>();
-        let mut gpu_results = empty_gpu_results(attempted);
-        let status = unsafe {
-            (self.sign_batch)(
-                gpu_abi::CUBBS_BBS_GPU_ABI_VERSION,
-                items.as_mut_ptr(),
-                items.len(),
-                gpu_results.as_mut_ptr(),
-            )
-        };
-        if status != gpu_abi::CUBBS_BBS_GPU_SUCCESS {
-            return batch_call_error(attempted, Error::Gpu(gpu_status_message(status)), fail_fast);
-        }
-
-        collect_generated_batch(attempted, fail_fast, gpu_results, signatures, |index| {
-            items[index].signature_out.len
-        })
-    }
-
-    pub(super) fn verify_batch(
-        &self,
-        reqs: Vec<VerifyRequest>,
-        fail_fast: bool,
-    ) -> BbsBatchRunResult<bool> {
-        let attempted = reqs.len();
-        let message_slices = reqs
-            .iter()
-            .map(|req| {
-                req.messages
-                    .iter()
-                    .map(|msg| byte_slice(msg))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let items = reqs
-            .iter()
-            .enumerate()
-            .map(|(index, req)| gpu_abi::CuBbsBbsGpuVerifyItem {
-                public_key: byte_slice(&req.public_key),
-                signature: byte_slice(&req.signature),
-                header: byte_slice(&req.header),
-                messages: message_slices[index].as_ptr(),
-                message_count: message_slices[index].len(),
-            })
-            .collect::<Vec<_>>();
-        let mut gpu_results = empty_gpu_results(attempted);
-        let status = unsafe {
-            (self.verify_batch)(
-                gpu_abi::CUBBS_BBS_GPU_ABI_VERSION,
-                items.as_ptr(),
-                items.len(),
-                gpu_results.as_mut_ptr(),
-            )
-        };
-        if status != gpu_abi::CUBBS_BBS_GPU_SUCCESS {
-            return batch_call_error(attempted, Error::Gpu(gpu_status_message(status)), fail_fast);
-        }
-
-        collect_boolean_batch(attempted, fail_fast, gpu_results)
-    }
-
-    pub(super) fn proof_gen_batch(
-        &self,
-        reqs: Vec<ProofGenRequest>,
-        fail_fast: bool,
-    ) -> BbsBatchRunResult<Vec<u8>> {
-        let attempted = reqs.len();
-        let message_slices = reqs
-            .iter()
-            .map(|req| {
-                req.messages
-                    .iter()
-                    .map(|msg| byte_slice(msg))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let mut proofs = reqs
-            .iter()
-            .map(|req| vec![0u8; proof_capacity(req.messages.len(), req.disclosed_indexes.len())])
-            .collect::<Vec<_>>();
-        let mut items = reqs
-            .iter()
-            .enumerate()
-            .map(|(index, req)| gpu_abi::CuBbsBbsGpuProofGenItem {
-                public_key: byte_slice(&req.public_key),
-                signature: byte_slice(&req.signature),
-                header: byte_slice(&req.header),
-                presentation_header: byte_slice(&req.presentation_header),
-                messages: message_slices[index].as_ptr(),
-                message_count: message_slices[index].len(),
-                disclosed_indexes: index_slice(&req.disclosed_indexes),
-                proof_out: byte_buffer(&mut proofs[index]),
-            })
-            .collect::<Vec<_>>();
-        let mut gpu_results = empty_gpu_results(attempted);
-        let status = unsafe {
-            (self.proof_gen_batch)(
-                gpu_abi::CUBBS_BBS_GPU_ABI_VERSION,
-                items.as_mut_ptr(),
-                items.len(),
-                gpu_results.as_mut_ptr(),
-            )
-        };
-        if status != gpu_abi::CUBBS_BBS_GPU_SUCCESS {
-            return batch_call_error(attempted, Error::Gpu(gpu_status_message(status)), fail_fast);
-        }
-
-        collect_generated_batch(attempted, fail_fast, gpu_results, proofs, |index| {
-            items[index].proof_out.len
-        })
-    }
-
-    pub(super) fn proof_verify_batch(
-        &self,
-        reqs: Vec<ProofVerifyRequest>,
-        fail_fast: bool,
-    ) -> BbsBatchRunResult<bool> {
-        let attempted = reqs.len();
-        let disclosed_message_slices = reqs
-            .iter()
-            .map(|req| {
-                req.disclosed_messages
-                    .iter()
-                    .map(|msg| byte_slice(msg))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let items = reqs
-            .iter()
-            .enumerate()
-            .map(|(index, req)| gpu_abi::CuBbsBbsGpuProofVerifyItem {
-                public_key: byte_slice(&req.public_key),
-                proof: byte_slice(&req.proof),
-                header: byte_slice(&req.header),
-                presentation_header: byte_slice(&req.presentation_header),
-                disclosed_messages: disclosed_message_slices[index].as_ptr(),
-                disclosed_count: disclosed_message_slices[index].len(),
-                disclosed_indexes: index_slice(&req.disclosed_indexes),
-                total_message_count: req.total_message_count,
-            })
-            .collect::<Vec<_>>();
-        let mut gpu_results = empty_gpu_results(attempted);
-        let status = unsafe {
-            (self.proof_verify_batch)(
-                gpu_abi::CUBBS_BBS_GPU_ABI_VERSION,
-                items.as_ptr(),
-                items.len(),
-                gpu_results.as_mut_ptr(),
-            )
-        };
-        if status != gpu_abi::CUBBS_BBS_GPU_SUCCESS {
-            return batch_call_error(attempted, Error::Gpu(gpu_status_message(status)), fail_fast);
-        }
-
-        collect_boolean_batch(attempted, fail_fast, gpu_results)
     }
 }

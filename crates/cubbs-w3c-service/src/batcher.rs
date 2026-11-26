@@ -127,6 +127,7 @@ where
     T: Send + 'static,
     R: Send + 'static,
 {
+    #[cfg(test)]
     pub fn spawn<F, Fut>(config: BatcherConfig, processor: F) -> Self
     where
         F: Fn(Vec<T>) -> Fut + Send + Sync + 'static,

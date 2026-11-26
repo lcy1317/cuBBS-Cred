@@ -2869,8 +2869,6 @@ impl GpuBbsEngine {
         if let Some(result) = self.proof_gen_batch_fused_resident_gpu(kernel, &reqs, fail_fast) {
             return result;
         }
-        let profile = std::env::var_os("CUBBS_BBS_GPU_PROOF_GEN_T2_PROFILE").is_some();
-        let profile_total_started = Instant::now();
         let attempted = reqs.len();
         let flat_messages = reqs
             .iter()
@@ -2881,7 +2879,6 @@ impl GpuBbsEngine {
                 Ok(scalars) => scalars,
                 Err(error) => return batch_call_error(attempted, error, fail_fast),
             };
-        let profile_scalar_ms = elapsed_ms(profile_total_started);
 
         let mut scalar_cursor = 0usize;
         let mut prepared = Vec::with_capacity(attempted);
@@ -2898,14 +2895,7 @@ impl GpuBbsEngine {
             scalar_cursor = scalar_end;
         }
 
-        if let Some(result) =
-            proof_gen_homogeneous_packed_batch(kernel, self, &prepared, attempted, fail_fast)
-        {
-            return result;
-        }
-
         if kernel.can_g1_msm() {
-            let profile_terms_started = Instant::now();
             let terms = match prepared
                 .iter()
                 .map(|(_, req, scalars)| {
@@ -2924,17 +2914,10 @@ impl GpuBbsEngine {
                 Ok(terms) => terms,
                 Err(error) => return batch_call_error(attempted, error, fail_fast),
             };
-            let profile_terms_ms = elapsed_ms(profile_terms_started);
             let all_t2_gpu = prepared
                 .iter()
                 .all(|(_, req, _)| proof_gen_gpu_t2_msm_enabled(req.messages.len()));
             let mut overlapped_domains = None;
-            // Overlap host prep work with the GPU B-MSM. When enabled, a
-            // background thread precomputes the BBS domain scalars AND the
-            // per-proof random scalars (both independent of B) while the GPU
-            // computes B. This hides ~part of the t2Prepare host cost behind
-            // the GPU B-MSM, lifting proof-gen throughput.
-            let profile_b_started = Instant::now();
             let prepared_b = if all_t2_gpu && proof_gen_overlap_domain_enabled() {
                 thread::scope(|scope| {
                     let domain_terms = terms.clone();
@@ -2956,83 +2939,8 @@ impl GpuBbsEngine {
             } else {
                 g1_msm_batch_grouped_by_points_for_proof_gen_b(kernel, &terms, fail_fast)
             };
-            let profile_b_ms = elapsed_ms(profile_b_started);
             if prepared_b.failed == 0 && prepared_b.results.len() == prepared.len() {
                 if all_t2_gpu {
-                    // GPU t2Prepare: the 6 fixed G1 scalar multiplications run
-                    // on the device. Falls back to the CPU path if the GPU
-                    // symbol is unavailable or the kernel fails.
-                    let gpu_t2 = if kernel.can_proof_gen_t2_prepare()
-                        && gpu_proof_gen_t2_prepare_enabled()
-                        && gpu_proof_gen_t2_prepare_for_shape(
-                            prepared.len(),
-                            prepared
-                                .first()
-                                .map(|(_, req, _)| req.messages.len())
-                                .unwrap_or(0),
-                        ) {
-                        let gpu_domains = match overlapped_domains.clone() {
-                            Some(domains) => Ok(domains),
-                            None => precompute_b_msm_domains(terms.clone()),
-                        };
-                        let gpu_domains = match gpu_domains {
-                            Ok(domains) => domains,
-                            Err(error) => return batch_call_error(attempted, error, fail_fast),
-                        };
-                        match prepare_proof_gen_t2_with_gpu_fixed_muls(
-                            kernel,
-                            self.protocol,
-                            prepared.clone(),
-                            prepared_b.results.clone(),
-                            gpu_domains,
-                            None,
-                            fail_fast,
-                        ) {
-                            Ok(result) => Some(result),
-                            Err(error) => {
-                                if std::env::var_os("CUBBS_BBS_GPU_PROOF_GEN_T2_PROFILE").is_some()
-                                {
-                                    eprintln!("cubbs_proof_gen_t2_gpu_fallback error={error}");
-                                }
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    if let Some((compressed_states, t2_results)) = gpu_t2 {
-                        if t2_results.failed == 0
-                            && t2_results.results.len() == compressed_states.len()
-                        {
-                            let profile_finalize_started = Instant::now();
-                            let result = finalize_proof_gen_t2_compressed_batch(
-                                self.protocol,
-                                Some(kernel),
-                                attempted,
-                                compressed_states,
-                                t2_results.results,
-                                fail_fast,
-                            );
-                            if profile {
-                                eprintln!(
-                                    "cubbs_proof_gen_full_profile items={} scalar_ms={:.6} terms_ms={:.6} b_msm_ms={:.6} t2_msm_ms={:.6} finalize_ms={:.6} total_ms={:.6}",
-                                    attempted,
-                                    profile_scalar_ms,
-                                    profile_terms_ms,
-                                    profile_b_ms,
-                                    0.0,
-                                    elapsed_ms(profile_finalize_started),
-                                    elapsed_ms(profile_total_started),
-                                );
-                            }
-                            return result;
-                        }
-                        return batch_call_error(
-                            attempted,
-                            Error::Gpu("proof-gen compressed T2 GPU MSM failed".to_owned()),
-                            fail_fast,
-                        );
-                    }
                     let (states_and_items, t2_terms) =
                         match prepare_proof_gen_t2_msm_terms_batch_with_domains(
                             self.protocol,
@@ -4058,16 +3966,6 @@ impl GpuBbsEngine {
                 if let Some(error) = gpu_runtime_plan_error(kernel, &plan) {
                     return batch_call_error(reqs.len(), error, fail_fast);
                 }
-                if sign_shape_batching_enabled() {
-                    if let Some(result) = self.sign_batch_with_gpu_shape_batching(
-                        kernel,
-                        reqs.clone(),
-                        &plan,
-                        fail_fast,
-                    ) {
-                        return result;
-                    }
-                }
                 self.sign_batch_with_gpu_message_scalars(kernel, reqs, fail_fast)
             }
             None => run_bbs_batch(reqs, fail_fast, |req| self.sign(req)),
@@ -4118,74 +4016,6 @@ impl GpuBbsEngine {
             }
         }
         self.sign_batch(reqs.iter().map(|req| (**req).clone()).collect(), fail_fast)
-    }
-
-    pub(super) fn sign_batch_with_gpu_shape_batching(
-        &self,
-        kernel: &GpuKernelLibrary,
-        reqs: Vec<SignRequest>,
-        plan: &planner::ExecutionPlan,
-        fail_fast: bool,
-    ) -> Option<BbsBatchRunResult<Vec<u8>>> {
-        let attempted = reqs.len();
-        if attempted < proof_bbs_mixed_shape_min_batch() {
-            return None;
-        }
-        if plan.batches.len() < 2 || plan.batches.len() > 3 {
-            return None;
-        }
-        if let Some(error) = gpu_runtime_plan_error(kernel, &plan) {
-            return Some(batch_call_error(attempted, error, fail_fast));
-        }
-
-        let mut requests = reqs.into_iter().map(Some).collect::<Vec<_>>();
-        let buckets = plan
-            .batches
-            .iter()
-            .cloned()
-            .map(|planned| {
-                let indexes = planned.request_indices;
-                let batch = indexes
-                    .iter()
-                    .map(|&index| {
-                        requests[index]
-                            .take()
-                            .expect("planner emitted each sign request exactly once")
-                    })
-                    .collect::<Vec<_>>();
-                (indexes, batch)
-            })
-            .collect::<Vec<_>>();
-        let results = thread::scope(|scope| {
-            buckets
-                .into_iter()
-                .map(|(indexes, batch)| {
-                    scope.spawn(move || {
-                        let bucket =
-                            self.sign_batch_with_gpu_message_scalars(kernel, batch, fail_fast);
-                        bucket
-                            .results
-                            .into_iter()
-                            .filter_map(|item| {
-                                indexes
-                                    .get(item.index)
-                                    .copied()
-                                    .map(|index| BbsBatchItemResult {
-                                        index,
-                                        result: item.result,
-                                    })
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .flat_map(|worker| worker.join().expect("sign shape worker panicked"))
-                .collect::<Vec<_>>()
-        });
-        Some(merge_batch_results_with_fail_fast(
-            attempted, results, fail_fast, None,
-        ))
     }
 
     pub fn verify_batch(
@@ -4289,13 +4119,6 @@ impl GpuBbsEngine {
                 if let Some(error) = gpu_runtime_plan_error(kernel, &plan) {
                     return batch_call_error(reqs.len(), error, fail_fast);
                 }
-                if proof_bbs_mixed_shape_batching_enabled() {
-                    if proof_gen_shape_batching_eligible(&reqs) {
-                        return self.proof_gen_batch_with_gpu_shape_batching(
-                            kernel, reqs, plan, fail_fast,
-                        );
-                    }
-                }
                 self.proof_gen_batch_with_gpu_message_scalars(kernel, reqs, fail_fast)
             }
             _ => run_bbs_batch(reqs, fail_fast, |req| self.proof_gen(req)),
@@ -4351,331 +4174,10 @@ impl GpuBbsEngine {
                 if kernel.can_precompute_message_scalars() && kernel.can_g1_msm() {
                     return self.profile_proof_verify_batch(reqs, fail_fast).result;
                 }
-                if proof_bbs_mixed_shape_batching_enabled() {
-                    if let Some(result) =
-                        self.proof_verify_batch_with_shape_batching(kernel, reqs.clone(), fail_fast)
-                    {
-                        return result;
-                    }
-                }
                 self.proof_verify_batch_with_gpu_message_scalars(kernel, reqs, fail_fast)
             }
             _ => run_bbs_batch(reqs, fail_fast, |req| self.proof_verify(req)),
         }
-    }
-
-    pub(super) fn proof_gen_batch_with_gpu_shape_batching(
-        &self,
-        kernel: &GpuKernelLibrary,
-        reqs: Vec<ProofGenRequest>,
-        plan: planner::ExecutionPlan,
-        fail_fast: bool,
-    ) -> BbsBatchRunResult<Vec<u8>> {
-        let attempted = reqs.len();
-        let shared_public_key = reqs
-            .first()
-            .is_none_or(|first| reqs.iter().all(|req| req.public_key == first.public_key));
-
-        debug_assert!(plan.batches.len() >= proof_bbs_mixed_shape_min_groups());
-        if let Some(error) = gpu_runtime_plan_error(kernel, &plan) {
-            return batch_call_error(attempted, error, fail_fast);
-        }
-
-        let mut requests = reqs.into_iter().map(Some).collect::<Vec<_>>();
-        let mut buckets = plan
-            .batches
-            .into_iter()
-            .map(|planned| {
-                let indexes = planned.request_indices;
-                let batch = indexes
-                    .iter()
-                    .map(|&index| {
-                        requests[index]
-                            .take()
-                            .expect("planner emitted each proof-gen request exactly once")
-                    })
-                    .collect::<Vec<_>>();
-                (indexes, batch)
-            })
-            .collect::<Vec<(Vec<usize>, Vec<ProofGenRequest>)>>();
-
-        buckets.sort_by_key(|(indexes, _)| indexes.iter().copied().min().unwrap_or_default());
-
-        let parallel_streams =
-            proof_gen_mixed_shape_parallel_streams(if shared_public_key { 3 } else { 4 });
-        if parallel_streams <= 1 {
-            let mut results = Vec::with_capacity(attempted);
-            let mut first_error_index = None;
-            for (indexes, batch) in buckets {
-                let bucket_result =
-                    self.proof_gen_batch_with_gpu_message_scalars(kernel, batch, fail_fast);
-                for item in bucket_result.results {
-                    if let Some(&original_index) = indexes.get(item.index) {
-                        let is_error = item.result.is_err();
-                        results.push(BbsBatchItemResult {
-                            index: original_index,
-                            result: item.result,
-                        });
-                        if is_error {
-                            first_error_index =
-                                Some(original_index.min(first_error_index.unwrap_or(attempted)));
-                        }
-                    }
-                }
-                if fail_fast && first_error_index.is_some() {
-                    break;
-                }
-            }
-
-            return merge_batch_results_with_fail_fast(
-                attempted,
-                results,
-                fail_fast && first_error_index.is_some(),
-                first_error_index,
-            );
-        }
-
-        let stream_count = parallel_streams.min(buckets.len());
-        let queue = Arc::new(Mutex::new(VecDeque::from(buckets)));
-        let first_error_index = Arc::new(AtomicUsize::new(attempted + 1));
-
-        let results = thread::scope(|scope| {
-            (0..stream_count)
-                .map(|_| {
-                    let queue = Arc::clone(&queue);
-                    let first_error_index = Arc::clone(&first_error_index);
-                    scope.spawn(move || {
-                        let mut bucket_results = Vec::new();
-                        loop {
-                            let job = {
-                                let mut queue_guard = queue.lock().unwrap();
-                                queue_guard.pop_front()
-                            };
-                            let Some((indexes, batch)) = job else {
-                                break;
-                            };
-
-                            let bucket_result = self
-                                .proof_gen_batch_with_gpu_message_scalars(kernel, batch, fail_fast);
-                            let mut local_first_error = None;
-                            for item in bucket_result.results {
-                                if let Some(&original_index) = indexes.get(item.index) {
-                                    let is_error = item.result.is_err();
-                                    bucket_results.push(BbsBatchItemResult {
-                                        index: original_index,
-                                        result: item.result,
-                                    });
-                                    if is_error {
-                                        local_first_error = Some(original_index);
-                                    }
-                                }
-                            }
-
-                            if let Some(error_index) = local_first_error {
-                                let mut observed = first_error_index.load(Ordering::Acquire);
-                                while error_index < observed {
-                                    match first_error_index.compare_exchange_weak(
-                                        observed,
-                                        error_index,
-                                        Ordering::Release,
-                                        Ordering::Acquire,
-                                    ) {
-                                        Ok(_) => break,
-                                        Err(next) => observed = next,
-                                    }
-                                }
-                            }
-                        }
-                        bucket_results
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|worker| {
-                    worker
-                        .join()
-                        .expect("proof-gen mixed-shape worker panicked")
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-        });
-
-        let first_error_index = {
-            let observed = first_error_index.load(Ordering::Acquire);
-            (observed != attempted + 1).then_some(observed)
-        };
-
-        merge_batch_results_with_fail_fast(
-            attempted,
-            results,
-            fail_fast && first_error_index.is_some(),
-            first_error_index,
-        )
-    }
-
-    pub(super) fn proof_verify_batch_with_shape_batching(
-        &self,
-        kernel: &GpuKernelLibrary,
-        reqs: Vec<ProofVerifyRequest>,
-        fail_fast: bool,
-    ) -> Option<BbsBatchRunResult<bool>> {
-        let attempted = reqs.len();
-        let shared_public_key = reqs
-            .first()
-            .is_none_or(|first| reqs.iter().all(|req| req.public_key == first.public_key));
-        if attempted < proof_bbs_mixed_shape_min_batch() {
-            return None;
-        }
-        if !proof_verify_requests_are_mixed(&reqs) {
-            return None;
-        }
-
-        let plan = planner::CuBbsPlanner::plan_proof_verify(&reqs);
-        if plan.batches.len() < proof_bbs_mixed_shape_min_groups() {
-            return None;
-        }
-        if let Some(error) = gpu_runtime_plan_error(kernel, &plan) {
-            return Some(batch_call_error(attempted, error, fail_fast));
-        }
-
-        let mut requests = reqs.into_iter().map(Some).collect::<Vec<_>>();
-        let mut buckets = plan
-            .batches
-            .into_iter()
-            .map(|planned| {
-                let indexes = planned.request_indices;
-                let batch = indexes
-                    .iter()
-                    .map(|&index| {
-                        requests[index]
-                            .take()
-                            .expect("planner emitted each proof-verify request exactly once")
-                    })
-                    .collect::<Vec<_>>();
-                (indexes, batch)
-            })
-            .collect::<Vec<(Vec<usize>, Vec<ProofVerifyRequest>)>>();
-
-        buckets.sort_by_key(|(indexes, _)| indexes.iter().copied().min().unwrap_or_default());
-
-        let parallel_streams =
-            proof_verify_mixed_shape_parallel_streams(if shared_public_key { 3 } else { 4 });
-        if parallel_streams <= 1 {
-            let mut results = Vec::with_capacity(attempted);
-            let mut first_error_index = None;
-            for (indexes, batch) in buckets {
-                let bucket_result =
-                    self.proof_verify_batch_with_gpu_message_scalars(kernel, batch, fail_fast);
-                for item in &bucket_result.results {
-                    if let Some(&original_index) = indexes.get(item.index) {
-                        results.push(BbsBatchItemResult {
-                            index: original_index,
-                            result: item.result.clone(),
-                        });
-                    }
-                }
-
-                if fail_fast {
-                    if let Some((index, _)) = indexes
-                        .iter()
-                        .cloned()
-                        .zip(bucket_result.results.iter())
-                        .find_map(|(index, item)| item.result.is_err().then_some((index, ())))
-                    {
-                        first_error_index = Some(index.min(first_error_index.unwrap_or(attempted)));
-                        break;
-                    }
-                }
-            }
-
-            return Some(merge_batch_results_with_fail_fast(
-                attempted,
-                results,
-                fail_fast && first_error_index.is_some(),
-                first_error_index,
-            ));
-        }
-
-        let stream_count = parallel_streams.min(buckets.len());
-        let queue = Arc::new(Mutex::new(VecDeque::from(buckets)));
-        let first_error_index = Arc::new(AtomicUsize::new(attempted + 1));
-
-        let results = thread::scope(|scope| {
-            (0..stream_count)
-                .map(|_| {
-                    let queue = Arc::clone(&queue);
-                    let first_error_index = Arc::clone(&first_error_index);
-                    scope.spawn(move || {
-                        let mut bucket_results = Vec::new();
-                        loop {
-                            let job = {
-                                let mut queue_guard = queue.lock().unwrap();
-                                queue_guard.pop_front()
-                            };
-                            let Some((indexes, batch)) = job else {
-                                break;
-                            };
-
-                            let bucket_result = self.proof_verify_batch_with_gpu_message_scalars(
-                                kernel, batch, fail_fast,
-                            );
-                            let mut local_first_error = None;
-                            for item in &bucket_result.results {
-                                if let Some(&original_index) = indexes.get(item.index) {
-                                    bucket_results.push(BbsBatchItemResult {
-                                        index: original_index,
-                                        result: item.result.clone(),
-                                    });
-                                    if item.result.is_err() {
-                                        local_first_error = Some(original_index);
-                                    }
-                                }
-                            }
-
-                            if let Some(error_index) = local_first_error {
-                                let mut observed = first_error_index.load(Ordering::Acquire);
-                                while error_index < observed {
-                                    match first_error_index.compare_exchange_weak(
-                                        observed,
-                                        error_index,
-                                        Ordering::Release,
-                                        Ordering::Acquire,
-                                    ) {
-                                        Ok(_) => break,
-                                        Err(next) => observed = next,
-                                    }
-                                }
-                            }
-                        }
-                        bucket_results
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|worker| {
-                    worker
-                        .join()
-                        .expect("proof-verify mixed-shape worker panicked")
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-        });
-
-        let first_error_index = {
-            let observed = first_error_index.load(Ordering::Acquire);
-            (observed != attempted + 1).then_some(observed)
-        };
-
-        Some(merge_batch_results_with_fail_fast(
-            attempted,
-            results,
-            fail_fast && first_error_index.is_some(),
-            first_error_index,
-        ))
     }
 
     pub fn profile_proof_gen_batch(

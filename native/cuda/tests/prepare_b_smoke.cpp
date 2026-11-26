@@ -195,17 +195,17 @@ int main() {
       CUBBS_BBS_GPU_ABI_VERSION, &universal_item, 1u, &universal_result);
   if (status != CUBBS_BBS_GPU_SUCCESS ||
       universal_result.code != CUBBS_BBS_GPU_SUCCESS ||
-      universal_result.value != expected_first_route ||
+      universal_result.value != CUBBS_BBS_MSM_ROUTE_CUBBS_LARGE ||
       universal_result.bytes_written != universal_out.size() ||
       hex_bytes(universal_out.data(), universal_out.size()) != expected_b) {
-    std::cerr << "universal common-points route failed status=" << status
+    std::cerr << "large common-points route failed status=" << status
               << " code=" << universal_result.code
               << " route=" << static_cast<unsigned>(universal_result.value)
               << "\n";
     return 1;
   }
   std::cout << "cuda " << universal_term_count
-            << "-term common-points smoke ok: selected route\n";
+            << "-term common-points smoke ok: large Pippenger route\n";
 
   const std::vector<uint8_t> two_scalar =
       hex_to_bytes("0000000000000000000000000000000000000000000000000000000000000002");
@@ -507,26 +507,18 @@ int main() {
   std::cout << "cuda g1_msm fused device row-scale smoke ok: "
                "scale=2 matches regular MSM\n";
 
-  // The same packed layout must survive a forced universal fallback.
-  const char *prior_route = std::getenv("CUBBS_BBS_MSM_BENCH_ROUTE");
-  const bool had_prior_route = prior_route != nullptr;
-  const std::string saved_route = had_prior_route ? prior_route : "";
-  setenv("CUBBS_BBS_MSM_BENCH_ROUTE", "4", 1);
+  // The same packed layout must also match via the common-points entry point.
   scaled_packed_result = {};
-  // The benchmark override belongs to the route-selecting ABI, not the
-  // explicitly fused entry point (which deliberately selects its own path).
   status = cubbs_bbs_gpu_g1_msm_common_points_batch_v2(
       CUBBS_BBS_GPU_ABI_VERSION, &scaled_packed_item, 1u, &scaled_packed_result);
-  if (had_prior_route) setenv("CUBBS_BBS_MSM_BENCH_ROUTE", saved_route.c_str(), 1);
-  else unsetenv("CUBBS_BBS_MSM_BENCH_ROUTE");
   if (status != CUBBS_BBS_GPU_SUCCESS || scaled_packed_result.code != CUBBS_BBS_GPU_SUCCESS ||
-      scaled_packed_result.value != 4u || scaled_packed_out != scaled_expected_out) {
-    std::cerr << "universal row-scale regression failed: status=" << status
+      scaled_packed_result.value != 2u || scaled_packed_out != scaled_expected_out) {
+    std::cerr << "common-points row-scale regression failed: status=" << status
               << " code=" << scaled_packed_result.code
               << " route=" << static_cast<unsigned>(scaled_packed_result.value) << "\n";
     return 1;
   }
-  std::cout << "cuda universal row-scale regression ok\n";
+  std::cout << "cuda common-points row-scale regression ok\n";
 
   const auto invalid_fr = hex_to_bytes(
       "73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001");
