@@ -182,9 +182,23 @@ pub async fn canonicalize_jsonld(
     document: &Value,
 ) -> Result<CanonicalizedNQuads, JsonLdCanonicalizationError> {
     let total_started = Instant::now();
+    let cache = canonicalization_cache();
+    if cache.capacity == 0 {
+        cache.misses.fetch_add(1, Ordering::Relaxed);
+        let nquads = jsonld_to_nquads(document).await?;
+        let rdf_canon_started = Instant::now();
+        let canonicalized = canonicalize_nquads(&nquads)?;
+        cache
+            .rdf_canonicalize_micros
+            .fetch_add(elapsed_micros(rdf_canon_started), Ordering::Relaxed);
+        cache
+            .canonicalize_total_micros
+            .fetch_add(elapsed_micros(total_started), Ordering::Relaxed);
+        return Ok(canonicalized);
+    }
     let cache_key_started = Instant::now();
     let cache_key = document_cache_key(document)?;
-    canonicalization_cache()
+    cache
         .cache_key_micros
         .fetch_add(elapsed_micros(cache_key_started), Ordering::Relaxed);
     canonicalize_jsonld_with_key(document, cache_key, total_started).await
@@ -262,9 +276,38 @@ pub async fn label_replacement_canonicalize_jsonld(
     let hmac_key: [u8; HMAC_KEY_LEN] = hmac_key
         .try_into()
         .map_err(|_| JsonLdCanonicalizationError::InvalidHmacKeyLength(hmac_key.len()))?;
+    let cache = canonicalization_cache();
+    if cache.capacity == 0 && cache.label_capacity == 0 {
+        let canonicalized = canonicalize_jsonld(document).await?;
+        if canonicalized.canonical_id_map.is_empty() {
+            cache
+                .label_replacement_micros
+                .fetch_add(elapsed_micros(started), Ordering::Relaxed);
+            return Ok(LabelReplacementCanonicalizedJsonLd {
+                nquads: canonicalized.lines,
+                canonical_id_map: BTreeMap::new(),
+                label_map: BTreeMap::new(),
+            });
+        }
+        let input_to_replacement =
+            shuffled_bnode_label_map(&canonicalized.canonical_id_map, &hmac_key);
+        let label_map = canonical_label_map_from_input_map(
+            &canonicalized.canonical_id_map,
+            &input_to_replacement,
+        );
+        let nquads = relabel_and_sort_canonical_nquads(&canonicalized.lines, &label_map);
+        cache
+            .label_replacement_micros
+            .fetch_add(elapsed_micros(started), Ordering::Relaxed);
+        return Ok(LabelReplacementCanonicalizedJsonLd {
+            nquads,
+            canonical_id_map: canonicalized.canonical_id_map,
+            label_map,
+        });
+    }
     let cache_key_started = Instant::now();
     let document_key = document_cache_key(document)?;
-    canonicalization_cache()
+    cache
         .cache_key_micros
         .fetch_add(elapsed_micros(cache_key_started), Ordering::Relaxed);
     let cache_lookup_started = Instant::now();
@@ -369,6 +412,12 @@ pub async fn canonicalize_and_group_jsonld(
 
 pub async fn jsonld_to_nquads(document: &Value) -> Result<String, JsonLdCanonicalizationError> {
     let started = Instant::now();
+    if let Some(fast_nquads) = try_fast_w3c_v2_jsonld_to_nquads(document) {
+        canonicalization_cache()
+            .jsonld_to_nquads_total_micros
+            .fetch_add(elapsed_micros(started), Ordering::Relaxed);
+        return Ok(fast_nquads);
+    }
     let result = if shared_jsonld_loader_enabled() {
         let loader = ChainLoader::new(w3c_context_cache()?, reqwest_loader());
         jsonld_to_nquads_using(document, &loader).await
@@ -381,6 +430,557 @@ pub async fn jsonld_to_nquads(document: &Value) -> Result<String, JsonLdCanonica
         .jsonld_to_nquads_total_micros
         .fetch_add(elapsed_micros(started), Ordering::Relaxed);
     result
+}
+
+const RDF_TYPE_IRI: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+const XSD_BOOLEAN_IRI: &str = "http://www.w3.org/2001/XMLSchema#boolean";
+const XSD_INTEGER_IRI: &str = "http://www.w3.org/2001/XMLSchema#integer";
+const XSD_DATETIME_IRI: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
+
+#[derive(Clone, Copy)]
+enum FastTermKind {
+    PlainString,
+    Iri,
+    Typed(&'static str),
+    ProofPurposeVocab,
+    CredentialSubject,
+}
+
+#[derive(Clone, Copy)]
+struct FastTermDef {
+    iri: &'static str,
+    kind: FastTermKind,
+}
+
+fn is_fast_abs_iri(s: &str) -> bool {
+    if s.is_empty() || s.starts_with("_:") {
+        return false;
+    }
+    let Some(colon) = s.find(':') else {
+        return false;
+    };
+    if colon == 0 {
+        return false;
+    }
+    let scheme = &s.as_bytes()[..colon];
+    if !scheme[0].is_ascii_alphabetic()
+        || !scheme
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    {
+        return false;
+    }
+    s.bytes().all(|b| {
+        b > 0x20
+            && b != 0x7f
+            && !matches!(b, b'<' | b'>' | b'"' | b'{' | b'}' | b'|' | b'^' | b'`' | b'\\')
+    })
+}
+
+fn is_protected_w3c_v2_term(key: &str) -> bool {
+    matches!(
+        key,
+        "id" | "type"
+            | "description"
+            | "digestMultibase"
+            | "digestSRI"
+            | "mediaType"
+            | "name"
+            | "VerifiableCredential"
+            | "EnvelopedVerifiableCredential"
+            | "VerifiablePresentation"
+            | "EnvelopedVerifiablePresentation"
+            | "JsonSchemaCredential"
+            | "JsonSchema"
+            | "BitstringStatusListCredential"
+            | "BitstringStatusList"
+            | "BitstringStatusListEntry"
+            | "DataIntegrityProof"
+            | "proof"
+            | "credentialSubject"
+            | "issuer"
+            | "validFrom"
+            | "validUntil"
+            | "cryptosuite"
+            | "proofPurpose"
+            | "proofValue"
+            | "verificationMethod"
+            | "created"
+            | "expires"
+            | "domain"
+            | "challenge"
+            | "nonce"
+            | "previousProof"
+    )
+}
+
+fn lookup_root_term<'a>(
+    key: &str,
+    has_vc_v2: bool,
+    inline: &'a HashMap<&'a str, &'a str>,
+) -> Option<(&'a str, FastTermKind)> {
+    if has_vc_v2 {
+        match key {
+            "description" => return Some(("https://schema.org/description", FastTermKind::PlainString)),
+            "name" => return Some(("https://schema.org/name", FastTermKind::PlainString)),
+            "mediaType" => return Some(("https://schema.org/encodingFormat", FastTermKind::PlainString)),
+            "digestMultibase" => {
+                return Some((
+                    "https://w3id.org/security#digestMultibase",
+                    FastTermKind::Typed("https://w3id.org/security#multibase"),
+                ));
+            }
+            "digestSRI" => {
+                return Some((
+                    "https://www.w3.org/2018/credentials#digestSRI",
+                    FastTermKind::Typed("https://www.w3.org/2018/credentials#sriString"),
+                ));
+            }
+            _ => {}
+        }
+    }
+    inline.get(key).map(|iri| (*iri, FastTermKind::PlainString))
+}
+
+fn lookup_vc_scoped_term(key: &str) -> Option<FastTermDef> {
+    match key {
+        "credentialSubject" => Some(FastTermDef {
+            iri: "https://www.w3.org/2018/credentials#credentialSubject",
+            kind: FastTermKind::CredentialSubject,
+        }),
+        "issuer" => Some(FastTermDef {
+            iri: "https://www.w3.org/2018/credentials#issuer",
+            kind: FastTermKind::Iri,
+        }),
+        "validFrom" => Some(FastTermDef {
+            iri: "https://www.w3.org/2018/credentials#validFrom",
+            kind: FastTermKind::Typed(XSD_DATETIME_IRI),
+        }),
+        "validUntil" => Some(FastTermDef {
+            iri: "https://www.w3.org/2018/credentials#validUntil",
+            kind: FastTermKind::Typed(XSD_DATETIME_IRI),
+        }),
+        "description" => Some(FastTermDef {
+            iri: "https://schema.org/description",
+            kind: FastTermKind::PlainString,
+        }),
+        "name" => Some(FastTermDef {
+            iri: "https://schema.org/name",
+            kind: FastTermKind::PlainString,
+        }),
+        _ => None,
+    }
+}
+
+fn lookup_di_scoped_term(key: &str) -> Option<FastTermDef> {
+    match key {
+        "cryptosuite" => Some(FastTermDef {
+            iri: "https://w3id.org/security#cryptosuite",
+            kind: FastTermKind::Typed("https://w3id.org/security#cryptosuiteString"),
+        }),
+        "verificationMethod" => Some(FastTermDef {
+            iri: "https://w3id.org/security#verificationMethod",
+            kind: FastTermKind::Iri,
+        }),
+        "proofPurpose" => Some(FastTermDef {
+            iri: "https://w3id.org/security#proofPurpose",
+            kind: FastTermKind::ProofPurposeVocab,
+        }),
+        "created" => Some(FastTermDef {
+            iri: "http://purl.org/dc/terms/created",
+            kind: FastTermKind::Typed(XSD_DATETIME_IRI),
+        }),
+        "expires" => Some(FastTermDef {
+            iri: "https://w3id.org/security#expiration",
+            kind: FastTermKind::Typed(XSD_DATETIME_IRI),
+        }),
+        "domain" => Some(FastTermDef {
+            iri: "https://w3id.org/security#domain",
+            kind: FastTermKind::PlainString,
+        }),
+        "challenge" => Some(FastTermDef {
+            iri: "https://w3id.org/security#challenge",
+            kind: FastTermKind::PlainString,
+        }),
+        "nonce" => Some(FastTermDef {
+            iri: "https://w3id.org/security#nonce",
+            kind: FastTermKind::PlainString,
+        }),
+        "proofValue" => Some(FastTermDef {
+            iri: "https://w3id.org/security#proofValue",
+            kind: FastTermKind::Typed("https://w3id.org/security#multibase"),
+        }),
+        "previousProof" => Some(FastTermDef {
+            iri: "https://w3id.org/security#previousProof",
+            kind: FastTermKind::Iri,
+        }),
+        _ => None,
+    }
+}
+
+fn push_escaped_nquad_literal(out: &mut String, s: &str) -> bool {
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || (c as u32) == 0x7f => return false,
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    true
+}
+
+fn push_nquad_triple_iri(out: &mut String, subj: &str, pred: &str, obj_iri: &str) {
+    out.push_str(subj);
+    out.push_str(" <");
+    out.push_str(pred);
+    out.push_str("> <");
+    out.push_str(obj_iri);
+    out.push_str("> .\n");
+}
+
+fn emit_fast_value(
+    out: &mut String,
+    subj: &str,
+    pred: &str,
+    kind: FastTermKind,
+    value: &Value,
+    has_vc_v2: bool,
+    inline: &HashMap<&str, &str>,
+    bnode_counter: &mut usize,
+) -> Option<()> {
+    match value {
+        Value::Null => Some(()),
+        Value::Array(items) => {
+            for item in items {
+                emit_fast_value(out, subj, pred, kind, item, has_vc_v2, inline, bnode_counter)?;
+            }
+            Some(())
+        }
+        Value::String(s) => match kind {
+            FastTermKind::PlainString => {
+                out.push_str(subj);
+                out.push_str(" <");
+                out.push_str(pred);
+                out.push_str("> ");
+                if !push_escaped_nquad_literal(out, s) {
+                    return None;
+                }
+                out.push_str(" .\n");
+                Some(())
+            }
+            FastTermKind::Typed(dt) => {
+                out.push_str(subj);
+                out.push_str(" <");
+                out.push_str(pred);
+                out.push_str("> ");
+                if !push_escaped_nquad_literal(out, s) {
+                    return None;
+                }
+                out.push_str("^^<");
+                out.push_str(dt);
+                out.push_str("> .\n");
+                Some(())
+            }
+            FastTermKind::Iri => {
+                if s.is_empty() {
+                    // Without a document base IRI, json-ld drops empty relative IRIs.
+                    return Some(());
+                }
+                if !is_fast_abs_iri(s) {
+                    return None;
+                }
+                push_nquad_triple_iri(out, subj, pred, s);
+                Some(())
+            }
+            FastTermKind::ProofPurposeVocab => {
+                let iri = match s.as_str() {
+                    "assertionMethod" => "https://w3id.org/security#assertionMethod",
+                    "authentication" => "https://w3id.org/security#authenticationMethod",
+                    "capabilityDelegation" => "https://w3id.org/security#capabilityDelegationMethod",
+                    "capabilityInvocation" => "https://w3id.org/security#capabilityInvocationMethod",
+                    "keyAgreement" => "https://w3id.org/security#keyAgreementMethod",
+                    other if is_fast_abs_iri(other) => other,
+                    _ => return None,
+                };
+                push_nquad_triple_iri(out, subj, pred, iri);
+                Some(())
+            }
+            FastTermKind::CredentialSubject => {
+                if !is_fast_abs_iri(s) {
+                    return None;
+                }
+                push_nquad_triple_iri(out, subj, pred, s);
+                Some(())
+            }
+        },
+        Value::Bool(b) => match kind {
+            FastTermKind::PlainString => {
+                out.push_str(subj);
+                out.push_str(" <");
+                out.push_str(pred);
+                out.push_str(if *b { "> \"true\"^^<" } else { "> \"false\"^^<" });
+                out.push_str(XSD_BOOLEAN_IRI);
+                out.push_str("> .\n");
+                Some(())
+            }
+            _ => None,
+        },
+        Value::Number(n) => match kind {
+            FastTermKind::PlainString => {
+                let int_str = if let Some(i) = n.as_i64() {
+                    i.to_string()
+                } else if let Some(u) = n.as_u64() {
+                    u.to_string()
+                } else {
+                    return None;
+                };
+                out.push_str(subj);
+                out.push_str(" <");
+                out.push_str(pred);
+                out.push_str("> \"");
+                out.push_str(&int_str);
+                out.push_str("\"^^<");
+                out.push_str(XSD_INTEGER_IRI);
+                out.push_str("> .\n");
+                Some(())
+            }
+            _ => None,
+        },
+        Value::Object(nested) => match kind {
+            FastTermKind::CredentialSubject => {
+                // Type-scoped VC context does not propagate into credentialSubject.
+                let nested_subj = resolve_node_subject(nested, bnode_counter)?;
+                out.push_str(subj);
+                out.push_str(" <");
+                out.push_str(pred);
+                out.push_str("> ");
+                out.push_str(&nested_subj);
+                out.push_str(" .\n");
+                emit_flat_node(out, &nested_subj, nested, has_vc_v2, false, false, inline, bnode_counter)
+            }
+            _ => None,
+        },
+    }
+}
+
+fn resolve_node_subject(
+    obj: &serde_json::Map<String, Value>,
+    bnode_counter: &mut usize,
+) -> Option<String> {
+    if obj.contains_key("@id") {
+        return None;
+    }
+    match obj.get("id") {
+        Some(Value::String(id)) => {
+            if !is_fast_abs_iri(id) {
+                return None;
+            }
+            Some(format!("<{id}>"))
+        }
+        Some(_) => None,
+        None => {
+            let n = *bnode_counter;
+            *bnode_counter += 1;
+            Some(format!("_:{n}"))
+        }
+    }
+}
+
+fn emit_flat_node(
+    out: &mut String,
+    subj: &str,
+    obj: &serde_json::Map<String, Value>,
+    has_vc_v2: bool,
+    is_vc: bool,
+    is_di: bool,
+    inline: &HashMap<&str, &str>,
+    bnode_counter: &mut usize,
+) -> Option<()> {
+    for (key, value) in obj {
+        if key == "@context" || key == "id" {
+            continue;
+        }
+        if key.starts_with('@') {
+            return None;
+        }
+        if key == "type" {
+            emit_fast_types(out, subj, value, has_vc_v2, inline)?;
+            continue;
+        }
+        if let Some(def) = if is_vc {
+            lookup_vc_scoped_term(key)
+        } else if is_di {
+            lookup_di_scoped_term(key)
+        } else {
+            None
+        } {
+            emit_fast_value(
+                out,
+                subj,
+                def.iri,
+                def.kind,
+                value,
+                has_vc_v2,
+                inline,
+                bnode_counter,
+            )?;
+            continue;
+        }
+        let (iri, kind) = lookup_root_term(key, has_vc_v2, inline)?;
+        emit_fast_value(out, subj, iri, kind, value, has_vc_v2, inline, bnode_counter)?;
+    }
+    Some(())
+}
+
+fn emit_fast_types(
+    out: &mut String,
+    subj: &str,
+    value: &Value,
+    has_vc_v2: bool,
+    inline: &HashMap<&str, &str>,
+) -> Option<()> {
+    let mut emit_one = |s: &str| -> Option<()> {
+        let iri = match s {
+            "VerifiableCredential" if has_vc_v2 => {
+                "https://www.w3.org/2018/credentials#VerifiableCredential"
+            }
+            "DataIntegrityProof" => "https://w3id.org/security#DataIntegrityProof",
+            other => {
+                if let Some(mapped) = inline.get(other) {
+                    *mapped
+                } else if is_fast_abs_iri(other) {
+                    other
+                } else {
+                    return None;
+                }
+            }
+        };
+        push_nquad_triple_iri(out, subj, RDF_TYPE_IRI, iri);
+        Some(())
+    };
+    match value {
+        Value::String(s) => emit_one(s),
+        Value::Array(arr) => {
+            for item in arr {
+                let Value::String(s) = item else {
+                    return None;
+                };
+                emit_one(s)?;
+            }
+            Some(())
+        }
+        _ => None,
+    }
+}
+
+fn parse_fast_ctx_entry<'a>(
+    entry: &'a Value,
+    has_vc_v2: &mut bool,
+    has_di_v2: &mut bool,
+    inline: &mut HashMap<&'a str, &'a str>,
+) -> Option<()> {
+    match entry {
+        Value::String(url) if url == "https://www.w3.org/ns/credentials/v2" => {
+            *has_vc_v2 = true;
+            *has_di_v2 = true;
+            Some(())
+        }
+        Value::String(url) if url == "https://w3id.org/security/data-integrity/v2" => {
+            *has_di_v2 = true;
+            Some(())
+        }
+        Value::Object(map) => {
+            for (k, v) in map {
+                if k.starts_with('@') || is_protected_w3c_v2_term(k) {
+                    return None;
+                }
+                let Value::String(iri) = v else {
+                    return None;
+                };
+                if !is_fast_abs_iri(iri) {
+                    return None;
+                }
+                inline.insert(k.as_str(), iri.as_str());
+            }
+            Some(())
+        }
+        _ => None,
+    }
+}
+
+fn try_fast_w3c_v2_jsonld_to_nquads(document: &Value) -> Option<String> {
+    let obj = document.as_object()?;
+    let ctx = obj.get("@context")?;
+    let mut has_vc_v2 = false;
+    let mut has_di_v2 = false;
+    let mut inline: HashMap<&str, &str> = HashMap::new();
+
+    match ctx {
+        Value::String(_) => parse_fast_ctx_entry(ctx, &mut has_vc_v2, &mut has_di_v2, &mut inline)?,
+        Value::Array(arr) if !arr.is_empty() => {
+            for entry in arr {
+                parse_fast_ctx_entry(entry, &mut has_vc_v2, &mut has_di_v2, &mut inline)?;
+            }
+        }
+        _ => return None,
+    }
+    if !has_vc_v2 && !has_di_v2 {
+        return None;
+    }
+
+    // Determine whether the root node activates VerifiableCredential or DataIntegrityProof scope.
+    let mut is_vc = false;
+    let mut is_di = false;
+    if let Some(ty) = obj.get("type") {
+        match ty {
+            Value::String(s) => {
+                if s == "VerifiableCredential" && has_vc_v2 {
+                    is_vc = true;
+                } else if s == "DataIntegrityProof" && has_di_v2 {
+                    is_di = true;
+                }
+            }
+            Value::Array(arr) => {
+                for item in arr {
+                    if let Value::String(s) = item {
+                        if s == "VerifiableCredential" && has_vc_v2 {
+                            is_vc = true;
+                        } else if s == "DataIntegrityProof" && has_di_v2 {
+                            is_di = true;
+                        }
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
+    if is_vc && is_di {
+        return None;
+    }
+
+    let mut bnode_counter = 0usize;
+    let root_subj = resolve_node_subject(obj, &mut bnode_counter)?;
+    let mut nquads = String::with_capacity(4096);
+    emit_flat_node(
+        &mut nquads,
+        &root_subj,
+        obj,
+        has_vc_v2,
+        is_vc,
+        is_di,
+        &inline,
+        &mut bnode_counter,
+    )?;
+    if ensure_type_values_were_not_dropped(document, &nquads).is_err() {
+        return None;
+    }
+    Some(nquads)
 }
 
 pub async fn jsonld_to_nquads_using(
@@ -974,5 +1574,69 @@ mod tests {
             ensure_type_values_were_not_dropped(&document, nquads),
             Err(JsonLdCanonicalizationError::DataLoss(_))
         ));
+    }
+
+    #[async_std::test]
+    async fn fast_w3c_v2_matches_generic_jsonld_bit_for_bit() {
+        let loader = ChainLoader::new(w3c_context_cache().unwrap(), reqwest_loader());
+        let docs = [
+            json!({
+                "@context": [
+                    "https://www.w3.org/ns/credentials/v2",
+                    {
+                        "ExampleCredential": "https://example.com/ExampleCredential",
+                        "claim0": "https://example.com/claim/0",
+                        "claim1": "https://example.com/claim/1",
+                        "age": "https://example.com/age",
+                        "active": "https://example.com/active"
+                    }
+                ],
+                "id": "urn:uuid:omni-w3c-64",
+                "type": ["VerifiableCredential", "ExampleCredential"],
+                "issuer": "",
+                "credentialSubject": {
+                    "id": "did:example:subject-64",
+                    "claim0": "value-0",
+                    "claim1": "value-\"1\"\nline2",
+                    "age": 42,
+                    "active": true
+                }
+            }),
+            json!({
+                "@context": [
+                    "https://www.w3.org/ns/credentials/v2",
+                    {
+                        "ExampleCredential": "https://example.com/ExampleCredential"
+                    }
+                ],
+                "id": "urn:uuid:omni-w3c-2",
+                "type": ["VerifiableCredential", "ExampleCredential"],
+                "issuer": "did:key:zUC79tMoWT1WjLn6RnjkfKSGcFtFhKcnDqji5mXX82GFMQLjFg8qnz8aSGtqnJc7paBmE3zpKSy3zzUQCAwM9DBJxDZohsaUqmdmTq4sCRWF4nioJ2YqKAmNQM296RNsJ2YKdZG",
+                "validFrom": "2026-01-01T00:00:00Z",
+                "credentialSubject": {
+                    "id": "did:example:alice",
+                    "name": "Alice"
+                }
+            }),
+            json!({
+                "@context": [
+                    "https://www.w3.org/ns/credentials/v2",
+                    { "ExampleCredential": "https://example.com/ExampleCredential" }
+                ],
+                "type": "DataIntegrityProof",
+                "cryptosuite": "bbs-2023",
+                "verificationMethod": "did:key:zUC79#zUC79",
+                "proofPurpose": "assertionMethod",
+                "created": "2026-01-01T00:00:00Z"
+            }),
+        ];
+        for doc in &docs {
+            let fast_raw = try_fast_w3c_v2_jsonld_to_nquads(doc)
+                .expect("fast path should handle standard W3C VC v2 / DI v2 doc");
+            let slow_raw = jsonld_to_nquads_using(doc, &loader).await.unwrap();
+            let fast_canon = canonicalize_nquads(&fast_raw).unwrap();
+            let slow_canon = canonicalize_nquads(&slow_raw).unwrap();
+            assert_eq!(fast_canon, slow_canon, "mismatch on doc {doc}");
+        }
     }
 }

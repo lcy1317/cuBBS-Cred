@@ -13,6 +13,11 @@
 void cubbs_bbs_run_host_tasks(
     size_t task_count, const std::function<void(size_t)> &task);
 
+// Configure CUDA device scheduling policy once before primary context creation.
+// Defaults to cudaDeviceScheduleBlockingSync to avoid 100%-core CPU spin-wait
+// inside cudaStreamSynchronize across concurrent host streams.
+void cubbs_bbs_ensure_cuda_device_schedule();
+
 struct CuBbsPrepareBInput {
   const uint8_t *public_key;
   const uint8_t *header;
@@ -133,8 +138,37 @@ int32_t cubbs_bbs_cuda_miller_loop_common_lines_batch(
     void *rhs_fp12_out, uint8_t *finalverify_out,
     const uint8_t *lhs_g2_key, const uint8_t *rhs_g2_key);
 
+int32_t cubbs_bbs_cuda_launch_pairing_eq_single_on_stream(
+    const void *d_lhs_g1, const void *d_rhs_g1,
+    const uint8_t *lhs_lines, const uint8_t *rhs_lines,
+    const uint8_t *lhs_g2_key, const uint8_t *rhs_g2_key,
+    uint8_t *d_eq_out, void *cuda_stream);
+
 int32_t cubbs_bbs_cuda_proof_gen_t2_prepare(
     struct CuBbsBbsGpuProofGenT2PrepareItem *items, size_t item_count,
     CuBbsBbsGpuResult *results);
+
+int32_t cubbs_bbs_cuda_sign_fused_common_batch(
+    const struct CuBbsBbsGpuSignFusedCommonBatchItem *item,
+    CuBbsBbsGpuResult *results);
+
+int32_t cubbs_bbs_cuda_verify_pre_b_aggregate_fused(
+    const struct CuBbsBbsGpuVerifyPreBAggregateFusedItem *item,
+    CuBbsBbsGpuResult *result);
+
+int32_t cubbs_bbs_cuda_pipeline_pinned_scratch(
+    size_t msg_bytes, size_t msg_count, uint8_t **messages_out,
+    uint64_t **offsets_out, uint64_t **lengths_out);
+
+int32_t cubbs_bbs_cuda_proof_gen_fused_common_batch(
+    const struct CuBbsBbsGpuProofGenFusedCommonBatchItem *item,
+    CuBbsBbsGpuResult *results);
+
+int32_t cubbs_bbs_cuda_proof_verify_fused_common_batch(
+    const struct CuBbsBbsGpuProofVerifyFusedCommonBatchItem *item,
+    CuBbsBbsGpuResult *result);
+
+int32_t cubbs_bbs_blst_get_prepared_g2_lines(
+    CuBbsBbsGpuByteSlice g2_compressed, void *lines_out_68x288);
 
 #endif

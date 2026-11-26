@@ -267,6 +267,51 @@ __global__ static void cubbs_bbs_g1_fixed_signed_comb9_precompute_kernel(
   }
 }
 
+// Builds a half-size GLV fixed signed comb table (only the lower 128-bit windows:
+// kBits=8 -> 17 windows, kBits=9 -> 15 windows, kBits=10 -> 13 windows).
+// One block owns one generator; threads parallelize all digits in each window.
+template <uint32_t kBits, uint32_t kWindows, uint32_t kEntries>
+__global__ static void cubbs_bbs_g1_fixed_glv_comb_precompute_kernel(
+    const cubbs_sppark_plain_affine_t *points, size_t term_count,
+    cubbs_sppark_bucket_t *comb_table) {
+  const size_t term = blockIdx.x;
+  const uint32_t tid = threadIdx.x;
+  if (term >= term_count) return;
+  __shared__ __align__(16) uint8_t
+      power_storage[kBits * sizeof(cubbs_sppark_bucket_t)];
+  auto *powers = reinterpret_cast<cubbs_sppark_bucket_t *>(power_storage);
+  if (tid == 0u) powers[0] = points[term];
+  __syncthreads();
+  for (uint32_t window = 0u; window < kWindows; ++window) {
+    if (tid == 0u) {
+#pragma unroll
+      for (uint32_t bit = 1u; bit < kBits; ++bit) {
+        powers[bit] = powers[bit - 1u];
+        powers[bit].add(powers[bit]);
+      }
+    }
+    __syncthreads();
+    for (uint32_t digit = tid; digit < kEntries; digit += blockDim.x) {
+      cubbs_sppark_bucket_t multiple;
+      multiple.inf();
+#pragma unroll
+      for (uint32_t bit = 0u; bit < kBits; ++bit) {
+        if ((digit & (1u << bit)) != 0u) {
+          if (multiple.is_inf()) multiple = powers[bit];
+          else multiple.add(powers[bit]);
+        }
+      }
+      comb_table[((term * kWindows + window) * kEntries) + digit] = multiple;
+    }
+    __syncthreads();
+    if (tid == 0u && window + 1u < kWindows) {
+      powers[0] = powers[kBits - 1u];
+      powers[0].add(powers[0]);
+    }
+    __syncthreads();
+  }
+}
+
 static uint32_t fused_common_points_threads_per_row() {
   // Default 128 threads/row: ~1 term/thread for the largest mixed VC shape
   // (130 terms), and it roughly doubles active warps per SM vs the 32-thread

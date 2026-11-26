@@ -1,0 +1,1704 @@
+#if defined(CUBBS_BBS_ENABLE_SPPARK_MSM)
+
+#ifndef CUBBS_BBS_FUSED_PROOF_CUH
+#define CUBBS_BBS_FUSED_PROOF_CUH
+
+// ============================================================================
+// GPU-Resident Fused BBS ProofGen & ProofVerify Pipelines (ABI v2)
+// ============================================================================
+// Eliminates CPU crypto (H2S packing, Scalar::random, T2 term expansion,
+// BLST point compression, SHA-256 challenge, scalar inversion/finalization)
+// by executing the entire proof generation and proof verification pipelines
+// end-to-end on the GPU in a single CUDA stream synchronization.
+
+// ---- Device helpers: RFC 8439 ChaCha20 CSPRNG -> uniform BLS12-381 Fr ----
+
+__device__ __forceinline__ static uint32_t cubbs_rotl32(uint32_t x, uint32_t n) {
+  return (x << n) | (x >> (32u - n));
+}
+
+__device__ __forceinline__ static void cubbs_chacha20_qr(
+    uint32_t &a, uint32_t &b, uint32_t &c, uint32_t &d) {
+  a += b; d ^= a; d = cubbs_rotl32(d, 16u);
+  c += d; b ^= c; b = cubbs_rotl32(b, 12u);
+  a += b; d ^= a; d = cubbs_rotl32(d, 8u);
+  c += d; b ^= c; b = cubbs_rotl32(b, 7u);
+}
+
+// Generates a uniform BLS12-381 Fr scalar (in little-endian 32 bytes) from a
+// 32-byte OS-seeded key, unique (row, scalar_idx) nonce, using 384 bits (12
+// ChaCha20 words) reduced mod r (statistical distance < 2^-128).
+__device__ static void cubbs_bbs_chacha20_fr_le_device(
+    const uint32_t seed_words[8], uint64_t row, uint32_t scalar_idx,
+    bool force_nonzero, uint8_t out_le[32]) {
+  uint32_t st[16];
+  st[0] = 0x61707865u;
+  st[1] = 0x3320646eu;
+  st[2] = 0x79622d32u;
+  st[3] = 0x6b206574u;
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) st[4 + i] = seed_words[i];
+  st[12] = 0u;
+  st[13] = static_cast<uint32_t>(row & 0xffffffffull);
+  st[14] = static_cast<uint32_t>(row >> 32u);
+  st[15] = scalar_idx;
+
+  uint32_t x[16];
+  #pragma unroll
+  for (int i = 0; i < 16; ++i) x[i] = st[i];
+
+  #pragma unroll
+  for (int round = 0; round < 10; ++round) {
+    cubbs_chacha20_qr(x[0], x[4], x[8],  x[12]);
+    cubbs_chacha20_qr(x[1], x[5], x[9],  x[13]);
+    cubbs_chacha20_qr(x[2], x[6], x[10], x[14]);
+    cubbs_chacha20_qr(x[3], x[7], x[11], x[15]);
+    cubbs_chacha20_qr(x[0], x[5], x[10], x[15]);
+    cubbs_chacha20_qr(x[1], x[6], x[11], x[12]);
+    cubbs_chacha20_qr(x[2], x[7], x[8],  x[13]);
+    cubbs_chacha20_qr(x[3], x[4], x[9],  x[14]);
+  }
+
+  uint32_t words12[12];
+  #pragma unroll
+  for (int i = 0; i < 12; ++i) words12[i] = x[i] + st[i];
+
+  uint64_t limbs[4];
+  bls12_381_fr_reduce_words12_to_le64(words12, limbs);
+  if (force_nonzero && (limbs[0] | limbs[1] | limbs[2] | limbs[3]) == 0ull) {
+    limbs[0] = 1ull;
+  }
+  memcpy(out_le, limbs, 32u);
+}
+
+__device__ __forceinline__ static void cubbs_bbs_store_fr_be(
+    cubbs_sppark_scalar_t val, uint8_t out_be[32]) {
+  val.from();
+  uint8_t le[32];
+  memcpy(le, &val, 32u);
+  #pragma unroll
+  for (int i = 0; i < 32; ++i) out_be[i] = le[31 - i];
+}
+
+__device__ __forceinline__ static void cubbs_bbs_sha256_push_u64_be(
+    CuBbsSha256Ctx &ctx, uint64_t value) {
+  ctx.push_word(static_cast<uint32_t>(value >> 32u));
+  ctx.push_word(static_cast<uint32_t>(value & 0xffffffffull));
+}
+
+// Computes RFC draft-irtf-cfrg-bbs-signatures proof challenge c = H2S(input, dst)
+// directly into a canonical LE 32-byte scalar with zero temporary buffers.
+__device__ static void cubbs_bbs_compute_proof_challenge_le_device(
+    const uint32_t *disclosed_indexes, size_t disclosed_count,
+    const uint8_t *disclosed_scalars_le_base, size_t disclosed_scalar_stride,
+    bool disclosed_uses_full_b_layout,
+    const uint8_t abar48[48], const uint8_t bbar48[48], const uint8_t d48[48],
+    const uint8_t t1_48[48], const uint8_t t2_48[48],
+    const uint8_t domain_be[32],
+    const uint8_t *ph, size_t ph_len,
+    const uint8_t *challenge_dst, size_t challenge_dst_len,
+    uint8_t out_le[32]) {
+  CuBbsSha256Ctx ctx;
+  uint32_t b0[8];
+  uint32_t b1[8];
+  uint32_t b2[8];
+
+  ctx.init_after_zpad();
+  cubbs_bbs_sha256_push_u64_be(ctx, static_cast<uint64_t>(disclosed_count));
+  for (size_t k = 0u; k < disclosed_count; ++k) {
+    const uint32_t idx = disclosed_indexes[k];
+    cubbs_bbs_sha256_push_u64_be(ctx, static_cast<uint64_t>(idx));
+    const uint8_t *s_le = disclosed_uses_full_b_layout
+                              ? (disclosed_scalars_le_base + ((2u + idx) * 32u))
+                              : (disclosed_scalars_le_base + (k * disclosed_scalar_stride));
+    ctx.update_scalar_le_as_be(s_le);
+  }
+  ctx.update(abar48, 48u);
+  ctx.update(bbar48, 48u);
+  ctx.update(d48, 48u);
+  ctx.update(t1_48, 48u);
+  ctx.update(t2_48, 48u);
+  ctx.update(domain_be, 32u);
+  cubbs_bbs_sha256_push_u64_be(ctx, static_cast<uint64_t>(ph_len));
+  if (ph_len > 0u) ctx.update(ph, ph_len);
+  ctx.push_byte(0u);
+  ctx.push_byte(48u);
+  ctx.push_byte(0u);
+  ctx.update(challenge_dst, challenge_dst_len);
+  ctx.push_byte(static_cast<uint8_t>(challenge_dst_len));
+  ctx.finalize_words(b0);
+
+  ctx.init();
+  ctx.w0 = b0[0]; ctx.w1 = b0[1]; ctx.w2 = b0[2]; ctx.w3 = b0[3];
+  ctx.w4 = b0[4]; ctx.w5 = b0[5]; ctx.w6 = b0[6]; ctx.w7 = b0[7];
+  ctx.block_len = 32u;
+  ctx.total_len = 32ull;
+  ctx.push_byte(1u);
+  ctx.update(challenge_dst, challenge_dst_len);
+  ctx.push_byte(static_cast<uint8_t>(challenge_dst_len));
+  ctx.finalize_words(b1);
+
+  ctx.init();
+  ctx.w0 = b0[0] ^ b1[0]; ctx.w1 = b0[1] ^ b1[1];
+  ctx.w2 = b0[2] ^ b1[2]; ctx.w3 = b0[3] ^ b1[3];
+  ctx.w4 = b0[4] ^ b1[4]; ctx.w5 = b0[5] ^ b1[5];
+  ctx.w6 = b0[6] ^ b1[6]; ctx.w7 = b0[7] ^ b1[7];
+  ctx.block_len = 32u;
+  ctx.total_len = 32ull;
+  ctx.push_byte(2u);
+  ctx.update(challenge_dst, challenge_dst_len);
+  ctx.push_byte(static_cast<uint8_t>(challenge_dst_len));
+  ctx.finalize_words(b2);
+
+  uint32_t words12[12];
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) words12[i] = b1[i];
+  #pragma unroll
+  for (int i = 0; i < 4; ++i) words12[8 + i] = b2[i];
+
+  uint64_t limbs[4];
+  bls12_381_fr_reduce_words12_to_le64(words12, limbs);
+  memcpy(out_le, limbs, 32u);
+}
+
+// ============================================================================
+// GPU-Resident Fused ProofGen Kernels
+// ============================================================================
+
+// Fill slots 0 (1) and 1 (domain_le) of every row in d_b_scalars_le.
+__global__ static void cubbs_bbs_proof_gen_init_b_header_scalars_kernel(
+    const uint8_t *domains_be, size_t domain_stride,
+    size_t item_count, size_t term_count,
+    uint8_t *b_scalars_le, uint32_t *invalid_out) {
+  const size_t row = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (row >= item_count) return;
+  uint8_t *row_s = b_scalars_le + (row * term_count * 32u);
+  memset(row_s, 0, 32u);
+  row_s[0] = 1u;
+  const uint8_t *dom_be = domains_be + (domain_stride == 0u ? 0u : row * domain_stride);
+  if (!cubbs_bbs_scalar_be_is_canonical(dom_be)) {
+    atomicExch(invalid_out, 1u);
+    memset(row_s + 32u, 0, 32u);
+    return;
+  }
+  uint8_t *dom_le = row_s + 32u;
+  #pragma unroll
+  for (int i = 0; i < 32; ++i) dom_le[i] = dom_be[31 - i];
+}
+
+// Normalize B_xyzz[0..B-1] -> B_affine[0..B-1] using 64-thread Montgomery batch inversion.
+__global__ static void cubbs_bbs_xyzz_to_plain_affine_batch64_kernel(
+    const cubbs_sppark_bucket_t *xyzz_in,
+    cubbs_sppark_plain_affine_t *affine_out,
+    size_t count) {
+  constexpr uint32_t kThreads = 64u;
+  __shared__ __align__(16) uint8_t scan_a_raw[kThreads * sizeof(fp_t)];
+  __shared__ __align__(16) uint8_t scan_b_raw[kThreads * sizeof(fp_t)];
+  auto *scan_a = reinterpret_cast<fp_t *>(scan_a_raw);
+  auto *scan_b = reinterpret_cast<fp_t *>(scan_b_raw);
+
+  const uint32_t tid = threadIdx.x;
+  const size_t idx = static_cast<size_t>(blockIdx.x) * kThreads + tid;
+  const bool valid = idx < count;
+
+  cubbs_sppark_bucket_t pt;
+  pt.inf();
+  bool finite = false;
+  fp_t zzz = fp_t::one();
+  if (valid) {
+    pt = xyzz_in[idx];
+    finite = !pt.is_inf();
+    if (finite) {
+      const fp_t *coords = reinterpret_cast<const fp_t *>(&pt);
+      zzz = coords[2];
+    }
+  }
+  scan_b[tid] = zzz;
+  __syncthreads();
+
+  fp_t prod = fp_t::one();
+  if (tid == 0u) {
+    for (uint32_t i = 0u; i < kThreads; ++i) {
+      scan_a[i] = prod;
+      prod *= scan_b[i];
+    }
+  }
+  __syncthreads();
+
+  // Warp 0 runs uniform reciprocal on prod (tid==0 holds total product).
+  if (tid < 32u) {
+    const fp_t inv_in = (tid == 0u) ? prod : fp_t::one();
+    const fp_t inv_all = inv_in.reciprocal();
+    if (tid == 0u) {
+      fp_t inv = inv_all;
+      for (int i = static_cast<int>(kThreads) - 1; i >= 0; --i) {
+        const fp_t inv_i = inv * scan_a[i];
+        inv *= scan_b[i];
+        scan_a[i] = inv_i;
+      }
+    }
+  }
+  __syncthreads();
+
+  if (valid) {
+    if (!finite) {
+      fp_t zero;
+      zero.zero();
+      affine_out[idx] = cubbs_sppark_plain_affine_t{zero, zero};
+    } else {
+      const fp_t *coords = reinterpret_cast<const fp_t *>(&pt);
+      const fp_t inv_zzz = scan_a[tid];
+      const fp_t affine_y = inv_zzz * coords[1];
+      const fp_t inv_z = inv_zzz * coords[3];
+      fp_t affine_x = inv_z * inv_z;
+      affine_x *= coords[0];
+      affine_out[idx] = cubbs_sppark_plain_affine_t{affine_x, affine_y};
+    }
+  }
+}
+
+// Per-proof GPU ChaCha20 CSPRNG + 7 GLV-split multiplier preparation:
+//   row_state[row * 6 + 0..5] = [r1, r2, e_tilde, r1_tilde, r3_tilde, e] (LE)
+//   glv_splits[row * 7 + 0..6] = GLV(rem||quot) of:
+//     [0] r2              (for D = r2*B)
+//     [1] r1*r2           (for Abar = (r1*r2)*A)
+//     [2] r1*r2           (for Bbar_pos = (r1*r2)*B)
+//     [3] r1*r2*e         (for Bbar_neg = -(r1*r2*e)*A)
+//     [4] r1*r2*e_tilde   (for T1_a = (r1*r2*e_tilde)*A)
+//     [5] r2*r1_tilde     (for T1_b = (r2*r1_tilde)*B)
+//     [6] r2*r3_tilde     (for T2_var = (r2*r3_tilde)*B = r3_tilde*D)
+__global__ static void cubbs_bbs_proof_gen_prep_scalars_kernel(
+    const uint8_t *signatures_e_be,
+    const uint8_t *csprng_seed,
+    size_t item_count,
+    uint8_t *row_state_le,    // item_count * 6 * 32
+    uint8_t *glv_splits_le,   // item_count * 7 * 32
+    uint32_t *invalid_out) {
+  const size_t row = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (row >= item_count) return;
+
+  const uint8_t *e_be = signatures_e_be + (row * 32u);
+  if (!cubbs_bbs_scalar_be_is_canonical(e_be)) {
+    atomicExch(invalid_out, 1u);
+    memset(row_state_le + (row * 6u * 32u), 0, 6u * 32u);
+    memset(glv_splits_le + (row * 7u * 32u), 0, 7u * 32u);
+    return;
+  }
+
+  uint32_t seed_w[8];
+  memcpy(seed_w, csprng_seed, 32u);
+
+  uint8_t r1_le[32], r2_le[32], et_le[32], r1t_le[32], r3t_le[32], e_le[32];
+  cubbs_bbs_chacha20_fr_le_device(seed_w, row, 0u, true, r1_le);
+  cubbs_bbs_chacha20_fr_le_device(seed_w, row, 1u, true, r2_le);
+  cubbs_bbs_chacha20_fr_le_device(seed_w, row, 2u, false, et_le);
+  cubbs_bbs_chacha20_fr_le_device(seed_w, row, 3u, false, r1t_le);
+  cubbs_bbs_chacha20_fr_le_device(seed_w, row, 4u, false, r3t_le);
+  #pragma unroll
+  for (int i = 0; i < 32; ++i) e_le[i] = e_be[31 - i];
+
+  uint8_t *st = row_state_le + (row * 6u * 32u);
+  memcpy(st + 0u * 32u, r1_le, 32u);
+  memcpy(st + 1u * 32u, r2_le, 32u);
+  memcpy(st + 2u * 32u, et_le, 32u);
+  memcpy(st + 3u * 32u, r1t_le, 32u);
+  memcpy(st + 4u * 32u, r3t_le, 32u);
+  memcpy(st + 5u * 32u, e_le, 32u);
+
+  cubbs_sppark_scalar_t fr_r1, fr_r2, fr_et, fr_r1t, fr_r3t, fr_e;
+  memcpy(&fr_r1, r1_le, 32u);   fr_r1.to();
+  memcpy(&fr_r2, r2_le, 32u);   fr_r2.to();
+  memcpy(&fr_et, et_le, 32u);   fr_et.to();
+  memcpy(&fr_r1t, r1t_le, 32u); fr_r1t.to();
+  memcpy(&fr_r3t, r3t_le, 32u); fr_r3t.to();
+  memcpy(&fr_e, e_le, 32u);     fr_e.to();
+
+  const cubbs_sppark_scalar_t fr_r1r2 = fr_r1 * fr_r2;
+  const cubbs_sppark_scalar_t fr_m3 = fr_r1r2 * fr_e;
+  const cubbs_sppark_scalar_t fr_m4 = fr_r1r2 * fr_et;
+  const cubbs_sppark_scalar_t fr_m5 = fr_r2 * fr_r1t;
+  const cubbs_sppark_scalar_t fr_m6 = fr_r2 * fr_r3t;
+
+  auto store_split = [&](uint32_t slot, cubbs_sppark_scalar_t val) {
+    val.from();
+    uint8_t le[32];
+    memcpy(le, &val, 32u);
+    uint8_t *dst = glv_splits_le + ((row * 7u + slot) * 32u);
+    cubbs_bbs_scalar_div_by_z2_device(le, dst, dst + 16u);
+  };
+  store_split(0u, fr_r2);
+  store_split(1u, fr_r1r2);
+  store_split(2u, fr_r1r2);
+  store_split(3u, fr_m3);
+  store_split(4u, fr_m4);
+  store_split(5u, fr_m5);
+  store_split(6u, fr_m6);
+}
+
+// Parallel ChaCha20 generator for m_tilde[row * U + u] (all B*U scalars in parallel!).
+__global__ static void cubbs_bbs_proof_gen_m_tilde_kernel(
+    const uint8_t *csprng_seed, size_t item_count, size_t undisclosed_count,
+    uint8_t *m_tilde_le) {
+  const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t total = item_count * undisclosed_count;
+  if (idx >= total) return;
+  const size_t row = idx / undisclosed_count;
+  const uint32_t u = static_cast<uint32_t>(idx - (row * undisclosed_count));
+  uint32_t seed_w[8];
+  memcpy(seed_w, csprng_seed, 32u);
+  cubbs_bbs_chacha20_fr_le_device(seed_w, row, 5u + u, false, m_tilde_le + (idx * 32u));
+}
+
+// Build [1*P, 2*P, ..., 8*P] in XYZZ for each affine base point using
+// single-mul dbl_u + mixed-affine uadd (0 stack spill).
+__global__ static void cubbs_bbs_build_radix16_tables_xyzz_kernel(
+    const cubbs_sppark_plain_affine_t *bases_in,
+    cubbs_sppark_bucket_t *tables_xyzz_out,
+    size_t point_count) {
+  const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= point_count) return;
+  const cubbs_sppark_plain_affine_t base = bases_in[idx];
+  cubbs_sppark_bucket_t *out = tables_xyzz_out + (idx * 8u);
+  cubbs_sppark_bucket_t acc;
+  acc = base;
+  out[0] = acc;
+  if (!acc.is_inf()) {
+    cubbs_bbs_xyzz_dbl_u(acc);
+  }
+  out[1] = acc;
+  #pragma unroll 1
+  for (uint32_t d = 2u; d < 8u; ++d) {
+    acc.uadd(base, false);
+    out[d] = acc;
+  }
+}
+
+static cudaError_t cubbs_bbs_launch_build_radix16_affine_tables(
+    const cubbs_sppark_plain_affine_t *d_bases,
+    size_t point_count,
+    cubbs_sppark_plain_affine_t *d_tables_aff_out,
+    cudaStream_t stream) {
+  if (point_count == 0u) return cudaSuccess;
+  const size_t total_entries = point_count * 8u;
+  cubbs_sppark_bucket_t *d_tmp_xyzz = nullptr;
+  cudaError_t err = cudaMallocAsync(
+      &d_tmp_xyzz, total_entries * sizeof(cubbs_sppark_bucket_t), stream);
+  if (err != cudaSuccess) return err;
+  {
+    constexpr uint32_t t = 128u;
+    const uint32_t b = static_cast<uint32_t>((point_count + t - 1u) / t);
+    cubbs_bbs_build_radix16_tables_xyzz_kernel<<<b, t, 0, stream>>>(
+        d_bases, d_tmp_xyzz, point_count);
+    err = cudaGetLastError();
+  }
+  if (err == cudaSuccess) {
+    constexpr uint32_t t = 64u;
+    const uint32_t b = static_cast<uint32_t>((total_entries + t - 1u) / t);
+    cubbs_bbs_xyzz_to_plain_affine_batch64_kernel<<<b, t, 0, stream>>>(
+        d_tmp_xyzz, d_tables_aff_out, total_entries);
+    err = cudaGetLastError();
+  }
+  (void)cudaFreeAsync(d_tmp_xyzz, stream);
+  return err;
+}
+
+// 5-way Straus simultaneous multi-base GLV kernel for ProofGen:
+//   blockIdx.y == 0: D      = r2 * B                        (1-base)
+//   blockIdx.y == 1: Abar   = (r1*r2) * A                   (1-base)
+//   blockIdx.y == 2: Bbar   = (r1*r2)*B - (r1*r2*e)*A       (2-base Straus)
+//   blockIdx.y == 3: T1     = (r1*r2*e_tilde)*A + (r2*r1_tilde)*B (2-base Straus)
+//   blockIdx.y == 4: T2_var = (r2*r3_tilde) * B             (1-base)
+// 64 threads/block, 100% active lanes, 0 warp divergence, 0 __syncthreads(),
+// digits kept in SMEM (6 KB/block) to free 24+ registers, 29% fewer doublings!
+__global__ static void cubbs_bbs_proof_gen_straus5_affine_u_kernel(
+    const cubbs_sppark_plain_affine_t *b_tables_aff,
+    const cubbs_sppark_plain_affine_t *a_tables_aff,
+    const uint8_t *glv_splits_le,
+    cubbs_sppark_bucket_t *pts5_xyzz,
+    size_t item_count) {
+  __shared__ uint64_t s_digs[64u][4u][3u];
+
+  const uint32_t tid = threadIdx.x;
+  const size_t proof = static_cast<size_t>(blockIdx.x) * 64u + tid;
+  if (proof >= item_count) return;
+  const uint32_t role = blockIdx.y;
+
+  uint32_t slot0 = 0u, slot1 = 0u;
+  uint32_t n_passes = 2u;
+  bool base0_is_b = true;
+  bool base1_is_b = false;
+  bool base1_neg = false;
+  uint32_t out_slot = 0u;
+
+  if (role == 0u) {
+    slot0 = 0u; n_passes = 2u; base0_is_b = true;  out_slot = 2u; // D
+  } else if (role == 1u) {
+    slot0 = 1u; n_passes = 2u; base0_is_b = false; out_slot = 0u; // Abar
+  } else if (role == 2u) {
+    slot0 = 2u; slot1 = 3u; n_passes = 4u; base0_is_b = true; base1_is_b = false; base1_neg = true; out_slot = 1u; // Bbar
+  } else if (role == 3u) {
+    slot0 = 4u; slot1 = 5u; n_passes = 4u; base0_is_b = false; base1_is_b = true; base1_neg = false; out_slot = 3u; // T1
+  } else {
+    slot0 = 6u; n_passes = 2u; base0_is_b = true;  out_slot = 4u; // T2_var
+  }
+
+  {
+    const uint8_t *c0 = glv_splits_le + ((proof * 7u + slot0) * 32u);
+    uint64_t r[3], q[3];
+    cubbs_bbs_pack_signed_radix16(c0, r);
+    cubbs_bbs_pack_signed_radix16(c0 + 16u, q);
+    #pragma unroll
+    for (int k = 0; k < 3; ++k) { s_digs[tid][0][k] = r[k]; s_digs[tid][1][k] = q[k]; }
+  }
+  if (n_passes == 4u) {
+    const uint8_t *c1 = glv_splits_le + ((proof * 7u + slot1) * 32u);
+    uint64_t r[3], q[3];
+    cubbs_bbs_pack_signed_radix16(c1, r);
+    cubbs_bbs_pack_signed_radix16(c1 + 16u, q);
+    #pragma unroll
+    for (int k = 0; k < 3; ++k) { s_digs[tid][2][k] = r[k]; s_digs[tid][3][k] = q[k]; }
+  }
+
+  const cubbs_sppark_plain_affine_t *tbl0 =
+      (base0_is_b ? b_tables_aff : a_tables_aff) + (proof * 8u);
+  const cubbs_sppark_plain_affine_t *tbl1 =
+      (base1_is_b ? b_tables_aff : a_tables_aff) + (proof * 8u);
+
+  cubbs_sppark_bucket_t acc;
+  acc.inf();
+  #pragma unroll 1
+  for (int window = 32; window >= 0; --window) {
+    if (!acc.is_inf()) {
+      #pragma unroll 1
+      for (uint32_t doubling = 0u; doubling < 4u; ++doubling) {
+        cubbs_bbs_xyzz_dbl_u(acc);
+      }
+    }
+    #pragma unroll 1
+    for (uint32_t pass = 0u; pass < n_passes; ++pass) {
+      const int32_t d = cubbs_bbs_signed_radix16_digit(
+          s_digs[tid][pass], static_cast<uint32_t>(window));
+      if (d != 0) {
+        const uint32_t mag = static_cast<uint32_t>(d < 0 ? -d : d);
+        const cubbs_sppark_plain_affine_t *tbl = (pass < 2u) ? tbl0 : tbl1;
+        cubbs_sppark_plain_affine_t p = tbl[mag - 1u];
+        bool neg = (d < 0) ^ ((pass >= 2u) && base1_neg);
+        if ((pass & 1u) != 0u) {
+          if (!p.is_inf()) {
+            fp_t beta_sq;
+            const uint64_t beta_sq_limbs[6] = {
+                0x30f1361b798a64e8ull, 0xf3b8ddab7ece5a2aull, 0x16a8ca3ac61577f7ull,
+                0xc26a2ff874fd029bull, 0x3636b76660701c6eull, 0x051ba4ab241b6160ull};
+            memcpy(&beta_sq, beta_sq_limbs, sizeof(beta_sq));
+            fp_t *px = reinterpret_cast<fp_t *>(&p);
+            px[0] = px[0] * beta_sq;
+          }
+          neg = !neg;
+        }
+        acc.uadd(p, neg);
+      }
+    }
+  }
+  pts5_xyzz[proof * 5u + out_slot] = acc;
+}
+
+// 2-way Straus simultaneous multi-base GLV kernel for ProofVerify:
+//   blockIdx.y == 0: T1  = e_cap*Abar + c*Bbar + r1_cap*D (3-base Straus -> 128 doublings!)
+//   blockIdx.y == 1: T2 += r3_cap*D                       (1-base GLV)
+// 64 threads/block, 100% active lanes, 0 warp divergence, 0 __syncthreads(),
+// 50% fewer doublings than 4-thread independent mul!
+__global__ static void cubbs_bbs_proof_verify_straus2_affine_u_kernel(
+    const cubbs_sppark_plain_affine_t *pts_tables_aff,
+    const uint8_t *proof_glv_splits_le,
+    size_t item_count,
+    cubbs_sppark_bucket_t *t1_xyzz,
+    cubbs_sppark_bucket_t *t2_xyzz) {
+  __shared__ uint64_t s_digs[64u][6u][3u];
+
+  const uint32_t tid = threadIdx.x;
+  const size_t proof = static_cast<size_t>(blockIdx.x) * 64u + tid;
+  if (proof >= item_count) return;
+  const bool is_t1 = (blockIdx.y == 0u);
+  const uint32_t n_passes = is_t1 ? 6u : 2u;
+
+  if (is_t1) {
+    #pragma unroll 1
+    for (uint32_t s = 0u; s < 3u; ++s) {
+      const uint8_t *comp = proof_glv_splits_le + ((proof * 4u + s) * 32u);
+      uint64_t r[3], q[3];
+      cubbs_bbs_pack_signed_radix16(comp, r);
+      cubbs_bbs_pack_signed_radix16(comp + 16u, q);
+      #pragma unroll
+      for (int k = 0; k < 3; ++k) {
+        s_digs[tid][s * 2u + 0u][k] = r[k];
+        s_digs[tid][s * 2u + 1u][k] = q[k];
+      }
+    }
+  } else {
+    const uint8_t *comp = proof_glv_splits_le + ((proof * 4u + 3u) * 32u);
+    uint64_t r[3], q[3];
+    cubbs_bbs_pack_signed_radix16(comp, r);
+    cubbs_bbs_pack_signed_radix16(comp + 16u, q);
+    #pragma unroll
+    for (int k = 0; k < 3; ++k) {
+      s_digs[tid][0u][k] = r[k];
+      s_digs[tid][1u][k] = q[k];
+    }
+  }
+
+  const cubbs_sppark_plain_affine_t *proof_tbl = pts_tables_aff + (proof * 3u * 8u);
+  cubbs_sppark_bucket_t acc;
+  acc.inf();
+  #pragma unroll 1
+  for (int window = 32; window >= 0; --window) {
+    if (!acc.is_inf()) {
+      #pragma unroll 1
+      for (uint32_t doubling = 0u; doubling < 4u; ++doubling) {
+        cubbs_bbs_xyzz_dbl_u(acc);
+      }
+    }
+    #pragma unroll 1
+    for (uint32_t pass = 0u; pass < n_passes; ++pass) {
+      const int32_t d = cubbs_bbs_signed_radix16_digit(
+          s_digs[tid][pass], static_cast<uint32_t>(window));
+      if (d != 0) {
+        const uint32_t mag = static_cast<uint32_t>(d < 0 ? -d : d);
+        const uint32_t base_idx = is_t1 ? (pass >> 1u) : 2u;
+        cubbs_sppark_plain_affine_t p = proof_tbl[base_idx * 8u + (mag - 1u)];
+        bool neg = (d < 0);
+        if ((pass & 1u) != 0u) {
+          if (!p.is_inf()) {
+            fp_t beta_sq;
+            const uint64_t beta_sq_limbs[6] = {
+                0x30f1361b798a64e8ull, 0xf3b8ddab7ece5a2aull, 0x16a8ca3ac61577f7ull,
+                0xc26a2ff874fd029bull, 0x3636b76660701c6eull, 0x051ba4ab241b6160ull};
+            memcpy(&beta_sq, beta_sq_limbs, sizeof(beta_sq));
+            fp_t *px = reinterpret_cast<fp_t *>(&p);
+            px[0] = px[0] * beta_sq;
+          }
+          neg = !neg;
+        }
+        acc.uadd(p, neg);
+      }
+    }
+  }
+
+  if (is_t1) {
+    t1_xyzz[proof] = acc;
+  } else {
+    cubbs_sppark_bucket_t t2 = t2_xyzz[proof];
+    t2.uadd(acc);
+    t2_xyzz[proof] = t2;
+  }
+}
+
+__global__ static void cubbs_bbs_proof_gen_add_t2_common_kernel(
+    cubbs_sppark_bucket_t *pts5_xyzz,
+    const cubbs_sppark_bucket_t *t2_common_xyzz,
+    size_t item_count) {
+  const size_t row = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (row < item_count) {
+    pts5_xyzz[row * 5u + 4u].uadd(t2_common_xyzz[row]);
+  }
+}
+
+// Compute challenge c, r3 = r2^-1, finalize all response scalars, and assemble
+// the complete RFC wire proof directly into proofs_out[row * proof_stride].
+__global__ static void cubbs_bbs_proof_gen_challenge_finalize_kernel(
+    const uint32_t *disclosed_indexes, size_t disclosed_count,
+    const uint32_t *undisclosed_indexes, size_t undisclosed_count,
+    const uint8_t *b_scalars_le, size_t term_count,
+    const uint8_t *row_state_le,
+    const uint8_t *m_tilde_le,
+    const uint8_t *pts5_compressed, // item_count * 240: [Abar||Bbar||D||T1||T2]
+    const uint8_t *domains_be, size_t domain_stride,
+    const uint8_t *packed_ph, const uint64_t *ph_offsets, const uint64_t *ph_lengths,
+    const uint8_t *challenge_dst, size_t challenge_dst_len,
+    size_t item_count, size_t proof_stride,
+    uint8_t *proofs_out) {
+  const size_t row = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const bool valid = row < item_count;
+
+  // All 32 lanes of every warp MUST execute fr_t::reciprocal() uniformly!
+  cubbs_sppark_scalar_t fr_r2 = cubbs_sppark_scalar_t::one();
+  if (valid) {
+    memcpy(&fr_r2, row_state_le + ((row * 6u + 1u) * 32u), 32u);
+    fr_r2.to();
+  }
+  const cubbs_sppark_scalar_t fr_r3 = fr_r2.reciprocal();
+  if (!valid) return;
+
+  const uint8_t *pts5 = pts5_compressed + (row * 240u);
+  const uint8_t *dom_be = domains_be + (domain_stride == 0u ? 0u : row * domain_stride);
+  const uint8_t *ph = (ph_lengths[row] > 0u) ? (packed_ph + ph_offsets[row]) : nullptr;
+
+  uint8_t c_le[32];
+  cubbs_bbs_compute_proof_challenge_le_device(
+      disclosed_indexes, disclosed_count,
+      b_scalars_le + (row * term_count * 32u), 32u, true,
+      pts5 + 0u, pts5 + 48u, pts5 + 96u, pts5 + 144u, pts5 + 192u,
+      dom_be, ph, static_cast<size_t>(ph_lengths[row]),
+      challenge_dst, challenge_dst_len, c_le);
+
+  cubbs_sppark_scalar_t fr_c;
+  memcpy(&fr_c, c_le, 32u);
+  fr_c.to();
+
+  const uint8_t *st = row_state_le + (row * 6u * 32u);
+  cubbs_sppark_scalar_t fr_r1, fr_et, fr_r1t, fr_r3t, fr_e;
+  memcpy(&fr_r1, st + 0u * 32u, 32u);  fr_r1.to();
+  memcpy(&fr_et, st + 2u * 32u, 32u);  fr_et.to();
+  memcpy(&fr_r1t, st + 3u * 32u, 32u); fr_r1t.to();
+  memcpy(&fr_r3t, st + 4u * 32u, 32u); fr_r3t.to();
+  memcpy(&fr_e, st + 5u * 32u, 32u);   fr_e.to();
+
+  uint8_t *out = proofs_out + (row * proof_stride);
+  // [0..144]: Abar || Bbar || D
+  memcpy(out, pts5, 144u);
+  // [144..176]: e_cap = e_tilde + e * c
+  cubbs_bbs_store_fr_be(fr_et + (fr_e * fr_c), out + 144u);
+  // [176..208]: r1_cap = r1_tilde - r1 * c
+  cubbs_bbs_store_fr_be(fr_r1t - (fr_r1 * fr_c), out + 176u);
+  // [208..240]: r3_cap = r3_tilde - r3 * c
+  cubbs_bbs_store_fr_be(fr_r3t - (fr_r3 * fr_c), out + 208u);
+  // [240 .. 240 + U*32]: m_cap[u] = m_tilde[u] + m[undisclosed[u]] * c
+  const uint8_t *row_b_scalars = b_scalars_le + (row * term_count * 32u);
+  const uint8_t *row_mt = m_tilde_le + (row * undisclosed_count * 32u);
+  for (size_t u = 0u; u < undisclosed_count; ++u) {
+    const uint32_t msg_idx = undisclosed_indexes[u];
+    cubbs_sppark_scalar_t fr_mt, fr_m;
+    memcpy(&fr_mt, row_mt + (u * 32u), 32u);
+    memcpy(&fr_m, row_b_scalars + ((2u + msg_idx) * 32u), 32u);
+    fr_mt.to();
+    fr_m.to();
+    cubbs_bbs_store_fr_be(fr_mt + (fr_m * fr_c), out + 240u + (u * 32u));
+  }
+  // [240 + U*32 .. +32]: c (BE)
+  uint8_t *c_out = out + 240u + (undisclosed_count * 32u);
+  #pragma unroll
+  for (int i = 0; i < 32; ++i) c_out[i] = c_le[31 - i];
+}
+
+// Thread-local GPU cache for ProofGen A points and ProofVerify (Abar, Bbar, D) points
+// along with their prebuilt 8-entry affine radix-16 tables [1*P..8*P].
+struct CuBbsFusedProofPointsCache {
+  cubbs_sppark_plain_affine_t *d_points{nullptr};
+  cubbs_sppark_plain_affine_t *d_radix16_aff{nullptr};
+  size_t capacity{0u};
+  std::string key;
+
+  cudaError_t ensure(size_t count) {
+    if (capacity >= count) return cudaSuccess;
+    if (d_points != nullptr) (void)cudaFree(d_points);
+    if (d_radix16_aff != nullptr) (void)cudaFree(d_radix16_aff);
+    d_points = nullptr;
+    d_radix16_aff = nullptr;
+    capacity = 0u;
+    key.clear();
+    const size_t req = std::max<size_t>(1u, count);
+    cudaError_t err = cudaMalloc(&d_points, req * sizeof(cubbs_sppark_plain_affine_t));
+    if (err == cudaSuccess) {
+      err = cudaMalloc(&d_radix16_aff, req * 8u * sizeof(cubbs_sppark_plain_affine_t));
+    }
+    if (err == cudaSuccess) {
+      capacity = req;
+    } else {
+      if (d_points != nullptr) (void)cudaFree(d_points);
+      if (d_radix16_aff != nullptr) (void)cudaFree(d_radix16_aff);
+      d_points = nullptr;
+      d_radix16_aff = nullptr;
+    }
+    return err;
+  }
+
+  ~CuBbsFusedProofPointsCache() {
+    if (d_points != nullptr) (void)cudaFree(d_points);
+    if (d_radix16_aff != nullptr) (void)cudaFree(d_radix16_aff);
+  }
+};
+
+static CuBbsFusedProofPointsCache &cubbs_proof_gen_a_cache() {
+  static thread_local CuBbsFusedProofPointsCache cache;
+  return cache;
+}
+
+static CuBbsFusedProofPointsCache &cubbs_proof_verify_pts_cache() {
+  static thread_local CuBbsFusedProofPointsCache cache;
+  return cache;
+}
+
+int32_t cubbs_bbs_cuda_proof_gen_fused_common_batch(
+    const CuBbsBbsGpuProofGenFusedCommonBatchItem *item,
+    CuBbsBbsGpuResult *results) {
+  if (item == nullptr) return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
+  const size_t item_count = item->item_count;
+  if (item_count == 0u) return CUBBS_BBS_GPU_SUCCESS;
+  cubbs_bbs_ensure_cuda_device_schedule();
+
+  const size_t term_count = item->common_term_count;
+  const size_t R = item->disclosed_count;
+  const size_t U = item->undisclosed_count;
+  if (term_count < 2u || R + U != term_count - 2u ||
+      item->common_points == nullptr ||
+      (U > 0u && item->undisclosed_points == nullptr) ||
+      (R > 0u && item->disclosed_indexes == nullptr) ||
+      (U > 0u && item->undisclosed_indexes == nullptr) ||
+      item->signatures == nullptr || item->domains_be == nullptr ||
+      (item->domain_stride != 0u && item->domain_stride != 32u) ||
+      item->ph_offsets == nullptr || item->ph_lengths == nullptr ||
+      item->message_dst.data == nullptr || item->challenge_dst.data == nullptr ||
+      item->csprng_seed == nullptr || item->proofs_out == nullptr ||
+      item->proof_stride != 272u + (U * 32u) || results == nullptr) {
+    return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
+  }
+  const size_t message_count = term_count - 2u;
+  const size_t total_messages = item_count * message_count;
+  if (total_messages > 0u &&
+      (item->message_offsets == nullptr || item->message_lengths == nullptr)) {
+    return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
+  }
+
+  // Acquire cached common-points table for B (M+2) and optionally T2 undisclosed (U).
+  std::shared_ptr<CuBbsFusedCommonPointsCache> cached_b;
+  const bool large_b = bbs_large_shape_kernel_supported(term_count);
+  const bool universal_b = !large_b &&
+                           !bbs_specialized_common_points_supported(term_count) &&
+                           bbs_universal_tiled_common_supported(term_count);
+  const bool tiled_b = large_b || universal_b;
+  const bool affine_b = !tiled_b && term_count >= 18u && item_count >= 16u &&
+                        bbs_homogeneous_affine_comb_enabled();
+  int32_t status = get_fused_common_points_cache(
+      item->common_points, term_count, &cached_b, tiled_b, affine_b,
+      affine_b ? 9u : 0u, universal_b);
+  if (status != CUBBS_BBS_GPU_SUCCESS || cached_b == nullptr) return status;
+
+  std::shared_ptr<CuBbsFusedCommonPointsCache> cached_u;
+  bool tiled_u = false;
+  if (U > 0u) {
+    const bool large_u = bbs_large_shape_kernel_supported(U);
+    const bool universal_u = !large_u &&
+                             !bbs_specialized_common_points_supported(U) &&
+                             bbs_universal_tiled_common_supported(U);
+    tiled_u = large_u || universal_u;
+    const bool affine_u = !tiled_u && U >= 18u && item_count >= 16u &&
+                          bbs_homogeneous_affine_comb_enabled();
+    status = get_fused_common_points_cache(
+        item->undisclosed_points, U, &cached_u, tiled_u, affine_u,
+        affine_u ? 9u : 0u, universal_u);
+    if (status != CUBBS_BBS_GPU_SUCCESS || cached_u == nullptr) return status;
+  }
+
+  const cudaStream_t stream = cubbs_fused_pinned_host_workspace().execution_stream(
+      cached_b->stream != nullptr ? cached_b->stream : static_cast<cudaStream_t>(0));
+  configure_cubbs_async_mempool();
+
+  auto &pipe_ws = cubbs_fused_pipeline_pinned_workspace();
+  const size_t dom_bytes = item->domain_stride == 0u ? 32u : item_count * 32u;
+  const size_t sig_e_bytes = item_count * 32u;
+  const size_t disc_idx_bytes = R * sizeof(uint32_t);
+  const size_t undisc_idx_bytes = U * sizeof(uint32_t);
+  const size_t ph_meta_bytes = item_count * 2u * sizeof(uint64_t);
+  const size_t ph_bytes = item->packed_ph_len;
+  const size_t aux_in_bytes =
+      dom_bytes + sig_e_bytes + 32u + disc_idx_bytes + undisc_idx_bytes +
+      ph_meta_bytes + ph_bytes + item->message_dst.len + item->challenge_dst.len + 64u;
+  const size_t proofs_out_bytes = item_count * item->proof_stride;
+
+  cudaError_t err = pipe_ws.ensure_messages(item->packed_messages_len);
+  if (err == cudaSuccess && total_messages > 0u)
+    err = pipe_ws.ensure_msg_meta(total_messages);
+  if (err == cudaSuccess)
+    err = pipe_ws.ensure_aux(aux_in_bytes, proofs_out_bytes);
+  if (err != cudaSuccess) return CUBBS_BBS_GPU_ERR_INTERNAL;
+
+  if (item->packed_messages_len > 0u && pipe_ws.messages != item->packed_messages)
+    std::memcpy(pipe_ws.messages, item->packed_messages, item->packed_messages_len);
+  if (total_messages > 0u) {
+    if (pipe_ws.offsets != item->message_offsets)
+      std::memcpy(pipe_ws.offsets, item->message_offsets, total_messages * sizeof(uint64_t));
+    if (pipe_ws.lengths != item->message_lengths)
+      std::memcpy(pipe_ws.lengths, item->message_lengths, total_messages * sizeof(uint64_t));
+  }
+
+  // Pack aux_in with 8-byte aligned offsets.
+  size_t off = 0u;
+  auto push_aligned = [&](size_t bytes, size_t align) -> size_t {
+    off = (off + align - 1u) & ~(align - 1u);
+    const size_t start = off;
+    off += bytes;
+    return start;
+  };
+  const size_t off_dom = push_aligned(dom_bytes, 8u);
+  const size_t off_sig_e = push_aligned(sig_e_bytes, 8u);
+  const size_t off_seed = push_aligned(32u, 8u);
+  const size_t off_disc = push_aligned(disc_idx_bytes, 4u);
+  const size_t off_undisc = push_aligned(undisc_idx_bytes, 4u);
+  const size_t off_ph_off = push_aligned(item_count * sizeof(uint64_t), 8u);
+  const size_t off_ph_len = push_aligned(item_count * sizeof(uint64_t), 8u);
+  const size_t off_ph_data = push_aligned(ph_bytes, 1u);
+  const size_t off_msg_dst = push_aligned(item->message_dst.len, 1u);
+  const size_t off_chal_dst = push_aligned(item->challenge_dst.len, 1u);
+
+  std::memcpy(pipe_ws.aux_in + off_dom, item->domains_be, dom_bytes);
+  for (size_t i = 0u; i < item_count; ++i) {
+    std::memcpy(pipe_ws.aux_in + off_sig_e + (i * 32u),
+                item->signatures + (i * 80u) + 48u, 32u);
+  }
+  std::memcpy(pipe_ws.aux_in + off_seed, item->csprng_seed, 32u);
+  if (R > 0u) std::memcpy(pipe_ws.aux_in + off_disc, item->disclosed_indexes, disc_idx_bytes);
+  if (U > 0u) std::memcpy(pipe_ws.aux_in + off_undisc, item->undisclosed_indexes, undisc_idx_bytes);
+  std::memcpy(pipe_ws.aux_in + off_ph_off, item->ph_offsets, item_count * sizeof(uint64_t));
+  std::memcpy(pipe_ws.aux_in + off_ph_len, item->ph_lengths, item_count * sizeof(uint64_t));
+  if (ph_bytes > 0u) std::memcpy(pipe_ws.aux_in + off_ph_data, item->packed_ph, ph_bytes);
+  if (item->message_dst.len > 0u)
+    std::memcpy(pipe_ws.aux_in + off_msg_dst, item->message_dst.data, item->message_dst.len);
+  if (item->challenge_dst.len > 0u)
+    std::memcpy(pipe_ws.aux_in + off_chal_dst, item->challenge_dst.data, item->challenge_dst.len);
+
+  // Allocate GPU buffers & launch H2S + B-MSM + scalar prep BEFORE CPU A-point decode
+  // so CPU point lookup/decode overlaps cleanly with GPU H2S + Lim-Lee B-MSM!
+  uint8_t *d_messages = nullptr;
+  uint64_t *d_offsets = nullptr;
+  uint64_t *d_lengths = nullptr;
+  uint8_t *d_aux_in = nullptr;
+  uint8_t *d_b_scalars_le = nullptr;
+  cubbs_sppark_bucket_t *d_b_xyzz = nullptr;
+  cubbs_sppark_plain_affine_t *d_b_affines = nullptr;
+  cubbs_sppark_plain_affine_t *d_b_tbl_aff = nullptr;
+  uint8_t *d_row_state_le = nullptr;
+  uint8_t *d_glv_splits_le = nullptr;
+  uint8_t *d_m_tilde_le = nullptr;
+  cubbs_sppark_bucket_t *d_pts5_xyzz = nullptr;
+  cubbs_sppark_bucket_t *d_t2_common_xyzz = nullptr;
+  uint8_t *d_pts5_compressed = nullptr;
+  uint8_t *d_proofs_out = nullptr;
+  uint32_t *d_invalid = nullptr;
+  CuBbsCommonMsmTransient trans_b;
+  CuBbsCommonMsmTransient trans_u;
+
+  if (err == cudaSuccess && item->packed_messages_len > 0u)
+    err = cudaMallocAsync(&d_messages, item->packed_messages_len, stream);
+  if (err == cudaSuccess && total_messages > 0u) {
+    err = cudaMallocAsync(&d_offsets, total_messages * sizeof(uint64_t), stream);
+    if (err == cudaSuccess)
+      err = cudaMallocAsync(&d_lengths, total_messages * sizeof(uint64_t), stream);
+  }
+  if (err == cudaSuccess) err = cudaMallocAsync(&d_aux_in, off, stream);
+  if (err == cudaSuccess) err = cudaMallocAsync(&d_b_scalars_le, item_count * term_count * 32u, stream);
+  if (err == cudaSuccess) err = cudaMallocAsync(&d_b_xyzz, item_count * sizeof(cubbs_sppark_bucket_t), stream);
+  if (err == cudaSuccess) err = cudaMallocAsync(&d_b_affines, item_count * sizeof(cubbs_sppark_plain_affine_t), stream);
+  if (err == cudaSuccess) err = cudaMallocAsync(&d_b_tbl_aff, item_count * 8u * sizeof(cubbs_sppark_plain_affine_t), stream);
+  if (err == cudaSuccess) err = cudaMallocAsync(&d_row_state_le, item_count * 6u * 32u, stream);
+  if (err == cudaSuccess) err = cudaMallocAsync(&d_glv_splits_le, item_count * 7u * 32u, stream);
+  if (err == cudaSuccess && U > 0u) {
+    err = cudaMallocAsync(&d_m_tilde_le, item_count * U * 32u, stream);
+    if (err == cudaSuccess)
+      err = cudaMallocAsync(&d_t2_common_xyzz, item_count * sizeof(cubbs_sppark_bucket_t), stream);
+  }
+  if (err == cudaSuccess) err = cudaMallocAsync(&d_pts5_xyzz, item_count * 5u * sizeof(cubbs_sppark_bucket_t), stream);
+  if (err == cudaSuccess) err = cudaMallocAsync(&d_pts5_compressed, item_count * 240u, stream);
+  if (err == cudaSuccess) err = cudaMallocAsync(&d_proofs_out, proofs_out_bytes, stream);
+  if (err == cudaSuccess) err = cudaMallocAsync(&d_invalid, sizeof(uint32_t), stream);
+  if (err == cudaSuccess) err = trans_b.alloc(*cached_b, term_count, item_count, tiled_b, stream);
+  if (err == cudaSuccess && U > 0u) err = trans_u.alloc(*cached_u, U, item_count, tiled_u, stream);
+
+  if (err == cudaSuccess && item->packed_messages_len > 0u)
+    err = cudaMemcpyAsync(d_messages, pipe_ws.messages, item->packed_messages_len,
+                          cudaMemcpyHostToDevice, stream);
+  if (err == cudaSuccess && total_messages > 0u) {
+    err = cudaMemcpyAsync(d_offsets, pipe_ws.offsets, total_messages * sizeof(uint64_t),
+                          cudaMemcpyHostToDevice, stream);
+    if (err == cudaSuccess)
+      err = cudaMemcpyAsync(d_lengths, pipe_ws.lengths, total_messages * sizeof(uint64_t),
+                            cudaMemcpyHostToDevice, stream);
+  }
+  if (err == cudaSuccess)
+    err = cudaMemcpyAsync(d_aux_in, pipe_ws.aux_in, off, cudaMemcpyHostToDevice, stream);
+  if (err == cudaSuccess)
+    err = cudaMemsetAsync(d_invalid, 0, sizeof(uint32_t), stream);
+
+  const uint8_t *d_dom = d_aux_in + off_dom;
+  const uint8_t *d_sig_e = d_aux_in + off_sig_e;
+  const uint8_t *d_seed = d_aux_in + off_seed;
+  const uint32_t *d_disc = reinterpret_cast<const uint32_t *>(d_aux_in + off_disc);
+  const uint32_t *d_undisc = reinterpret_cast<const uint32_t *>(d_aux_in + off_undisc);
+  const uint64_t *d_ph_off = reinterpret_cast<const uint64_t *>(d_aux_in + off_ph_off);
+  const uint64_t *d_ph_len = reinterpret_cast<const uint64_t *>(d_aux_in + off_ph_len);
+  const uint8_t *d_ph_data = d_aux_in + off_ph_data;
+  const uint8_t *d_msg_dst = d_aux_in + off_msg_dst;
+  const uint8_t *d_chal_dst = d_aux_in + off_chal_dst;
+
+  // Stage 1: Fill [1, domain] + H2S all raw messages directly into B scalar layout.
+  if (err == cudaSuccess) {
+    constexpr uint32_t t = 128u;
+    const uint32_t b = static_cast<uint32_t>((item_count + t - 1u) / t);
+    cubbs_bbs_proof_gen_init_b_header_scalars_kernel<<<b, t, 0, stream>>>(
+        d_dom, item->domain_stride, item_count, term_count, d_b_scalars_le, d_invalid);
+    err = cudaGetLastError();
+  }
+  if (err == cudaSuccess && total_messages > 0u) {
+    constexpr uint32_t t = 128u;
+    const uint32_t b = static_cast<uint32_t>((total_messages + t - 1u) / t);
+    cubbs_bbs_sign_h2s_messages_to_le_kernel<<<b, t, 0, stream>>>(
+        d_messages, d_offsets, d_lengths, item_count, message_count, term_count,
+        d_msg_dst, item->message_dst.len, d_b_scalars_le);
+    err = cudaGetLastError();
+  }
+  // Stage 2: Lim-Lee B-MSM + B affine normalization + ChaCha20 scalar prep.
+  if (err == cudaSuccess) {
+    err = cubbs_bbs_launch_cached_common_msm_range(
+        *cached_b, trans_b, d_b_scalars_le, term_count, item_count, d_b_xyzz, stream);
+  }
+  if (err == cudaSuccess) {
+    const uint32_t norm_blocks = static_cast<uint32_t>((item_count + 63u) / 64u);
+    cubbs_bbs_xyzz_to_plain_affine_batch64_kernel<<<norm_blocks, 64u, 0, stream>>>(
+        d_b_xyzz, d_b_affines, item_count);
+    err = cudaGetLastError();
+  }
+  if (err == cudaSuccess) {
+    err = cubbs_bbs_launch_build_radix16_affine_tables(
+        d_b_affines, item_count, d_b_tbl_aff, stream);
+  }
+  if (err == cudaSuccess) {
+    constexpr uint32_t t = 128u;
+    const uint32_t b = static_cast<uint32_t>((item_count + t - 1u) / t);
+    cubbs_bbs_proof_gen_prep_scalars_kernel<<<b, t, 0, stream>>>(
+        d_sig_e, d_seed, item_count, d_row_state_le, d_glv_splits_le, d_invalid);
+    err = cudaGetLastError();
+  }
+  if (err == cudaSuccess && U > 0u) {
+    constexpr uint32_t t = 128u;
+    const size_t total_u = item_count * U;
+    const uint32_t b = static_cast<uint32_t>((total_u + t - 1u) / t);
+    cubbs_bbs_proof_gen_m_tilde_kernel<<<b, t, 0, stream>>>(
+        d_seed, item_count, U, d_m_tilde_le);
+    err = cudaGetLastError();
+  }
+
+  // Overlapped with GPU H2S + B-MSM: decode/lookup signature A_0..A_{B-1} on CPU.
+  auto &a_cache = cubbs_proof_gen_a_cache();
+  int32_t a_status = CUBBS_BBS_GPU_SUCCESS;
+  bool upload_a = false;
+  std::string next_a_key;
+  std::vector<cubbs_sppark_plain_affine_t> host_a;
+  if (err == cudaSuccess) {
+    bool matches = (a_cache.key.size() == item_count * 48u && a_cache.capacity >= item_count);
+    if (matches) {
+      const char *ck = a_cache.key.data();
+      for (size_t i = 0u; i < item_count; ++i) {
+        if (std::memcmp(ck + (i * 48u), item->signatures + (i * 80u), 48u) != 0) {
+          matches = false;
+          break;
+        }
+      }
+    }
+    upload_a = !matches;
+    if (upload_a) {
+      next_a_key.resize(item_count * 48u);
+      std::vector<CuBbsBbsGpuByteSlice> slices(item_count);
+      for (size_t i = 0u; i < item_count; ++i) {
+        const uint8_t *p = item->signatures + (i * 80u);
+        std::memcpy(&next_a_key[i * 48u], p, 48u);
+        slices[i] = CuBbsBbsGpuByteSlice{p, 48u};
+      }
+      host_a.resize(item_count);
+      a_status = load_or_decode_cached_g1_affines(slices.data(), item_count, host_a.data());
+    }
+  }
+  if (err == cudaSuccess && a_status == CUBBS_BBS_GPU_SUCCESS && upload_a) {
+    err = a_cache.ensure(item_count);
+    if (err == cudaSuccess) {
+      err = cudaMemcpyAsync(a_cache.d_points, host_a.data(),
+                            item_count * sizeof(host_a[0]),
+                            cudaMemcpyHostToDevice, stream);
+    }
+    if (err == cudaSuccess) {
+      err = cubbs_bbs_launch_build_radix16_affine_tables(
+          a_cache.d_points, item_count, a_cache.d_radix16_aff, stream);
+    }
+  }
+
+  // Stage 3: 5-way Straus multi-base GLV kernel (D, Abar, Bbar, T1, T2_var) + T2 undisclosed MSM.
+  if (err == cudaSuccess && a_status == CUBBS_BBS_GPU_SUCCESS) {
+    const dim3 f_grid(static_cast<uint32_t>((item_count + 63u) / 64u), 5u);
+    cubbs_bbs_proof_gen_straus5_affine_u_kernel<<<f_grid, 64u, 0, stream>>>(
+        d_b_tbl_aff, a_cache.d_radix16_aff, d_glv_splits_le, d_pts5_xyzz, item_count);
+    err = cudaGetLastError();
+  }
+  if (err == cudaSuccess && a_status == CUBBS_BBS_GPU_SUCCESS && U > 0u) {
+    err = cubbs_bbs_launch_cached_common_msm_range(
+        *cached_u, trans_u, d_m_tilde_le, U, item_count, d_t2_common_xyzz, stream);
+    if (err == cudaSuccess) {
+      constexpr uint32_t t = 128u;
+      const uint32_t b = static_cast<uint32_t>((item_count + t - 1u) / t);
+      cubbs_bbs_proof_gen_add_t2_common_kernel<<<b, t, 0, stream>>>(
+          d_pts5_xyzz, d_t2_common_xyzz, item_count);
+      err = cudaGetLastError();
+    }
+  }
+
+  // Stage 4: GPU 64-thread Montgomery batch-compress [Abar, Bbar, D, T1, T2].
+  if (err == cudaSuccess && a_status == CUBBS_BBS_GPU_SUCCESS) {
+    err = cubbs_bbs_launch_xyzz_to_compressed(
+        d_pts5_xyzz, item_count * 5u, d_pts5_compressed, 48u, 0u, stream);
+  }
+
+  // Stage 5: GPU zero-spill challenge + r3 = r2^-1 + scalar finalize + wire assembly!
+  if (err == cudaSuccess && a_status == CUBBS_BBS_GPU_SUCCESS) {
+    constexpr uint32_t t = 64u;
+    const uint32_t b = static_cast<uint32_t>((item_count + t - 1u) / t);
+    cubbs_bbs_proof_gen_challenge_finalize_kernel<<<b, t, 0, stream>>>(
+        d_disc, R, d_undisc, U, d_b_scalars_le, term_count,
+        d_row_state_le, d_m_tilde_le, d_pts5_compressed,
+        d_dom, item->domain_stride, d_ph_data, d_ph_off, d_ph_len,
+        d_chal_dst, item->challenge_dst.len,
+        item_count, item->proof_stride, d_proofs_out);
+    err = cudaGetLastError();
+  }
+
+  if (err == cudaSuccess && a_status == CUBBS_BBS_GPU_SUCCESS) {
+    err = cudaMemcpyAsync(pipe_ws.aux_out, d_proofs_out, proofs_out_bytes,
+                          cudaMemcpyDeviceToHost, stream);
+  }
+  if (err == cudaSuccess && a_status == CUBBS_BBS_GPU_SUCCESS) {
+    err = cudaMemcpyAsync(pipe_ws.invalid_flag, d_invalid, sizeof(uint32_t),
+                          cudaMemcpyDeviceToHost, stream);
+  }
+  if (err == cudaSuccess) {
+    err = cudaStreamSynchronize(stream);
+  }
+
+  trans_u.free_async(stream);
+  trans_b.free_async(stream);
+  if (d_invalid != nullptr) (void)cudaFreeAsync(d_invalid, stream);
+  if (d_proofs_out != nullptr) (void)cudaFreeAsync(d_proofs_out, stream);
+  if (d_pts5_compressed != nullptr) (void)cudaFreeAsync(d_pts5_compressed, stream);
+  if (d_t2_common_xyzz != nullptr) (void)cudaFreeAsync(d_t2_common_xyzz, stream);
+  if (d_pts5_xyzz != nullptr) (void)cudaFreeAsync(d_pts5_xyzz, stream);
+  if (d_m_tilde_le != nullptr) (void)cudaFreeAsync(d_m_tilde_le, stream);
+  if (d_glv_splits_le != nullptr) (void)cudaFreeAsync(d_glv_splits_le, stream);
+  if (d_row_state_le != nullptr) (void)cudaFreeAsync(d_row_state_le, stream);
+  if (d_b_tbl_aff != nullptr) (void)cudaFreeAsync(d_b_tbl_aff, stream);
+  if (d_b_affines != nullptr) (void)cudaFreeAsync(d_b_affines, stream);
+  if (d_b_xyzz != nullptr) (void)cudaFreeAsync(d_b_xyzz, stream);
+  if (d_b_scalars_le != nullptr) (void)cudaFreeAsync(d_b_scalars_le, stream);
+  if (d_aux_in != nullptr) (void)cudaFreeAsync(d_aux_in, stream);
+  if (d_lengths != nullptr) (void)cudaFreeAsync(d_lengths, stream);
+  if (d_offsets != nullptr) (void)cudaFreeAsync(d_offsets, stream);
+  if (d_messages != nullptr) (void)cudaFreeAsync(d_messages, stream);
+
+  if (a_status != CUBBS_BBS_GPU_SUCCESS) return a_status;
+  if (err != cudaSuccess) return CUBBS_BBS_GPU_ERR_INTERNAL;
+  if (upload_a) a_cache.key = std::move(next_a_key);
+  if (*pipe_ws.invalid_flag != 0u) return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
+
+  std::memcpy(item->proofs_out, pipe_ws.aux_out, proofs_out_bytes);
+  for (size_t i = 0u; i < item_count; ++i) {
+    set_result_route(results, i, CUBBS_BBS_GPU_SUCCESS, item->proof_stride,
+                     CUBBS_BBS_MSM_ROUTE_FUSED_COMMON_POINTS);
+  }
+  return CUBBS_BBS_GPU_SUCCESS;
+}
+
+// ============================================================================
+// GPU-Resident Fused ProofVerify Kernels
+// ============================================================================
+
+// Parse raw proof scalars, build common_scalars_le (B * (M+2) * 32) and
+// proof_scalars_le (B * 4 * 32 = [e_cap, c, r1_cap, r3_cap]), plus recode
+// 128-bit random pairing coefficients c_i into signed 8-bit digits (17 windows).
+__global__ static void cubbs_bbs_proof_verify_parse_and_build_kernel(
+    const uint8_t *proofs, size_t proof_stride,
+    const uint32_t *disclosed_indexes, size_t disclosed_count,
+    const uint32_t *undisclosed_indexes, size_t undisclosed_count,
+    const uint8_t *disclosed_scalars_le,
+    const uint8_t *domains_be, size_t domain_stride,
+    const uint8_t *coefficients_le,
+    size_t item_count, size_t term_count,
+    uint8_t *common_scalars_le,
+    uint8_t *proof_scalars_le,
+    int16_t *coef_digits_out,
+    uint32_t *invalid_out) {
+  const size_t row = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (row >= item_count) return;
+
+  const uint8_t *pr = proofs + (row * proof_stride);
+  const uint8_t *dom_be = domains_be + (domain_stride == 0u ? 0u : row * domain_stride);
+  const uint8_t *coef_le = coefficients_le + (row * 32u);
+  const uint8_t *e_cap_be = pr + 144u;
+  const uint8_t *r1_cap_be = pr + 176u;
+  const uint8_t *r3_cap_be = pr + 208u;
+  const uint8_t *c_be = pr + 240u + (undisclosed_count * 32u);
+
+  uint64_t coef_hi0 = 0ull, coef_hi1 = 0ull;
+  memcpy(&coef_hi0, coef_le + 16u, 8u);
+  memcpy(&coef_hi1, coef_le + 24u, 8u);
+
+  // Spec check: Abar != Identity_G1 (bit 6 of byte 0 == 0) + canonical scalars.
+  bool ok = ((pr[0] & 0x40u) == 0u) &&
+            cubbs_bbs_scalar_be_is_canonical(dom_be) &&
+            cubbs_bbs_scalar_be_is_canonical(e_cap_be) &&
+            cubbs_bbs_scalar_be_is_canonical(r1_cap_be) &&
+            cubbs_bbs_scalar_be_is_canonical(r3_cap_be) &&
+            cubbs_bbs_scalar_be_is_canonical(c_be) &&
+            ((coef_hi0 | coef_hi1) == 0ull);
+
+  auto be_to_le = [](const uint8_t src[32], uint8_t dst[32]) {
+    #pragma unroll
+    for (int i = 0; i < 32; ++i) dst[i] = src[31 - i];
+  };
+
+  uint8_t *row_common = common_scalars_le + (row * term_count * 32u);
+  uint8_t *row_ps = proof_scalars_le + (row * 4u * 32u);
+
+  if (!ok) {
+    atomicExch(invalid_out, 1u);
+    memset(row_common, 0, term_count * 32u);
+    memset(row_ps, 0, 4u * 32u);
+    const uint8_t zero16[16] = {};
+    cubbs_bbs_recode_s8_128_store(zero16, row, item_count, coef_digits_out);
+    return;
+  }
+
+  uint8_t c_le[32], dom_le[32], e_le[32], r1_le[32], r3_le[32];
+  be_to_le(c_be, c_le);
+  be_to_le(dom_be, dom_le);
+  be_to_le(e_cap_be, e_le);
+  be_to_le(r1_cap_be, r1_le);
+  be_to_le(r3_cap_be, r3_le);
+
+  // Proof variable GLV-split scalars (rem || quot): [0]=e_cap (Abar), [1]=c (Bbar), [2]=r1_cap (D), [3]=r3_cap (D)
+  cubbs_bbs_scalar_div_by_z2_device(e_le,  row_ps + 0u * 32u, row_ps + 0u * 32u + 16u);
+  cubbs_bbs_scalar_div_by_z2_device(c_le,  row_ps + 1u * 32u, row_ps + 1u * 32u + 16u);
+  cubbs_bbs_scalar_div_by_z2_device(r1_le, row_ps + 2u * 32u, row_ps + 2u * 32u + 16u);
+  cubbs_bbs_scalar_div_by_z2_device(r3_le, row_ps + 3u * 32u, row_ps + 3u * 32u + 16u);
+
+  cubbs_sppark_scalar_t fr_c, fr_dom;
+  memcpy(&fr_c, c_le, 32u);     fr_c.to();
+  memcpy(&fr_dom, dom_le, 32u); fr_dom.to();
+
+  // Common slot 0 = c (for P1), slot 1 = domain * c (for Q1).
+  memcpy(row_common + 0u * 32u, c_le, 32u);
+  cubbs_sppark_scalar_t fr_dc = fr_dom * fr_c;
+  fr_dc.from();
+  memcpy(row_common + 1u * 32u, &fr_dc, 32u);
+
+  // Disclosed slots: H[disclosed[k]] gets disclosed_scalar[k] * c.
+  const uint8_t *row_disc_s = disclosed_scalars_le + (row * disclosed_count * 32u);
+  for (size_t k = 0u; k < disclosed_count; ++k) {
+    cubbs_sppark_scalar_t fr_m;
+    memcpy(&fr_m, row_disc_s + (k * 32u), 32u);
+    fr_m.to();
+    cubbs_sppark_scalar_t prod = fr_m * fr_c;
+    prod.from();
+    memcpy(row_common + ((2u + disclosed_indexes[k]) * 32u), &prod, 32u);
+  }
+
+  // Undisclosed slots: H[undisclosed[u]] gets m_cap[u].
+  for (size_t u = 0u; u < undisclosed_count; ++u) {
+    const uint8_t *m_be = pr + 240u + (u * 32u);
+    if (!cubbs_bbs_scalar_be_is_canonical(m_be)) {
+      atomicExch(invalid_out, 1u);
+      memset(row_common + ((2u + undisclosed_indexes[u]) * 32u), 0, 32u);
+    } else {
+      be_to_le(m_be, row_common + ((2u + undisclosed_indexes[u]) * 32u));
+    }
+  }
+
+  cubbs_bbs_recode_s8_128_store(coef_le, row, item_count, coef_digits_out);
+}
+
+// Extract [Abar_0..Abar_{B-1}, Bbar_0..Bbar_{B-1}] from interleaved [Abar,Bbar,D]
+// for coalesced 2-stream Signed 8-bit Pippenger aggregate pairing MSM.
+__global__ static void cubbs_bbs_proof_verify_extract_ab_kernel(
+    const cubbs_sppark_plain_affine_t *proof_bases_3,
+    cubbs_sppark_plain_affine_t *ab_streams_2,
+    size_t item_count) {
+  const size_t row = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (row >= item_count) return;
+  ab_streams_2[row] = proof_bases_3[row * 3u + 0u];
+  ab_streams_2[item_count + row] = proof_bases_3[row * 3u + 1u];
+}
+
+// Compress T1[row] and T2[row] by packing into one contiguous 2*B array first?
+// Even simpler: normalize & compress T1 and T2 directly in one 64-thread kernel!
+__global__ static void cubbs_bbs_proof_verify_check_challenge_kernel(
+    const uint8_t *proofs, size_t proof_stride,
+    const uint32_t *disclosed_indexes, size_t disclosed_count,
+    size_t undisclosed_count,
+    const uint8_t *disclosed_scalars_le,
+    const uint8_t *t1_compressed, // item_count * 48
+    const uint8_t *t2_compressed, // item_count * 48
+    const uint8_t *domains_be, size_t domain_stride,
+    const uint8_t *packed_ph, const uint64_t *ph_offsets, const uint64_t *ph_lengths,
+    const uint8_t *challenge_dst, size_t challenge_dst_len,
+    size_t item_count,
+    uint32_t *challenge_fail_out) {
+  const size_t row = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (row >= item_count) return;
+
+  const uint8_t *pr = proofs + (row * proof_stride);
+  const uint8_t *dom_be = domains_be + (domain_stride == 0u ? 0u : row * domain_stride);
+  const uint8_t *ph = (ph_lengths[row] > 0u) ? (packed_ph + ph_offsets[row]) : nullptr;
+
+  uint8_t computed_c_le[32];
+  cubbs_bbs_compute_proof_challenge_le_device(
+      disclosed_indexes, disclosed_count,
+      disclosed_scalars_le + (row * disclosed_count * 32u), 32u, false,
+      pr + 0u, pr + 48u, pr + 96u,
+      t1_compressed + (row * 48u), t2_compressed + (row * 48u),
+      dom_be, ph, static_cast<size_t>(ph_lengths[row]),
+      challenge_dst, challenge_dst_len, computed_c_le);
+
+  const uint8_t *expected_c_be = pr + 240u + (undisclosed_count * 32u);
+  uint32_t diff = 0u;
+  #pragma unroll
+  for (int i = 0; i < 32; ++i) {
+    diff |= static_cast<uint32_t>(computed_c_le[31 - i] ^ expected_c_be[i]);
+  }
+  if (diff != 0u) {
+    atomicExch(challenge_fail_out, 1u);
+  }
+}
+
+// Normalize aggregate (lhs_agg, rhs_agg) to affine for inline GPU pairing check.
+__global__ static void cubbs_bbs_proof_verify_finalize_pair_affines_kernel(
+    const cubbs_sppark_bucket_t *agg_outputs,
+    cubbs_sppark_plain_affine_t *pair_affines_out,
+    uint32_t *inf_flag_out) {
+  const uint32_t tid = threadIdx.x;
+  __shared__ __align__(16) uint8_t pts_smem[2u * sizeof(cubbs_sppark_bucket_t)];
+  auto *pts = reinterpret_cast<cubbs_sppark_bucket_t *>(pts_smem);
+  if (tid < 2u) {
+    pts[tid] = agg_outputs[tid];
+  }
+  __syncwarp();
+  if (tid == 0u) {
+    *inf_flag_out = (pts[0].is_inf() || pts[1].is_inf()) ? 1u : 0u;
+  }
+  __syncwarp();
+
+  const fp_t one = fp_t::one();
+  fp_t zzz = one;
+  if (tid < 2u && !pts[tid].is_inf()) {
+    const fp_t *coords = reinterpret_cast<const fp_t *>(&pts[tid]);
+    zzz = coords[2];
+  }
+  const fp_t inv_zzz = zzz.reciprocal();
+  if (tid < 2u) {
+    if (pts[tid].is_inf()) {
+      fp_t zero;
+      zero.zero();
+      pair_affines_out[tid] = cubbs_sppark_plain_affine_t{zero, zero};
+    } else {
+      const fp_t *coords = reinterpret_cast<const fp_t *>(&pts[tid]);
+      const fp_t affine_y = inv_zzz * coords[1];
+      const fp_t inv_z = inv_zzz * coords[3];
+      fp_t affine_x = inv_z * inv_z;
+      affine_x *= coords[0];
+      pair_affines_out[tid] = cubbs_sppark_plain_affine_t{affine_x, affine_y};
+    }
+  }
+}
+
+int32_t cubbs_bbs_cuda_proof_verify_fused_common_batch(
+    const CuBbsBbsGpuProofVerifyFusedCommonBatchItem *item,
+    CuBbsBbsGpuResult *result) {
+  if (item == nullptr || result == nullptr) return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
+  const size_t item_count = item->item_count;
+  if (item_count == 0u) {
+    result->code = CUBBS_BBS_GPU_SUCCESS;
+    result->value = 1u;
+    result->bytes_written = 0u;
+    return CUBBS_BBS_GPU_SUCCESS;
+  }
+  cubbs_bbs_ensure_cuda_device_schedule();
+
+  const size_t term_count = item->common_term_count;
+  const size_t R = item->disclosed_count;
+  const size_t U = item->undisclosed_count;
+  const bool skip_pairing = (item->public_key.len == 0u);
+  if (term_count < 2u || R + U != term_count - 2u ||
+      item->common_points == nullptr ||
+      (R > 0u && item->disclosed_indexes == nullptr) ||
+      (U > 0u && item->undisclosed_indexes == nullptr) ||
+      item->proofs == nullptr || item->proof_stride != 272u + (U * 32u) ||
+      (!skip_pairing && (item->public_key.data == nullptr || item->public_key.len != 96u ||
+                         item->g2_generator.data == nullptr || item->g2_generator.len != 96u)) ||
+      item->coefficients_le == nullptr || item->domains_be == nullptr ||
+      (item->domain_stride != 0u && item->domain_stride != 32u) ||
+      item->ph_offsets == nullptr || item->ph_lengths == nullptr ||
+      item->message_dst.data == nullptr || item->challenge_dst.data == nullptr) {
+    return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
+  }
+  const size_t total_disclosed = item_count * R;
+  if (total_disclosed > 0u &&
+      (item->message_offsets == nullptr || item->message_lengths == nullptr)) {
+    return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
+  }
+
+  // Prepare/cache G2 lines for public_key and g2_generator (when common-PK pairing is enabled).
+  auto &pipe_ws = cubbs_fused_pipeline_pinned_workspace();
+  if (!skip_pairing) {
+    if (!pipe_ws.pk_valid ||
+        std::memcmp(pipe_ws.pk_key, item->public_key.data, 96u) != 0) {
+      const int32_t st =
+          cubbs_bbs_blst_get_prepared_g2_lines(item->public_key, pipe_ws.pk_lines);
+      if (st != CUBBS_BBS_GPU_SUCCESS) return st;
+      std::memcpy(pipe_ws.pk_key, item->public_key.data, 96u);
+      pipe_ws.pk_valid = true;
+    }
+    if (!pipe_ws.g2_valid ||
+        std::memcmp(pipe_ws.g2_key, item->g2_generator.data, 96u) != 0) {
+      const int32_t st =
+          cubbs_bbs_blst_get_prepared_g2_lines(item->g2_generator, pipe_ws.g2_lines);
+      if (st != CUBBS_BBS_GPU_SUCCESS) return st;
+      std::memcpy(pipe_ws.g2_key, item->g2_generator.data, 96u);
+      pipe_ws.g2_valid = true;
+    }
+  }
+
+  std::shared_ptr<CuBbsFusedCommonPointsCache> cached;
+  const bool large_common = bbs_large_shape_kernel_supported(term_count);
+  const bool universal_common = !large_common &&
+                                !bbs_specialized_common_points_supported(term_count) &&
+                                bbs_universal_tiled_common_supported(term_count);
+  const bool tiled_common = large_common || universal_common;
+  const bool affine_common = !tiled_common && term_count >= 18u && item_count >= 16u &&
+                             bbs_homogeneous_affine_comb_enabled();
+  int32_t status = get_fused_common_points_cache(
+      item->common_points, term_count, &cached, tiled_common, affine_common,
+      affine_common ? 9u : 0u, universal_common);
+  if (status != CUBBS_BBS_GPU_SUCCESS || cached == nullptr) return status;
+
+  const cudaStream_t stream = cubbs_fused_pinned_host_workspace().execution_stream(
+      cached->stream != nullptr ? cached->stream : static_cast<cudaStream_t>(0));
+  configure_cubbs_async_mempool();
+
+  const size_t proofs_bytes = item_count * item->proof_stride;
+  const size_t dom_bytes = item->domain_stride == 0u ? 32u : item_count * 32u;
+  const size_t coef_bytes = item_count * 32u;
+  const size_t disc_idx_bytes = R * sizeof(uint32_t);
+  const size_t undisc_idx_bytes = U * sizeof(uint32_t);
+  const size_t ph_bytes = item->packed_ph_len;
+  const size_t aux_in_bytes =
+      proofs_bytes + dom_bytes + coef_bytes + disc_idx_bytes + undisc_idx_bytes +
+      (item_count * 2u * sizeof(uint64_t)) + ph_bytes +
+      item->message_dst.len + item->challenge_dst.len + 64u;
+  const size_t aux_out_bytes = 32u;
+
+  cudaError_t err = pipe_ws.ensure_messages(item->packed_disclosed_messages_len);
+  if (err == cudaSuccess && total_disclosed > 0u)
+    err = pipe_ws.ensure_msg_meta(total_disclosed);
+  if (err == cudaSuccess)
+    err = pipe_ws.ensure_aux(aux_in_bytes, aux_out_bytes);
+  if (err != cudaSuccess) return CUBBS_BBS_GPU_ERR_INTERNAL;
+
+  if (item->packed_disclosed_messages_len > 0u &&
+      pipe_ws.messages != item->packed_disclosed_messages) {
+    std::memcpy(pipe_ws.messages, item->packed_disclosed_messages,
+                item->packed_disclosed_messages_len);
+  }
+  if (total_disclosed > 0u) {
+    if (pipe_ws.offsets != item->message_offsets)
+      std::memcpy(pipe_ws.offsets, item->message_offsets, total_disclosed * sizeof(uint64_t));
+    if (pipe_ws.lengths != item->message_lengths)
+      std::memcpy(pipe_ws.lengths, item->message_lengths, total_disclosed * sizeof(uint64_t));
+  }
+
+  size_t off = 0u;
+  auto push_aligned = [&](size_t bytes, size_t align) -> size_t {
+    off = (off + align - 1u) & ~(align - 1u);
+    const size_t start = off;
+    off += bytes;
+    return start;
+  };
+  const size_t off_proofs = push_aligned(proofs_bytes, 8u);
+  const size_t off_dom = push_aligned(dom_bytes, 8u);
+  const size_t off_coef = push_aligned(coef_bytes, 8u);
+  const size_t off_disc = push_aligned(disc_idx_bytes, 4u);
+  const size_t off_undisc = push_aligned(undisc_idx_bytes, 4u);
+  const size_t off_ph_off = push_aligned(item_count * sizeof(uint64_t), 8u);
+  const size_t off_ph_len = push_aligned(item_count * sizeof(uint64_t), 8u);
+  const size_t off_ph_data = push_aligned(ph_bytes, 1u);
+  const size_t off_msg_dst = push_aligned(item->message_dst.len, 1u);
+  const size_t off_chal_dst = push_aligned(item->challenge_dst.len, 1u);
+
+  std::memcpy(pipe_ws.aux_in + off_proofs, item->proofs, proofs_bytes);
+  std::memcpy(pipe_ws.aux_in + off_dom, item->domains_be, dom_bytes);
+  std::memcpy(pipe_ws.aux_in + off_coef, item->coefficients_le, coef_bytes);
+  if (R > 0u) std::memcpy(pipe_ws.aux_in + off_disc, item->disclosed_indexes, disc_idx_bytes);
+  if (U > 0u) std::memcpy(pipe_ws.aux_in + off_undisc, item->undisclosed_indexes, undisc_idx_bytes);
+  std::memcpy(pipe_ws.aux_in + off_ph_off, item->ph_offsets, item_count * sizeof(uint64_t));
+  std::memcpy(pipe_ws.aux_in + off_ph_len, item->ph_lengths, item_count * sizeof(uint64_t));
+  if (ph_bytes > 0u) std::memcpy(pipe_ws.aux_in + off_ph_data, item->packed_ph, ph_bytes);
+  if (item->message_dst.len > 0u)
+    std::memcpy(pipe_ws.aux_in + off_msg_dst, item->message_dst.data, item->message_dst.len);
+  if (item->challenge_dst.len > 0u)
+    std::memcpy(pipe_ws.aux_in + off_chal_dst, item->challenge_dst.data, item->challenge_dst.len);
+
+  // Allocate device buffers & launch H2S + Parse + T2 Common Lim-Lee MSM BEFORE
+  // CPU G1 decode of (Abar, Bbar, D) so CPU decode overlaps with GPU T2 MSM!
+  uint8_t *d_messages = nullptr;
+  uint64_t *d_offsets = nullptr;
+  uint64_t *d_lengths = nullptr;
+  uint8_t *d_aux_in = nullptr;
+  uint8_t *d_disc_scalars_le = nullptr;
+  uint8_t *d_common_scalars_le = nullptr;
+  uint8_t *d_proof_scalars_le = nullptr;
+  int16_t *d_coef_digits = nullptr;
+  cubbs_sppark_bucket_t *d_t1_xyzz = nullptr;
+  cubbs_sppark_bucket_t *d_t2_xyzz = nullptr;
+  uint8_t *d_t1_compressed = nullptr;
+  uint8_t *d_t2_compressed = nullptr;
+  cubbs_sppark_plain_affine_t *d_ab_streams = nullptr;
+  cubbs_sppark_bucket_t *d_win_chunk_sums = nullptr;
+  cubbs_sppark_bucket_t *d_agg_outputs = nullptr;
+  cubbs_sppark_plain_affine_t *d_pair_affines = nullptr;
+  uint32_t *d_flags = nullptr; // [0]=invalid, [1]=challenge_fail, [2]=inf_flag
+  uint8_t *d_eq_out = nullptr;
+  CuBbsCommonMsmTransient trans_c;
+
+  const uint32_t chunks = static_cast<uint32_t>((item_count + 2047u) / 2048u);
+
+  if (err == cudaSuccess && item->packed_disclosed_messages_len > 0u)
+    err = cudaMallocAsync(&d_messages, item->packed_disclosed_messages_len, stream);
+  if (err == cudaSuccess && total_disclosed > 0u) {
+    err = cudaMallocAsync(&d_offsets, total_disclosed * sizeof(uint64_t), stream);
+    if (err == cudaSuccess)
+      err = cudaMallocAsync(&d_lengths, total_disclosed * sizeof(uint64_t), stream);
+    if (err == cudaSuccess)
+      err = cudaMallocAsync(&d_disc_scalars_le, total_disclosed * 32u, stream);
+  }
+  if (err == cudaSuccess) err = cudaMallocAsync(&d_aux_in, off, stream);
+  if (err == cudaSuccess) err = cudaMallocAsync(&d_common_scalars_le, item_count * term_count * 32u, stream);
+  if (err == cudaSuccess) err = cudaMallocAsync(&d_proof_scalars_le, item_count * 4u * 32u, stream);
+  if (err == cudaSuccess) err = cudaMallocAsync(&d_coef_digits, 17u * item_count * sizeof(int16_t), stream);
+  if (err == cudaSuccess) err = cudaMallocAsync(&d_t1_xyzz, item_count * sizeof(cubbs_sppark_bucket_t), stream);
+  if (err == cudaSuccess) err = cudaMallocAsync(&d_t2_xyzz, item_count * sizeof(cubbs_sppark_bucket_t), stream);
+  if (err == cudaSuccess) err = cudaMallocAsync(&d_t1_compressed, item_count * 48u, stream);
+  if (err == cudaSuccess) err = cudaMallocAsync(&d_t2_compressed, item_count * 48u, stream);
+  if (err == cudaSuccess && !skip_pairing) err = cudaMallocAsync(&d_ab_streams, item_count * 2u * sizeof(cubbs_sppark_plain_affine_t), stream);
+  if (err == cudaSuccess && !skip_pairing) err = cudaMallocAsync(&d_win_chunk_sums, 34u * chunks * sizeof(cubbs_sppark_bucket_t), stream);
+  if (err == cudaSuccess && !skip_pairing) err = cudaMallocAsync(&d_agg_outputs, 2u * sizeof(cubbs_sppark_bucket_t), stream);
+  if (err == cudaSuccess && !skip_pairing) err = cudaMallocAsync(&d_pair_affines, 2u * sizeof(cubbs_sppark_plain_affine_t), stream);
+  if (err == cudaSuccess) err = cudaMallocAsync(&d_flags, 3u * sizeof(uint32_t), stream);
+  if (err == cudaSuccess && !skip_pairing) err = cudaMallocAsync(&d_eq_out, sizeof(uint8_t), stream);
+  if (err == cudaSuccess) err = trans_c.alloc(*cached, term_count, item_count, tiled_common, stream);
+
+  if (err == cudaSuccess && item->packed_disclosed_messages_len > 0u)
+    err = cudaMemcpyAsync(d_messages, pipe_ws.messages, item->packed_disclosed_messages_len,
+                          cudaMemcpyHostToDevice, stream);
+  if (err == cudaSuccess && total_disclosed > 0u) {
+    err = cudaMemcpyAsync(d_offsets, pipe_ws.offsets, total_disclosed * sizeof(uint64_t),
+                          cudaMemcpyHostToDevice, stream);
+    if (err == cudaSuccess)
+      err = cudaMemcpyAsync(d_lengths, pipe_ws.lengths, total_disclosed * sizeof(uint64_t),
+                            cudaMemcpyHostToDevice, stream);
+  }
+  if (err == cudaSuccess)
+    err = cudaMemcpyAsync(d_aux_in, pipe_ws.aux_in, off, cudaMemcpyHostToDevice, stream);
+  if (err == cudaSuccess)
+    err = cudaMemsetAsync(d_flags, 0, 3u * sizeof(uint32_t), stream);
+
+  const uint8_t *d_proofs = d_aux_in + off_proofs;
+  const uint8_t *d_dom = d_aux_in + off_dom;
+  const uint8_t *d_coef = d_aux_in + off_coef;
+  const uint32_t *d_disc = reinterpret_cast<const uint32_t *>(d_aux_in + off_disc);
+  const uint32_t *d_undisc = reinterpret_cast<const uint32_t *>(d_aux_in + off_undisc);
+  const uint64_t *d_ph_off = reinterpret_cast<const uint64_t *>(d_aux_in + off_ph_off);
+  const uint64_t *d_ph_len = reinterpret_cast<const uint64_t *>(d_aux_in + off_ph_len);
+  const uint8_t *d_ph_data = d_aux_in + off_ph_data;
+  const uint8_t *d_msg_dst = d_aux_in + off_msg_dst;
+  const uint8_t *d_chal_dst = d_aux_in + off_chal_dst;
+
+  // Stage 1: H2S on disclosed messages + parse proof scalars + Lim-Lee T2 common MSM.
+  if (err == cudaSuccess && total_disclosed > 0u) {
+    constexpr uint32_t t = 128u;
+    const uint32_t b = static_cast<uint32_t>((total_disclosed + t - 1u) / t);
+    cubbs_bbs_verify_h2s_flat_to_le_kernel<<<b, t, 0, stream>>>(
+        d_messages, d_offsets, d_lengths, total_disclosed,
+        d_msg_dst, item->message_dst.len, d_disc_scalars_le);
+    err = cudaGetLastError();
+  }
+  if (err == cudaSuccess) {
+    constexpr uint32_t t = 128u;
+    const uint32_t b = static_cast<uint32_t>((item_count + t - 1u) / t);
+    cubbs_bbs_proof_verify_parse_and_build_kernel<<<b, t, 0, stream>>>(
+        d_proofs, item->proof_stride, d_disc, R, d_undisc, U,
+        d_disc_scalars_le, d_dom, item->domain_stride, d_coef,
+        item_count, term_count, d_common_scalars_le, d_proof_scalars_le,
+        d_coef_digits, &d_flags[0]);
+    err = cudaGetLastError();
+  }
+  if (err == cudaSuccess) {
+    err = cubbs_bbs_launch_cached_common_msm_range(
+        *cached, trans_c, d_common_scalars_le, term_count, item_count, d_t2_xyzz, stream);
+  }
+
+  // Overlapped with GPU H2S + T2 Common MSM: decode/subgroup-check (Abar, Bbar, D) on CPU.
+  auto &pts_cache = cubbs_proof_verify_pts_cache();
+  int32_t pts_status = CUBBS_BBS_GPU_SUCCESS;
+  bool upload_pts = false;
+  std::string next_pts_key;
+  std::vector<cubbs_sppark_plain_affine_t> host_pts;
+  const size_t total_pts = item_count * 3u;
+  if (err == cudaSuccess) {
+    bool matches = (pts_cache.key.size() == item_count * 144u &&
+                    pts_cache.capacity >= total_pts);
+    if (matches) {
+      const char *ck = pts_cache.key.data();
+      for (size_t i = 0u; i < item_count; ++i) {
+        if (std::memcmp(ck + (i * 144u), item->proofs + (i * item->proof_stride), 144u) != 0) {
+          matches = false;
+          break;
+        }
+      }
+    }
+    upload_pts = !matches;
+    if (upload_pts) {
+      next_pts_key.resize(item_count * 144u);
+      std::vector<CuBbsBbsGpuByteSlice> slices(total_pts);
+      for (size_t i = 0u; i < item_count; ++i) {
+        const uint8_t *pr = item->proofs + (i * item->proof_stride);
+        std::memcpy(&next_pts_key[i * 144u], pr, 144u);
+        slices[i * 3u + 0u] = CuBbsBbsGpuByteSlice{pr + 0u, 48u};
+        slices[i * 3u + 1u] = CuBbsBbsGpuByteSlice{pr + 48u, 48u};
+        slices[i * 3u + 2u] = CuBbsBbsGpuByteSlice{pr + 96u, 48u};
+      }
+      host_pts.resize(total_pts);
+      pts_status = load_or_decode_cached_g1_affines(slices.data(), total_pts, host_pts.data());
+    }
+  }
+  if (err == cudaSuccess && pts_status == CUBBS_BBS_GPU_SUCCESS && upload_pts) {
+    err = pts_cache.ensure(total_pts);
+    if (err == cudaSuccess) {
+      err = cudaMemcpyAsync(pts_cache.d_points, host_pts.data(),
+                            total_pts * sizeof(host_pts[0]),
+                            cudaMemcpyHostToDevice, stream);
+    }
+    if (err == cudaSuccess) {
+      err = cubbs_bbs_launch_build_radix16_affine_tables(
+          pts_cache.d_points, total_pts, pts_cache.d_radix16_aff, stream);
+    }
+  }
+
+  // Stage 2: Variable proof muls (T1 = e_cap*Abar + c*Bbar + r1_cap*D; T2 += r3_cap*D)
+  // via 2-way Straus-3/1 affine radix-16 GLV kernel (50% fewer doublings, 100% uniform warps).
+  if (err == cudaSuccess && pts_status == CUBBS_BBS_GPU_SUCCESS) {
+    const dim3 v_grid(static_cast<uint32_t>((item_count + 63u) / 64u), 2u);
+    cubbs_bbs_proof_verify_straus2_affine_u_kernel<<<v_grid, 64u, 0, stream>>>(
+        pts_cache.d_radix16_aff, d_proof_scalars_le, item_count,
+        d_t1_xyzz, d_t2_xyzz);
+    err = cudaGetLastError();
+  }
+
+  // Stage 3: GPU 64-thread Montgomery batch-compress T1 & T2.
+  if (err == cudaSuccess && pts_status == CUBBS_BBS_GPU_SUCCESS) {
+    err = cubbs_bbs_launch_xyzz_to_compressed(
+        d_t1_xyzz, item_count, d_t1_compressed, 48u, 0u, stream);
+  }
+  if (err == cudaSuccess && pts_status == CUBBS_BBS_GPU_SUCCESS) {
+    err = cubbs_bbs_launch_xyzz_to_compressed(
+        d_t2_xyzz, item_count, d_t2_compressed, 48u, 0u, stream);
+  }
+
+  // Stage 4: GPU zero-spill challenge verification (computed_c == proof_c for all B items).
+  if (err == cudaSuccess && pts_status == CUBBS_BBS_GPU_SUCCESS) {
+    constexpr uint32_t t = 128u;
+    const uint32_t b = static_cast<uint32_t>((item_count + t - 1u) / t);
+    cubbs_bbs_proof_verify_check_challenge_kernel<<<b, t, 0, stream>>>(
+        d_proofs, item->proof_stride, d_disc, R, U, d_disc_scalars_le,
+        d_t1_compressed, d_t2_compressed, d_dom, item->domain_stride,
+        d_ph_data, d_ph_off, d_ph_len, d_chal_dst, item->challenge_dst.len,
+        item_count, &d_flags[1]);
+    err = cudaGetLastError();
+  }
+
+  // Stage 5: Signed 8-bit Pippenger Aggregate Dual Pairing MSM + Inline GPU Pairing
+  // (skipped when public_key.len == 0 for unique-PK batches, where caller runs GPU pairing_eq_batch).
+  if (err == cudaSuccess && pts_status == CUBBS_BBS_GPU_SUCCESS && !skip_pairing) {
+    constexpr uint32_t t = 128u;
+    const uint32_t b = static_cast<uint32_t>((item_count + t - 1u) / t);
+    cubbs_bbs_proof_verify_extract_ab_kernel<<<b, t, 0, stream>>>(
+        pts_cache.d_points, d_ab_streams, item_count);
+    err = cudaGetLastError();
+  }
+  if (err == cudaSuccess && pts_status == CUBBS_BBS_GPU_SUCCESS && !skip_pairing) {
+    const dim3 bucket_grid(17u, 2u, chunks);
+    cubbs_bbs_verify_pippenger_buckets_s8_kernel<<<bucket_grid, 128u, 0, stream>>>(
+        d_ab_streams, item_count, d_coef_digits, 0u, item_count, chunks,
+        d_win_chunk_sums);
+    err = cudaGetLastError();
+  }
+  if (err == cudaSuccess && pts_status == CUBBS_BBS_GPU_SUCCESS && !skip_pairing) {
+    cubbs_bbs_verify_pippenger_combine_s8_kernel<<<1u, 32u, 0, stream>>>(
+        d_win_chunk_sums, chunks, 2u, false, d_agg_outputs);
+    err = cudaGetLastError();
+  }
+  if (err == cudaSuccess && pts_status == CUBBS_BBS_GPU_SUCCESS && !skip_pairing) {
+    cubbs_bbs_proof_verify_finalize_pair_affines_kernel<<<1u, 32u, 0, stream>>>(
+        d_agg_outputs, d_pair_affines, &d_flags[2]);
+    err = cudaGetLastError();
+  }
+  if (err == cudaSuccess && pts_status == CUBBS_BBS_GPU_SUCCESS && !skip_pairing) {
+    const int32_t pair_launch = cubbs_bbs_cuda_launch_pairing_eq_single_on_stream(
+        &d_pair_affines[0], &d_pair_affines[1],
+        pipe_ws.pk_lines, pipe_ws.g2_lines,
+        item->public_key.data, item->g2_generator.data,
+        d_eq_out, stream);
+    if (pair_launch != CUBBS_BBS_GPU_SUCCESS) err = cudaErrorUnknown;
+  }
+
+  // Stage 6: Single 16-byte D2H + ONE cudaStreamSynchronize!
+  if (err == cudaSuccess && pts_status == CUBBS_BBS_GPU_SUCCESS) {
+    err = cudaMemcpyAsync(pipe_ws.aux_out, d_flags, 3u * sizeof(uint32_t),
+                          cudaMemcpyDeviceToHost, stream);
+  }
+  if (err == cudaSuccess && pts_status == CUBBS_BBS_GPU_SUCCESS && !skip_pairing) {
+    err = cudaMemcpyAsync(pipe_ws.aux_out + (3u * sizeof(uint32_t)), d_eq_out,
+                          sizeof(uint8_t), cudaMemcpyDeviceToHost, stream);
+  }
+  if (err == cudaSuccess) {
+    err = cudaStreamSynchronize(stream);
+  }
+
+  trans_c.free_async(stream);
+  if (d_eq_out != nullptr) (void)cudaFreeAsync(d_eq_out, stream);
+  if (d_flags != nullptr) (void)cudaFreeAsync(d_flags, stream);
+  if (d_pair_affines != nullptr) (void)cudaFreeAsync(d_pair_affines, stream);
+  if (d_agg_outputs != nullptr) (void)cudaFreeAsync(d_agg_outputs, stream);
+  if (d_win_chunk_sums != nullptr) (void)cudaFreeAsync(d_win_chunk_sums, stream);
+  if (d_ab_streams != nullptr) (void)cudaFreeAsync(d_ab_streams, stream);
+  if (d_t2_compressed != nullptr) (void)cudaFreeAsync(d_t2_compressed, stream);
+  if (d_t1_compressed != nullptr) (void)cudaFreeAsync(d_t1_compressed, stream);
+  if (d_t2_xyzz != nullptr) (void)cudaFreeAsync(d_t2_xyzz, stream);
+  if (d_t1_xyzz != nullptr) (void)cudaFreeAsync(d_t1_xyzz, stream);
+  if (d_coef_digits != nullptr) (void)cudaFreeAsync(d_coef_digits, stream);
+  if (d_proof_scalars_le != nullptr) (void)cudaFreeAsync(d_proof_scalars_le, stream);
+  if (d_common_scalars_le != nullptr) (void)cudaFreeAsync(d_common_scalars_le, stream);
+  if (d_disc_scalars_le != nullptr) (void)cudaFreeAsync(d_disc_scalars_le, stream);
+  if (d_aux_in != nullptr) (void)cudaFreeAsync(d_aux_in, stream);
+  if (d_lengths != nullptr) (void)cudaFreeAsync(d_lengths, stream);
+  if (d_offsets != nullptr) (void)cudaFreeAsync(d_offsets, stream);
+  if (d_messages != nullptr) (void)cudaFreeAsync(d_messages, stream);
+
+  if (pts_status != CUBBS_BBS_GPU_SUCCESS) return pts_status;
+  if (err != cudaSuccess) return CUBBS_BBS_GPU_ERR_INTERNAL;
+  if (upload_pts) pts_cache.key = std::move(next_pts_key);
+
+  uint32_t flags[3] = {0u, 0u, 0u};
+  std::memcpy(flags, pipe_ws.aux_out, sizeof(flags));
+  if (flags[0] != 0u || flags[2] != 0u) {
+    return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
+  }
+  const uint8_t eq_value = skip_pairing ? 1u : pipe_ws.aux_out[sizeof(flags)];
+  const uint8_t all_valid = (flags[1] == 0u && eq_value == 1u) ? 1u : 0u;
+  result->code = CUBBS_BBS_GPU_SUCCESS;
+  result->value = all_valid;
+  result->bytes_written = 0u;
+  return CUBBS_BBS_GPU_SUCCESS;
+}
+
+#endif // CUBBS_BBS_FUSED_PROOF_CUH
+#endif // CUBBS_BBS_ENABLE_SPPARK_MSM

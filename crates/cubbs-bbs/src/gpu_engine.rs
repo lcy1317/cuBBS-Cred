@@ -109,6 +109,907 @@ impl GpuBbsEngine {
         Ok(terms)
     }
 
+    pub(super) fn template_points_and_domain_cached(
+        &self,
+        public_key: &[u8],
+        header: &[u8],
+        message_count: usize,
+    ) -> Result<Arc<BbsMsmTerms>> {
+        let key = BbsMsmTermTemplateKey {
+            public_key: public_key.to_vec(),
+            header: header.to_vec(),
+            message_count,
+        };
+        if let Some(template) = self
+            .b_msm_term_templates
+            .lock()
+            .unwrap()
+            .entries
+            .get(&key)
+            .cloned()
+        {
+            return Ok(template);
+        }
+        let dummy_req = SignRequest {
+            secret_key: Vec::new(),
+            public_key: public_key.to_vec(),
+            header: header.to_vec(),
+            messages: vec![Vec::new(); message_count],
+        };
+        let dummy_scalars = vec![BBSplusMessage::new(Scalar::from(0u64)); message_count];
+        let terms = Arc::new(
+            self.protocol
+                .prepare_b_msm_terms_for_prehashed_message_scalars(&dummy_req, &dummy_scalars)?,
+        );
+        self.b_msm_term_templates
+            .lock()
+            .unwrap()
+            .insert(key, Arc::clone(&terms));
+        Ok(terms)
+    }
+
+    pub(super) fn sign_batch_fused_resident_gpu<R: std::borrow::Borrow<SignRequest>>(
+        &self,
+        kernel: &GpuKernelLibrary,
+        reqs: &[R],
+        fail_fast: bool,
+    ) -> Option<BbsBatchRunResult<Vec<u8>>> {
+        if reqs.is_empty() || !kernel.can_sign_fused_common_batch() {
+            return None;
+        }
+        // Quick structural check before touching templates/GPU.
+        if reqs.iter().any(|r| {
+            let req = r.borrow();
+            req.secret_key.len() != SECRET_KEY_LEN || req.public_key.len() != PUBLIC_KEY_LEN
+        }) {
+            return None;
+        }
+
+        // Group indices by message_count (M). Same-shape batches (including M=256 Unique)
+        // form a single group; mixed shapes form one group per distinct M.
+        let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+        for (idx, r) in reqs.iter().enumerate() {
+            let m = r.borrow().messages.len();
+            if let Some((_, indices)) = groups.iter_mut().find(|(gm, _)| *gm == m) {
+                indices.push(idx);
+            } else {
+                groups.push((m, vec![idx]));
+            }
+        }
+
+        let mut results: Vec<Option<Vec<u8>>> = vec![None; reqs.len()];
+        for (msg_count, indices) in groups {
+            let group_len = indices.len();
+            let first_req = reqs[indices[0]].borrow();
+            let all_same_pk_hdr = indices.iter().all(|&i| {
+                let r = reqs[i].borrow();
+                r.public_key == first_req.public_key && r.header == first_req.header
+            });
+            let all_same_sk = indices
+                .iter()
+                .all(|&i| reqs[i].borrow().secret_key == first_req.secret_key);
+
+            let (common_points, domains_be, domain_stride) = if all_same_pk_hdr {
+                let template = self
+                    .template_points_and_domain_cached(
+                        &first_req.public_key,
+                        &first_req.header,
+                        msg_count,
+                    )
+                    .ok()?;
+                if template.compressed_points.len() != msg_count + 2
+                    || template.scalar_be.get(1).map(Vec::len) != Some(32)
+                {
+                    return None;
+                }
+                (
+                    Arc::clone(&template.compressed_points),
+                    template.scalar_be[1].clone(),
+                    0usize,
+                )
+            } else {
+                let first_template = self
+                    .template_points_and_domain_cached(
+                        &first_req.public_key,
+                        &first_req.header,
+                        msg_count,
+                    )
+                    .ok()?;
+                if first_template.compressed_points.len() != msg_count + 2 {
+                    return None;
+                }
+                let mut domains = vec![0u8; group_len * 32];
+                for (pos, &req_idx) in indices.iter().enumerate() {
+                    let req = reqs[req_idx].borrow();
+                    let tmpl = self
+                        .template_points_and_domain_cached(&req.public_key, &req.header, msg_count)
+                        .ok()?;
+                    if tmpl.compressed_points.len() != first_template.compressed_points.len()
+                        || tmpl.compressed_points.as_slice()
+                            != first_template.compressed_points.as_slice()
+                    {
+                        return None;
+                    }
+                    let dom = tmpl.scalar_be.get(1)?;
+                    if dom.len() != 32 {
+                        return None;
+                    }
+                    domains[pos * 32..(pos + 1) * 32].copy_from_slice(dom);
+                }
+                (
+                    Arc::clone(&first_template.compressed_points),
+                    domains,
+                    32usize,
+                )
+            };
+
+            let (secret_keys_be, secret_key_stride) = if all_same_sk {
+                (first_req.secret_key.clone(), 0usize)
+            } else {
+                let mut sks = Vec::with_capacity(group_len * SECRET_KEY_LEN);
+                for &req_idx in &indices {
+                    sks.extend_from_slice(&reqs[req_idx].borrow().secret_key);
+                }
+                (sks, SECRET_KEY_LEN)
+            };
+
+            let total_msgs = group_len * msg_count;
+            let total_bytes: usize = indices
+                .iter()
+                .map(|&i| reqs[i].borrow().messages.iter().map(Vec::len).sum::<usize>())
+                .sum();
+
+            // Zero-copy single-pass pack directly into CUDA thread-local pinned memory!
+            let sigs = if let Some((p_msgs, p_offs, p_lens)) =
+                unsafe { kernel.pipeline_pinned_scratch_slices(total_bytes, total_msgs) }
+            {
+                let mut byte_cursor = 0usize;
+                let mut msg_cursor = 0usize;
+                for &req_idx in &indices {
+                    for msg in &reqs[req_idx].borrow().messages {
+                        let len = msg.len();
+                        p_offs[msg_cursor] = byte_cursor as u64;
+                        p_lens[msg_cursor] = len as u64;
+                        if len > 0 {
+                            p_msgs[byte_cursor..byte_cursor + len].copy_from_slice(msg);
+                        }
+                        byte_cursor += len;
+                        msg_cursor += 1;
+                    }
+                }
+                kernel
+                    .sign_fused_common_batch(
+                        common_points.as_slice(),
+                        group_len,
+                        &secret_keys_be,
+                        secret_key_stride,
+                        &domains_be,
+                        domain_stride,
+                        p_msgs,
+                        p_offs,
+                        p_lens,
+                    )
+                    .ok()?
+            } else {
+                let mut packed_messages = Vec::with_capacity(total_bytes);
+                let mut offsets = Vec::with_capacity(total_msgs);
+                let mut lengths = Vec::with_capacity(total_msgs);
+                for &req_idx in &indices {
+                    for msg in &reqs[req_idx].borrow().messages {
+                        offsets.push(packed_messages.len() as u64);
+                        lengths.push(msg.len() as u64);
+                        packed_messages.extend_from_slice(msg);
+                    }
+                }
+                kernel
+                    .sign_fused_common_batch(
+                        common_points.as_slice(),
+                        group_len,
+                        &secret_keys_be,
+                        secret_key_stride,
+                        &domains_be,
+                        domain_stride,
+                        &packed_messages,
+                        &offsets,
+                        &lengths,
+                    )
+                    .ok()?
+            };
+
+            for (pos, &req_idx) in indices.iter().enumerate() {
+                results[req_idx] =
+                    Some(sigs[pos * SIGNATURE_LEN..(pos + 1) * SIGNATURE_LEN].to_vec());
+            }
+        }
+
+        let _ = fail_fast;
+        let items = results
+            .into_iter()
+            .enumerate()
+            .map(|(index, sig)| BbsBatchItemResult {
+                index,
+                result: sig.ok_or_else(|| Error::Gpu("GPU fused Sign missing output".to_owned())),
+            })
+            .collect::<Vec<_>>();
+        Some(batch_run_result(reqs.len(), items))
+    }
+
+    pub(super) fn verify_batch_pre_b_aggregate_fused_resident_gpu<
+        R: std::borrow::Borrow<VerifyRequest>,
+    >(
+        &self,
+        kernel: &GpuKernelLibrary,
+        reqs: &[R],
+        plan: &planner::ExecutionPlan,
+    ) -> Option<BbsBatchRunResult<bool>> {
+        let attempted = reqs.len();
+        if attempted == 0
+            || !verify_pre_b_aggregate_enabled(attempted)
+            || !kernel.can_verify_pre_b_aggregate_fused()
+            || verify_aggregate_lane_count(attempted) > 1
+        {
+            return None;
+        }
+        let first_req = reqs.first()?.borrow();
+        if first_req.public_key.len() != PUBLIC_KEY_LEN
+            || reqs.iter().any(|r| {
+                let req = r.borrow();
+                req.public_key != first_req.public_key
+                    || req.signature.len() != SIGNATURE_LEN
+                    || req.header.len() != BBS2023_HEADER_LEN
+                    || (!verify_mixed_aggregate_enabled() && plan.batches.len() > 1)
+            })
+        {
+            return None;
+        }
+
+        let first_m = first_req.messages.len();
+        let uniform_m = reqs.iter().all(|r| r.borrow().messages.len() == first_m);
+        let max_m = reqs.iter().map(|r| r.borrow().messages.len()).max()?;
+
+        // Resolve common_points (for max_m) and per-batch domains via template cache.
+        let mut common_points: Option<Arc<Vec<Vec<u8>>>> = None;
+        let mut domains_be = Vec::new();
+        let domain_stride: usize;
+
+        if uniform_m && reqs.iter().all(|r| r.borrow().header == first_req.header) {
+            let tmpl = self
+                .template_points_and_domain_cached(&first_req.public_key, &first_req.header, max_m)
+                .ok()?;
+            if tmpl.compressed_points.len() != max_m + 2
+                || tmpl.scalar_be.get(1).map(Vec::len) != Some(32)
+            {
+                return None;
+            }
+            common_points = Some(Arc::clone(&tmpl.compressed_points));
+            domains_be = tmpl.scalar_be[1].clone();
+            domain_stride = 0;
+        } else {
+            domains_be.resize(attempted * 32, 0u8);
+            domain_stride = 32;
+            for batch in &plan.batches {
+                let &rep_idx = batch.request_indices.first()?;
+                let rep = reqs[rep_idx].borrow();
+                let m = rep.messages.len();
+                let tmpl = self
+                    .template_points_and_domain_cached(&rep.public_key, &rep.header, m)
+                    .ok()?;
+                if tmpl.compressed_points.len() != m + 2 {
+                    return None;
+                }
+                let dom = tmpl.scalar_be.get(1)?;
+                if dom.len() != 32 {
+                    return None;
+                }
+                if m == max_m && common_points.is_none() {
+                    common_points = Some(Arc::clone(&tmpl.compressed_points));
+                }
+                for &idx in &batch.request_indices {
+                    let r = reqs[idx].borrow();
+                    if r.header != rep.header || r.messages.len() != m {
+                        return None;
+                    }
+                    domains_be[idx * 32..(idx + 1) * 32].copy_from_slice(dom);
+                }
+            }
+        }
+        let common_points = common_points?;
+
+        // Generate B random nonzero 128-bit little-endian coefficients (32B stride)
+        // using thread_rng() (ChaCha12 CSPRNG seeded from OS entropy — zero syscalls!).
+        let mut coefficients_le = vec![0u8; attempted * 32];
+        let mut rng = rand::thread_rng();
+        for i in 0..attempted {
+            let slot = &mut coefficients_le[i * 32..i * 32 + 16];
+            rng.fill_bytes(slot);
+            if slot.iter().all(|&b| b == 0) {
+                slot[0] = 1;
+            }
+        }
+
+        // Pack signatures (B * 80B) and raw messages directly into CUDA pinned scratch.
+        let mut signatures = Vec::with_capacity(attempted * SIGNATURE_LEN);
+        let mut total_msgs = 0usize;
+        let mut total_bytes = 0usize;
+        for r in reqs {
+            let req = r.borrow();
+            signatures.extend_from_slice(&req.signature);
+            total_msgs += req.messages.len();
+            for msg in &req.messages {
+                total_bytes += msg.len();
+            }
+        }
+        let mut item_counts = if uniform_m {
+            Vec::new()
+        } else {
+            Vec::with_capacity(attempted)
+        };
+        let mut item_starts = if uniform_m {
+            Vec::new()
+        } else {
+            Vec::with_capacity(attempted)
+        };
+
+        let g2_gen = g2_generator_compressed();
+        let verify_res = if let Some((p_msgs, p_offs, p_lens)) =
+            unsafe { kernel.pipeline_pinned_scratch_slices(total_bytes, total_msgs) }
+        {
+            let mut byte_cursor = 0usize;
+            let mut msg_cursor = 0usize;
+            for r in reqs {
+                let req = r.borrow();
+                if !uniform_m {
+                    item_starts.push(msg_cursor as u64);
+                    item_counts.push(req.messages.len() as u32);
+                }
+                for msg in &req.messages {
+                    let len = msg.len();
+                    p_offs[msg_cursor] = byte_cursor as u64;
+                    p_lens[msg_cursor] = len as u64;
+                    if len > 0 {
+                        p_msgs[byte_cursor..byte_cursor + len].copy_from_slice(msg);
+                    }
+                    byte_cursor += len;
+                    msg_cursor += 1;
+                }
+            }
+            kernel.verify_pre_b_aggregate_fused(
+                common_points.as_slice(),
+                attempted,
+                &signatures,
+                &coefficients_le,
+                &domains_be,
+                domain_stride,
+                if uniform_m {
+                    None
+                } else {
+                    Some(&item_counts)
+                },
+                if uniform_m {
+                    None
+                } else {
+                    Some(&item_starts)
+                },
+                p_msgs,
+                p_offs,
+                p_lens,
+                &first_req.public_key,
+                &g2_gen,
+            )
+        } else {
+            let mut packed_messages = Vec::with_capacity(total_bytes);
+            let mut offsets = Vec::with_capacity(total_msgs);
+            let mut lengths = Vec::with_capacity(total_msgs);
+            for r in reqs {
+                let req = r.borrow();
+                if !uniform_m {
+                    item_starts.push(offsets.len() as u64);
+                    item_counts.push(req.messages.len() as u32);
+                }
+                for msg in &req.messages {
+                    offsets.push(packed_messages.len() as u64);
+                    lengths.push(msg.len() as u64);
+                    packed_messages.extend_from_slice(msg);
+                }
+            }
+            kernel.verify_pre_b_aggregate_fused(
+                common_points.as_slice(),
+                attempted,
+                &signatures,
+                &coefficients_le,
+                &domains_be,
+                domain_stride,
+                if uniform_m {
+                    None
+                } else {
+                    Some(&item_counts)
+                },
+                if uniform_m {
+                    None
+                } else {
+                    Some(&item_starts)
+                },
+                &packed_messages,
+                &offsets,
+                &lengths,
+                &first_req.public_key,
+                &g2_gen,
+            )
+        };
+        match verify_res {
+            Ok(true) => Some(batch_run_result(
+                attempted,
+                (0..attempted)
+                    .map(|index| BbsBatchItemResult {
+                        index,
+                        result: Ok(true),
+                    })
+                    .collect(),
+            )),
+            Ok(false) | Err(_) => None,
+        }
+    }
+
+    pub(super) fn proof_gen_batch_fused_resident_gpu<R: std::borrow::Borrow<ProofGenRequest>>(
+        &self,
+        kernel: &GpuKernelLibrary,
+        reqs: &[R],
+        fail_fast: bool,
+    ) -> Option<BbsBatchRunResult<Vec<u8>>> {
+        if reqs.is_empty() || !kernel.can_proof_gen_fused_common_batch() {
+            return None;
+        }
+        let attempted = reqs.len();
+        let mut groups: Vec<(usize, Vec<usize>, Vec<usize>)> = Vec::new();
+        for (idx, r) in reqs.iter().enumerate() {
+            let req = r.borrow();
+            let m = req.messages.len();
+            if req.signature.len() != SIGNATURE_LEN
+                || req.public_key.len() != PUBLIC_KEY_LEN
+                || ensure_disclosed_indexes(&req.disclosed_indexes, m).is_err()
+            {
+                return None;
+            }
+            if let Some((_, _, indices)) = groups
+                .iter_mut()
+                .find(|(gm, gdisc, _)| *gm == m && *gdisc == req.disclosed_indexes)
+            {
+                indices.push(idx);
+            } else {
+                groups.push((m, req.disclosed_indexes.clone(), vec![idx]));
+            }
+        }
+
+        let mut results: Vec<Option<Vec<u8>>> = vec![None; attempted];
+        for (msg_count, disclosed_indexes, indices) in groups {
+            let group_len = indices.len();
+            let first = reqs[indices[0]].borrow();
+            let all_same_pk_hdr = indices.iter().all(|&i| {
+                let req = reqs[i].borrow();
+                req.public_key == first.public_key && req.header == first.header
+            });
+            let (common_points, domains_be, domain_stride) = if all_same_pk_hdr {
+                let tmpl = self
+                    .template_points_and_domain_cached(&first.public_key, &first.header, msg_count)
+                    .ok()?;
+                if tmpl.compressed_points.len() != msg_count + 2
+                    || tmpl.scalar_be.get(1).map(Vec::len) != Some(32)
+                {
+                    return None;
+                }
+                (
+                    Arc::clone(&tmpl.compressed_points),
+                    tmpl.scalar_be[1].clone(),
+                    0usize,
+                )
+            } else {
+                let first_tmpl = self
+                    .template_points_and_domain_cached(&first.public_key, &first.header, msg_count)
+                    .ok()?;
+                if first_tmpl.compressed_points.len() != msg_count + 2 {
+                    return None;
+                }
+                let mut domains = vec![0u8; group_len * 32];
+                for (pos, &req_idx) in indices.iter().enumerate() {
+                    let req = reqs[req_idx].borrow();
+                    let tmpl = self
+                        .template_points_and_domain_cached(&req.public_key, &req.header, msg_count)
+                        .ok()?;
+                    if tmpl.compressed_points.len() != first_tmpl.compressed_points.len()
+                        || tmpl.compressed_points.as_slice() != first_tmpl.compressed_points.as_slice()
+                    {
+                        return None;
+                    }
+                    let dom = tmpl.scalar_be.get(1)?;
+                    if dom.len() != 32 {
+                        return None;
+                    }
+                    domains[pos * 32..(pos + 1) * 32].copy_from_slice(dom);
+                }
+                (Arc::clone(&first_tmpl.compressed_points), domains, 32usize)
+            };
+
+            let disclosed_u32: Vec<u32> = disclosed_indexes.iter().map(|&i| i as u32).collect();
+            let mut is_disclosed = vec![false; msg_count];
+            for &idx in &disclosed_indexes {
+                is_disclosed[idx] = true;
+            }
+            let mut undisclosed_u32 = Vec::with_capacity(msg_count - disclosed_u32.len());
+            let mut undisclosed_points = Vec::with_capacity(msg_count - disclosed_u32.len());
+            for i in 0..msg_count {
+                if !is_disclosed[i] {
+                    undisclosed_u32.push(i as u32);
+                    undisclosed_points.push(common_points[2 + i].clone());
+                }
+            }
+
+            let mut signatures = Vec::with_capacity(group_len * SIGNATURE_LEN);
+            let mut total_bytes = 0usize;
+            let mut total_ph_bytes = 0usize;
+            for &req_idx in &indices {
+                let req = reqs[req_idx].borrow();
+                signatures.extend_from_slice(&req.signature);
+                for msg in &req.messages {
+                    total_bytes += msg.len();
+                }
+                total_ph_bytes += req.presentation_header.len();
+            }
+            let total_msgs = group_len * msg_count;
+
+            let mut packed_ph = Vec::with_capacity(total_ph_bytes);
+            let mut ph_offsets = Vec::with_capacity(group_len);
+            let mut ph_lengths = Vec::with_capacity(group_len);
+            for &req_idx in &indices {
+                let req = reqs[req_idx].borrow();
+                ph_offsets.push(packed_ph.len() as u64);
+                ph_lengths.push(req.presentation_header.len() as u64);
+                packed_ph.extend_from_slice(&req.presentation_header);
+            }
+
+            let mut csprng_seed = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut csprng_seed);
+
+            let res = if let Some((p_msgs, p_offs, p_lens)) =
+                unsafe { kernel.pipeline_pinned_scratch_slices(total_bytes, total_msgs) }
+            {
+                let mut byte_cursor = 0usize;
+                let mut msg_cursor = 0usize;
+                for &req_idx in &indices {
+                    for msg in &reqs[req_idx].borrow().messages {
+                        let len = msg.len();
+                        p_offs[msg_cursor] = byte_cursor as u64;
+                        p_lens[msg_cursor] = len as u64;
+                        if len > 0 {
+                            p_msgs[byte_cursor..byte_cursor + len].copy_from_slice(msg);
+                        }
+                        byte_cursor += len;
+                        msg_cursor += 1;
+                    }
+                }
+                kernel.proof_gen_fused_common_batch(
+                    common_points.as_slice(),
+                    &undisclosed_points,
+                    &disclosed_u32,
+                    &undisclosed_u32,
+                    group_len,
+                    &signatures,
+                    &domains_be,
+                    domain_stride,
+                    p_msgs,
+                    p_offs,
+                    p_lens,
+                    &packed_ph,
+                    &ph_offsets,
+                    &ph_lengths,
+                    &csprng_seed,
+                )
+            } else {
+                let mut packed_messages = Vec::with_capacity(total_bytes);
+                let mut offsets = Vec::with_capacity(total_msgs);
+                let mut lengths = Vec::with_capacity(total_msgs);
+                for &req_idx in &indices {
+                    for msg in &reqs[req_idx].borrow().messages {
+                        offsets.push(packed_messages.len() as u64);
+                        lengths.push(msg.len() as u64);
+                        packed_messages.extend_from_slice(msg);
+                    }
+                }
+                kernel.proof_gen_fused_common_batch(
+                    common_points.as_slice(),
+                    &undisclosed_points,
+                    &disclosed_u32,
+                    &undisclosed_u32,
+                    group_len,
+                    &signatures,
+                    &domains_be,
+                    domain_stride,
+                    &packed_messages,
+                    &offsets,
+                    &lengths,
+                    &packed_ph,
+                    &ph_offsets,
+                    &ph_lengths,
+                    &csprng_seed,
+                )
+            };
+
+            let Ok((proofs_flat, proof_stride)) = res else {
+                return None;
+            };
+            for (pos, &orig_idx) in indices.iter().enumerate() {
+                let slice = &proofs_flat[pos * proof_stride..(pos + 1) * proof_stride];
+                results[orig_idx] = Some(slice.to_vec());
+            }
+        }
+
+        let _ = fail_fast;
+        let out = results
+            .into_iter()
+            .enumerate()
+            .map(|(index, proof)| BbsBatchItemResult {
+                index,
+                result: Ok(proof.expect("every proof group wrote its output")),
+            })
+            .collect();
+        Some(batch_run_result(attempted, out))
+    }
+
+    pub(super) fn proof_verify_batch_fused_resident_gpu<
+        R: std::borrow::Borrow<ProofVerifyRequest>,
+    >(
+        &self,
+        kernel: &GpuKernelLibrary,
+        reqs: &[R],
+        fail_fast: bool,
+    ) -> Option<BbsBatchRunResult<bool>> {
+        if reqs.is_empty() || !kernel.can_proof_verify_fused_common_batch() {
+            return None;
+        }
+        let attempted = reqs.len();
+        if reqs.iter().any(|r| r.borrow().public_key.len() != PUBLIC_KEY_LEN) {
+            return None;
+        }
+        let first_pk = &reqs[0].borrow().public_key;
+        let all_same_pk = reqs.iter().all(|r| r.borrow().public_key == *first_pk);
+        if !all_same_pk && !(kernel.can_pairing_eq() && native_pairing_enabled()) {
+            return None;
+        }
+
+        // Validate structure and group by (total_message_count, disclosed_indexes)
+        // so uniform, mixed-shape, and unique-PK batches stay GPU-resident.
+        let mut groups: Vec<(usize, Vec<usize>, Vec<usize>)> = Vec::new();
+        for (idx, r) in reqs.iter().enumerate() {
+            let req = r.borrow();
+            let m = req.total_message_count;
+            if ensure_disclosed_indexes(&req.disclosed_indexes, m).is_err()
+                || req.disclosed_messages.len() != req.disclosed_indexes.len()
+            {
+                return None;
+            }
+            let u = m - req.disclosed_indexes.len();
+            if req.proof.len() != 272 + (u * 32) {
+                return None;
+            }
+            if let Some((_, _, indices)) = groups
+                .iter_mut()
+                .find(|(gm, gdisc, _)| *gm == m && *gdisc == req.disclosed_indexes)
+            {
+                indices.push(idx);
+            } else {
+                groups.push((m, req.disclosed_indexes.clone(), vec![idx]));
+            }
+        }
+
+        let g2_gen = g2_generator_compressed();
+        let mut rng = rand::thread_rng();
+
+        for (msg_count, disclosed_indexes, indices) in groups {
+            let group_len = indices.len();
+            let first_req = reqs[indices[0]].borrow();
+            let all_same_pk_hdr = all_same_pk
+                && indices
+                    .iter()
+                    .all(|&i| reqs[i].borrow().header == first_req.header);
+            let (common_points, domains_be, domain_stride) = if all_same_pk_hdr {
+                let tmpl = self
+                    .template_points_and_domain_cached(
+                        &first_req.public_key,
+                        &first_req.header,
+                        msg_count,
+                    )
+                    .ok()?;
+                if tmpl.compressed_points.len() != msg_count + 2
+                    || tmpl.scalar_be.get(1).map(Vec::len) != Some(32)
+                {
+                    return None;
+                }
+                (
+                    Arc::clone(&tmpl.compressed_points),
+                    tmpl.scalar_be[1].clone(),
+                    0usize,
+                )
+            } else {
+                let first_tmpl = self
+                    .template_points_and_domain_cached(
+                        &first_req.public_key,
+                        &first_req.header,
+                        msg_count,
+                    )
+                    .ok()?;
+                if first_tmpl.compressed_points.len() != msg_count + 2 {
+                    return None;
+                }
+                let mut domains = vec![0u8; group_len * 32];
+                for (pos, &req_idx) in indices.iter().enumerate() {
+                    let req = reqs[req_idx].borrow();
+                    let tmpl = self
+                        .template_points_and_domain_cached(&req.public_key, &req.header, msg_count)
+                        .ok()?;
+                    let dom = tmpl.scalar_be.get(1)?;
+                    if dom.len() != 32 {
+                        return None;
+                    }
+                    domains[pos * 32..(pos + 1) * 32].copy_from_slice(dom);
+                }
+                (Arc::clone(&first_tmpl.compressed_points), domains, 32usize)
+            };
+
+            let disclosed_u32: Vec<u32> = disclosed_indexes.iter().map(|&i| i as u32).collect();
+            let mut is_disclosed = vec![false; msg_count];
+            for &idx in &disclosed_indexes {
+                is_disclosed[idx] = true;
+            }
+            let mut undisclosed_u32 = Vec::with_capacity(msg_count - disclosed_u32.len());
+            for i in 0..msg_count {
+                if !is_disclosed[i] {
+                    undisclosed_u32.push(i as u32);
+                }
+            }
+            let proof_stride = 272usize + (undisclosed_u32.len() * 32usize);
+
+            let mut coefficients_le = vec![0u8; group_len * 32];
+            for i in 0..group_len {
+                let slot = &mut coefficients_le[i * 32..i * 32 + 16];
+                rng.fill_bytes(slot);
+                if slot.iter().all(|&b| b == 0) {
+                    slot[0] = 1;
+                }
+            }
+
+            let mut proofs = Vec::with_capacity(group_len * proof_stride);
+            let mut total_bytes = 0usize;
+            let mut total_ph_bytes = 0usize;
+            for &req_idx in &indices {
+                let req = reqs[req_idx].borrow();
+                proofs.extend_from_slice(&req.proof);
+                for msg in &req.disclosed_messages {
+                    total_bytes += msg.len();
+                }
+                total_ph_bytes += req.presentation_header.len();
+            }
+            let total_msgs = group_len * disclosed_u32.len();
+
+            let mut packed_ph = Vec::with_capacity(total_ph_bytes);
+            let mut ph_offsets = Vec::with_capacity(group_len);
+            let mut ph_lengths = Vec::with_capacity(group_len);
+            for &req_idx in &indices {
+                let req = reqs[req_idx].borrow();
+                ph_offsets.push(packed_ph.len() as u64);
+                ph_lengths.push(req.presentation_header.len() as u64);
+                packed_ph.extend_from_slice(&req.presentation_header);
+            }
+
+            let pk_arg: &[u8] = if all_same_pk { first_pk.as_slice() } else { &[] };
+            let verify_res = if let Some((p_msgs, p_offs, p_lens)) =
+                unsafe { kernel.pipeline_pinned_scratch_slices(total_bytes, total_msgs) }
+            {
+                let mut byte_cursor = 0usize;
+                let mut msg_cursor = 0usize;
+                for &req_idx in &indices {
+                    for msg in &reqs[req_idx].borrow().disclosed_messages {
+                        let len = msg.len();
+                        p_offs[msg_cursor] = byte_cursor as u64;
+                        p_lens[msg_cursor] = len as u64;
+                        if len > 0 {
+                            p_msgs[byte_cursor..byte_cursor + len].copy_from_slice(msg);
+                        }
+                        byte_cursor += len;
+                        msg_cursor += 1;
+                    }
+                }
+                kernel.proof_verify_fused_common_batch(
+                    common_points.as_slice(),
+                    &disclosed_u32,
+                    &undisclosed_u32,
+                    group_len,
+                    &proofs,
+                    proof_stride,
+                    &coefficients_le,
+                    &domains_be,
+                    domain_stride,
+                    p_msgs,
+                    p_offs,
+                    p_lens,
+                    &packed_ph,
+                    &ph_offsets,
+                    &ph_lengths,
+                    pk_arg,
+                    &g2_gen,
+                )
+            } else {
+                let mut packed_messages = Vec::with_capacity(total_bytes);
+                let mut offsets = Vec::with_capacity(total_msgs);
+                let mut lengths = Vec::with_capacity(total_msgs);
+                for &req_idx in &indices {
+                    for msg in &reqs[req_idx].borrow().disclosed_messages {
+                        offsets.push(packed_messages.len() as u64);
+                        lengths.push(msg.len() as u64);
+                        packed_messages.extend_from_slice(msg);
+                    }
+                }
+                kernel.proof_verify_fused_common_batch(
+                    common_points.as_slice(),
+                    &disclosed_u32,
+                    &undisclosed_u32,
+                    group_len,
+                    &proofs,
+                    proof_stride,
+                    &coefficients_le,
+                    &domains_be,
+                    domain_stride,
+                    &packed_messages,
+                    &offsets,
+                    &lengths,
+                    &packed_ph,
+                    &ph_offsets,
+                    &ph_lengths,
+                    pk_arg,
+                    &g2_gen,
+                )
+            };
+
+            match verify_res {
+                Ok(true) => {}
+                Ok(false) | Err(_) => return None,
+            }
+
+            if !all_same_pk {
+                let pairing_inputs: Vec<BbsPairingEqInput> = indices
+                    .iter()
+                    .map(|&req_idx| {
+                        let req = reqs[req_idx].borrow();
+                        BbsPairingEqInput {
+                            lhs_g1: req.proof[0..48].to_vec(),
+                            lhs_g2: req.public_key.clone(),
+                            rhs_g1: req.proof[48..96].to_vec(),
+                            rhs_g2: g2_gen.clone(),
+                        }
+                    })
+                    .collect();
+                let pair_res = kernel.pairing_eq_batch(&pairing_inputs, fail_fast);
+                if pair_res.failed != 0
+                    || pair_res
+                        .results
+                        .iter()
+                        .any(|item| !matches!(item.result, Ok(true)))
+                {
+                    return None;
+                }
+            }
+        }
+
+        let _ = fail_fast;
+        Some(batch_run_result(
+            attempted,
+            (0..attempted)
+                .map(|index| BbsBatchItemResult {
+                    index,
+                    result: Ok(true),
+                })
+                .collect(),
+        ))
+    }
+
     pub fn backend_info(&self) -> BbsBackendInfo {
         match &self.kernel {
             Some(kernel) if kernel.hardware_acceleration => BbsBackendInfo {
@@ -775,6 +1676,15 @@ impl GpuBbsEngine {
             if let Some(error) = gpu_runtime_plan_error(kernel, &plan) {
                 return Err(error);
             }
+            if let Some(result) = self.proof_verify_batch_fused_resident_gpu(kernel, &requests, true)
+            {
+                return result
+                    .results
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| Error::Gpu("GPU ProofVerify returned no result".to_owned()))?
+                    .result;
+            }
             let result = self.proof_verify_batch_with_gpu_message_scalars(kernel, requests, true);
             return result
                 .results
@@ -821,6 +1731,19 @@ impl GpuBbsEngine {
         let profile_started = Instant::now();
         let attempted = reqs.len();
         let e_enabled = gpu_precompute_signature_e_enabled();
+        if e_enabled
+            && (!sign_prepared_cache_enabled() || attempted > sign_prepared_cache_max_batch())
+        {
+            if let Some(result) = self.sign_batch_fused_resident_gpu(kernel, &reqs, fail_fast) {
+                if profile {
+                    eprintln!(
+                        "cubbs_sign_batch_profile items={attempted} fused_resident=true total_ms={:.6}",
+                        elapsed_ms(profile_started),
+                    );
+                }
+                return result;
+            }
+        }
         let pipeline_domain = if e_enabled && !message_scalar_cache_enabled() {
             reqs.first().and_then(|first| {
                 reqs.iter()
@@ -1287,6 +2210,9 @@ impl GpuBbsEngine {
         reqs: Vec<ProofGenRequest>,
         fail_fast: bool,
     ) -> BbsBatchRunResult<Vec<u8>> {
+        if let Some(result) = self.proof_gen_batch_fused_resident_gpu(kernel, &reqs, fail_fast) {
+            return result;
+        }
         let profile = std::env::var_os("CUBBS_BBS_GPU_PROOF_GEN_T2_PROFILE").is_some();
         let profile_total_started = Instant::now();
         let attempted = reqs.len();
@@ -1591,6 +2517,17 @@ impl GpuBbsEngine {
         let profile = std::env::var_os("CUBBS_BBS_VERIFY_BATCH_PROFILE").is_some();
         let profile_started = Instant::now();
         let attempted = reqs.len();
+        if let Some(result) =
+            self.verify_batch_pre_b_aggregate_fused_resident_gpu(kernel, reqs, plan)
+        {
+            if profile {
+                eprintln!(
+                    "cubbs_verify_batch_profile items={attempted} fused_resident=true total_ms={:.6}",
+                    elapsed_ms(profile_started),
+                );
+            }
+            return result;
+        }
         let flat_messages = reqs
             .iter()
             .flat_map(|req| req.messages.iter().map(Vec::as_slice))
@@ -2006,7 +2943,7 @@ impl GpuBbsEngine {
         fail_fast: bool,
     ) -> BbsBatchRunResult<bool> {
         let attempted = reqs.len();
-        if kernel.can_g1_msm() {
+        if kernel.can_g1_msm() && !reqs.iter().all(proof_verify_gpu_msm_enabled) {
             let mut gpu_reqs = Vec::new();
             let mut gpu_indexes = Vec::new();
             let mut cpu_reqs = Vec::new();
@@ -2139,6 +3076,7 @@ impl GpuBbsEngine {
                             kernel,
                             attempted,
                             &aggregate_items,
+                            precomputed_pairing,
                             fail_fast,
                         );
                     }
@@ -2347,6 +3285,9 @@ impl GpuBbsEngine {
                 if let Some(error) = gpu_runtime_plan_error(kernel, &plan) {
                     return batch_call_error(reqs.len(), error, fail_fast);
                 }
+                if let Some(result) = self.sign_batch_fused_resident_gpu(kernel, &reqs, fail_fast) {
+                    return result;
+                }
                 if sign_shape_batching_enabled() {
                     if let Some(result) = self.sign_batch_with_gpu_shape_batching(
                         kernel,
@@ -2376,10 +3317,33 @@ impl GpuBbsEngine {
                 if let Some(error) = gpu_runtime_plan_error(kernel, &plan) {
                     return batch_call_error(count, error, fail_fast);
                 }
+                let refs = vec![req; count];
+                if let Some(result) = self.sign_batch_fused_resident_gpu(kernel, &refs, fail_fast) {
+                    return result;
+                }
                 self.sign_batch_repeated_with_gpu_message_scalars(kernel, req, count, fail_fast)
             }
             _ => run_bbs_batch(vec![req.clone(); count], fail_fast, |req| self.sign(req)),
         }
+    }
+
+    pub(super) fn sign_batch_shared(
+        &self,
+        reqs: &[Arc<SignRequest>],
+        fail_fast: bool,
+    ) -> BbsBatchRunResult<Vec<u8>> {
+        if let Some(kernel) = &self.kernel {
+            if let Some(result) = self.sign_batch_fused_resident_gpu(kernel, reqs, fail_fast) {
+                return result;
+            }
+        }
+        let Some(first) = reqs.first() else {
+            return batch_run_result(0, Vec::new());
+        };
+        if reqs.iter().all(|req| Arc::ptr_eq(req, first)) {
+            return self.sign_batch_repeated(first, reqs.len(), fail_fast);
+        }
+        self.sign_batch(reqs.iter().map(|req| (**req).clone()).collect(), fail_fast)
     }
 
     pub(super) fn sign_batch_with_gpu_shape_batching(
@@ -2487,12 +3451,32 @@ impl GpuBbsEngine {
                 if let Some(error) = gpu_runtime_plan_error(kernel, &plan) {
                     return batch_call_error(count, error, fail_fast);
                 }
+                let refs = vec![req; count];
+                if let Some(result) =
+                    self.verify_batch_pre_b_aggregate_fused_resident_gpu(kernel, &refs, &plan)
+                {
+                    return result;
+                }
                 self.verify_batch_repeated_with_gpu_message_scalars(
                     kernel, req, count, &plan, fail_fast,
                 )
             }
             _ => run_bbs_batch(vec![req.clone(); count], fail_fast, |req| self.verify(req)),
         }
+    }
+
+    pub(super) fn verify_batch_shared(
+        &self,
+        reqs: &[Arc<VerifyRequest>],
+        fail_fast: bool,
+    ) -> BbsBatchRunResult<bool> {
+        let Some(first) = reqs.first() else {
+            return batch_run_result(0, Vec::new());
+        };
+        if reqs.iter().all(|req| Arc::ptr_eq(req, first)) {
+            return self.verify_batch_repeated(first, reqs.len(), fail_fast);
+        }
+        self.verify_batch(reqs.iter().map(|req| (**req).clone()).collect(), fail_fast)
     }
 
     pub fn proof_gen_batch(
@@ -2505,6 +3489,11 @@ impl GpuBbsEngine {
                 let plan = planner::CuBbsPlanner::plan_proof_gen(&reqs);
                 if let Some(error) = gpu_runtime_plan_error(kernel, &plan) {
                     return batch_call_error(reqs.len(), error, fail_fast);
+                }
+                if let Some(result) =
+                    self.proof_gen_batch_fused_resident_gpu(kernel, &reqs, fail_fast)
+                {
+                    return result;
                 }
                 if proof_bbs_mixed_shape_batching_enabled() {
                     if proof_gen_shape_batching_eligible(&reqs) {
@@ -2519,6 +3508,34 @@ impl GpuBbsEngine {
         }
     }
 
+    pub(super) fn proof_gen_batch_shared(
+        &self,
+        reqs: &[Arc<ProofGenRequest>],
+        fail_fast: bool,
+    ) -> BbsBatchRunResult<Vec<u8>> {
+        if let Some(kernel) = &self.kernel {
+            if let Some(result) = self.proof_gen_batch_fused_resident_gpu(kernel, reqs, fail_fast) {
+                return result;
+            }
+        }
+        self.proof_gen_batch(reqs.iter().map(|req| (**req).clone()).collect(), fail_fast)
+    }
+
+    pub(super) fn proof_verify_batch_shared(
+        &self,
+        reqs: &[Arc<ProofVerifyRequest>],
+        fail_fast: bool,
+    ) -> BbsBatchRunResult<bool> {
+        if let Some(kernel) = &self.kernel {
+            if let Some(result) =
+                self.proof_verify_batch_fused_resident_gpu(kernel, reqs, fail_fast)
+            {
+                return result;
+            }
+        }
+        self.proof_verify_batch(reqs.iter().map(|req| (**req).clone()).collect(), fail_fast)
+    }
+
     pub fn proof_verify_batch(
         &self,
         reqs: Vec<ProofVerifyRequest>,
@@ -2529,6 +3546,11 @@ impl GpuBbsEngine {
                 let plan = planner::CuBbsPlanner::plan_proof_verify(&reqs);
                 if let Some(error) = gpu_runtime_plan_error(kernel, &plan) {
                     return batch_call_error(reqs.len(), error, fail_fast);
+                }
+                if let Some(result) =
+                    self.proof_verify_batch_fused_resident_gpu(kernel, &reqs, fail_fast)
+                {
+                    return result;
                 }
                 if kernel.can_precompute_message_scalars() && kernel.can_g1_msm() {
                     return self.profile_proof_verify_batch(reqs, fail_fast).result;

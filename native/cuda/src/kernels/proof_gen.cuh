@@ -157,7 +157,6 @@ __global__ static void cubbs_bbs_proof_gen_fixed_muls_global_table_kernel(
 // multiplication (no device-side scalar-field arithmetic). Random scalars are
 // also generated on the host (cost is ~3us/proof, negligible).
 struct CuBbsProofGenT2DeviceWorkspace {
-  std::mutex mutex;
   size_t capacity{0u};
   size_t table_size{0u};
   cudaStream_t stream{nullptr};
@@ -174,19 +173,23 @@ struct CuBbsProofGenT2DeviceWorkspace {
   std::vector<cubbs_sppark_point_t> projectives;
   std::vector<const void *> projective_ptrs;
   std::vector<uint8_t *> compressed_outs;
+
+  ~CuBbsProofGenT2DeviceWorkspace() {
+    if (stream != nullptr) (void)cudaStreamSynchronize(stream);
+    if (bases != nullptr) (void)cudaFree(bases);
+    if (scalars != nullptr) (void)cudaFree(scalars);
+    if (tables != nullptr) (void)cudaFree(tables);
+    if (outputs != nullptr) (void)cudaFree(outputs);
+    if (host_bases != nullptr) (void)cudaFreeHost(host_bases);
+    if (host_scalars != nullptr) (void)cudaFreeHost(host_scalars);
+    if (host_outputs != nullptr) (void)cudaFreeHost(host_outputs);
+    if (stream != nullptr) (void)cudaStreamDestroy(stream);
+  }
 };
 
 static CuBbsProofGenT2DeviceWorkspace &cubbs_proof_gen_t2_workspace() {
-  static auto *workspaces =
-      new std::array<CuBbsProofGenT2DeviceWorkspace, 8u>();
-  static std::atomic<size_t> next_workspace{0u};
-  const size_t active_workspaces = std::min<size_t>(
-      workspaces->size(),
-      std::max<size_t>(
-          1u, env_size_or_default(
-                  "CUBBS_BBS_GPU_PROOF_GEN_WORKSPACES", 3u)));
-  return (*workspaces)[next_workspace.fetch_add(1u, std::memory_order_relaxed) %
-                       active_workspaces];
+  static thread_local CuBbsProofGenT2DeviceWorkspace workspace;
+  return workspace;
 }
 
 int32_t cubbs_bbs_cuda_proof_gen_t2_prepare(
@@ -198,6 +201,7 @@ int32_t cubbs_bbs_cuda_proof_gen_t2_prepare(
   if (item_count == 0u) {
     return CUBBS_BBS_GPU_SUCCESS;
   }
+  cubbs_bbs_ensure_cuda_device_schedule();
 
   const size_t n = item_count;
   const char *radix256_config =
@@ -216,7 +220,6 @@ int32_t cubbs_bbs_cuda_proof_gen_t2_prepare(
   const size_t table_size =
       use_radix256 ? radix256_table_size : radix16_table_size;
   auto &workspace = cubbs_proof_gen_t2_workspace();
-  std::lock_guard<std::mutex> workspace_lock(workspace.mutex);
   cudaError_t err = cudaSuccess;
   if (workspace.stream == nullptr) {
     err = cudaStreamCreateWithFlags(&workspace.stream, cudaStreamNonBlocking);
@@ -304,24 +307,36 @@ int32_t cubbs_bbs_cuda_proof_gen_t2_prepare(
   }
 
   // Decode each big-endian scalar and perform the exact BLST GLV split on the
-  // host. The kernel consumes only the first six multipliers; r3_tilde remains
-  // part of Rust state assembly and does not need a device transfer.
-  for (size_t i = 0; i < n; ++i) {
-    // Convert the six device multipliers from Rust's big-endian encoding.
-    for (size_t s = 0; s < 6u; ++s) {
-      const uint8_t *src = items[i].scalars_be[s].data;
-      uint8_t *split = &workspace.host_scalars[(i * 6u + s) * 32u];
-      if (s == 2u &&
-          std::memcmp(src, items[i].scalars_be[1].data, 32u) == 0) {
-        std::memcpy(split, split - 32u, 32u);
-        continue;
+  // host in parallel. The kernel consumes only the first six multipliers;
+  // r3_tilde remains part of Rust state assembly and does not need a transfer.
+  auto split_range = [&](size_t begin, size_t end) {
+    for (size_t i = begin; i < end; ++i) {
+      for (size_t s = 0; s < 6u; ++s) {
+        const uint8_t *src = items[i].scalars_be[s].data;
+        uint8_t *split = &workspace.host_scalars[(i * 6u + s) * 32u];
+        if (s == 2u &&
+            std::memcmp(src, items[i].scalars_be[1].data, 32u) == 0) {
+          std::memcpy(split, split - 32u, 32u);
+          continue;
+        }
+        uint8_t scalar_le[32];
+        for (size_t b = 0; b < 32u; ++b) {
+          scalar_le[b] = src[31u - b];
+        }
+        cubbs_bbs_scalar_div_by_z2_host(scalar_le, split);
       }
-      uint8_t scalar_le[32];
-      for (size_t b = 0; b < 32u; ++b) {
-        scalar_le[b] = src[31u - b];
-      }
-      cubbs_bbs_scalar_div_by_z2_host(scalar_le, split);
     }
+  };
+  if (n >= 128u) {
+    const size_t workers = std::min<size_t>(4u, n / 64u);
+    const size_t chunk = (n + workers - 1u) / workers;
+    cubbs_run_host_tasks(workers, [&](size_t w) {
+      const size_t begin = w * chunk;
+      const size_t end = std::min(n, begin + chunk);
+      if (begin < end) split_range(begin, end);
+    });
+  } else {
+    split_range(0u, n);
   }
 
   auto *dev_d = workspace.outputs;

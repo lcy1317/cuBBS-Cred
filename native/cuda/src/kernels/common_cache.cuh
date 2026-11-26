@@ -16,6 +16,16 @@ struct CuBbsFusedCommonPointsCache {
   cubbs_sppark_plain_affine_t *device_fixed_affine_comb8{nullptr};
   cubbs_sppark_plain_affine_t *device_fixed_affine_comb9{nullptr};
   cubbs_sppark_plain_affine_t *device_fixed_affine_comb10{nullptr};
+  cubbs_sppark_plain_affine_t *device_fixed_glv_affine_comb8{nullptr};
+  cubbs_sppark_plain_affine_t *device_fixed_glv_affine_comb9{nullptr};
+  cubbs_sppark_plain_affine_t *device_fixed_glv_affine_comb10{nullptr};
+  cubbs_sppark_plain_affine_t *device_limlee_affines{nullptr};
+  size_t *device_limlee_offsets{nullptr};
+  cubbs_sppark_bucket_t *device_limlee_c_total{nullptr};
+  uint32_t limlee_num_groups{0u};
+  uint32_t limlee_group_size{0u};
+  uint32_t limlee_v_sub{0u};
+  size_t limlee_total_entries{0u};
   uint8_t *device_scalars{nullptr};
   cubbs_sppark_bucket_t *device_outputs{nullptr};
   // Dedicated CUDA stream so launches for different point-set groups can
@@ -45,8 +55,12 @@ struct CuBbsFusedCommonPointsCache {
     if (device_fixed_affine_comb8) affines += 32u * 129u;
     if (device_fixed_affine_comb9) affines += 29u * 257u;
     if (device_fixed_affine_comb10) affines += 26u * 513u;
+    if (device_fixed_glv_affine_comb8) affines += 17u * 129u;
+    if (device_fixed_glv_affine_comb9) affines += 15u * 257u;
+    if (device_fixed_glv_affine_comb10) affines += 13u * 513u;
     return term_count * (buckets * sizeof(cubbs_sppark_bucket_t) +
-                         affines * sizeof(cubbs_sppark_plain_affine_t));
+                         affines * sizeof(cubbs_sppark_plain_affine_t)) +
+           limlee_total_entries * sizeof(cubbs_sppark_plain_affine_t);
   }
 
   ~CuBbsFusedCommonPointsCache() {
@@ -101,6 +115,24 @@ struct CuBbsFusedCommonPointsCache {
     }
     if (device_fixed_affine_comb10 != nullptr) {
       (void)cudaFree(device_fixed_affine_comb10);
+    }
+    if (device_fixed_glv_affine_comb8 != nullptr) {
+      (void)cudaFree(device_fixed_glv_affine_comb8);
+    }
+    if (device_fixed_glv_affine_comb9 != nullptr) {
+      (void)cudaFree(device_fixed_glv_affine_comb9);
+    }
+    if (device_fixed_glv_affine_comb10 != nullptr) {
+      (void)cudaFree(device_fixed_glv_affine_comb10);
+    }
+    if (device_limlee_affines != nullptr) {
+      (void)cudaFree(device_limlee_affines);
+    }
+    if (device_limlee_offsets != nullptr) {
+      (void)cudaFree(device_limlee_offsets);
+    }
+    if (device_limlee_c_total != nullptr) {
+      (void)cudaFree(device_limlee_c_total);
     }
     if (stream != nullptr) {
       (void)cudaStreamDestroy(stream);
@@ -170,6 +202,106 @@ static std::string fused_common_points_cache_key(
     key.append(reinterpret_cast<const char *>(points[i].data), points[i].len);
   }
   return key;
+}
+
+static bool bbs_limlee_comb_enabled() {
+  const char *env = std::getenv("CUBBS_BBS_GPU_LIMLEE_COMB");
+  return env == nullptr || env_flag_enabled("CUBBS_BBS_GPU_LIMLEE_COMB");
+}
+
+static cudaError_t build_limlee_table_for_cache(
+    CuBbsFusedCommonPointsCache *cached, size_t term_count) {
+  uint32_t group_size = 15u;
+  if (const char *genv = std::getenv("CUBBS_BBS_LIMLEE_GROUP_SIZE")) {
+    const unsigned long parsed = std::strtoul(genv, nullptr, 10);
+    if (parsed >= 8ul && parsed <= CUBBS_LIMLEE_MAX_GROUP_SIZE) {
+      group_size = static_cast<uint32_t>(parsed);
+    }
+  }
+  const uint32_t num_groups =
+      static_cast<uint32_t>((term_count + group_size - 1u) / group_size);
+  uint32_t v_sub = (group_size >= 17u)
+                       ? 1u
+                       : ((term_count <= 70u) ? 4u : ((term_count <= 130u) ? 2u : 1u));
+  if (const char *venv = std::getenv("CUBBS_BBS_LIMLEE_V_SUB")) {
+    const unsigned long parsed = std::strtoul(venv, nullptr, 10);
+    if (parsed == 1ul || parsed == 2ul || parsed == 4ul) {
+      v_sub = static_cast<uint32_t>(parsed);
+    }
+  }
+  const uint32_t total_subtables = num_groups * v_sub;
+  std::vector<size_t> offsets(total_subtables);
+  size_t total_entries = 0u;
+  for (uint32_t g = 0u; g < num_groups; ++g) {
+    const size_t start = static_cast<size_t>(g) * group_size;
+    const uint32_t gl = static_cast<uint32_t>(
+        std::min<size_t>(group_size, term_count - start));
+    const size_t entries = size_t{1u} << (gl - 1u);
+    for (uint32_t sv = 0u; sv < v_sub; ++sv) {
+      offsets[g * v_sub + sv] = total_entries;
+      total_entries += entries;
+    }
+  }
+
+  cubbs_sppark_bucket_t *tmp_q = nullptr;
+  cubbs_sppark_bucket_t *tmp_xyzz = nullptr;
+  cudaError_t err = cudaMalloc(&cached->device_limlee_offsets,
+                               total_subtables * sizeof(size_t));
+  if (err == cudaSuccess) {
+    err = cudaMalloc(&cached->device_limlee_c_total, sizeof(cubbs_sppark_bucket_t));
+  }
+  if (err == cudaSuccess) {
+    err = cudaMalloc(&cached->device_limlee_affines,
+                     total_entries * sizeof(cubbs_sppark_plain_affine_t));
+  }
+  if (err == cudaSuccess) {
+    err = cudaMalloc(&tmp_q, term_count * v_sub * sizeof(cubbs_sppark_bucket_t));
+  }
+  if (err == cudaSuccess) {
+    err = cudaMalloc(&tmp_xyzz, total_entries * sizeof(cubbs_sppark_bucket_t));
+  }
+  if (err == cudaSuccess) {
+    err = cudaMemcpy(cached->device_limlee_offsets, offsets.data(),
+                     total_subtables * sizeof(size_t), cudaMemcpyHostToDevice);
+  }
+  if (err == cudaSuccess) {
+    constexpr uint32_t q_threads = 128u;
+    const uint32_t q_blocks =
+        static_cast<uint32_t>((term_count + q_threads - 1u) / q_threads);
+    cubbs_bbs_limlee_prepare_q_kernel<<<q_blocks, q_threads>>>(
+        cached->device_points, term_count, v_sub, tmp_q);
+    err = cudaGetLastError();
+  }
+  if (err == cudaSuccess) {
+    cubbs_bbs_limlee_prepare_c_total_kernel<<<1u, 128u>>>(
+        cached->device_points, term_count, cached->device_limlee_c_total);
+    err = cudaGetLastError();
+  }
+  if (err == cudaSuccess) {
+    cubbs_bbs_limlee_build_subtables_kernel<<<total_subtables, 256u>>>(
+        tmp_q, term_count, group_size, v_sub, cached->device_limlee_offsets, tmp_xyzz);
+    err = cudaGetLastError();
+  }
+  if (err == cudaSuccess) {
+    constexpr uint32_t norm_threads = 256u;
+    const uint32_t norm_blocks =
+        static_cast<uint32_t>((total_entries + norm_threads - 1u) / norm_threads);
+    cubbs_bbs_g1_comb_xyzz_to_affine_kernel<<<norm_blocks, norm_threads>>>(
+        tmp_xyzz, cached->device_limlee_affines, total_entries);
+    err = cudaGetLastError();
+  }
+  if (err == cudaSuccess) {
+    err = cudaDeviceSynchronize();
+  }
+  if (tmp_xyzz != nullptr) (void)cudaFree(tmp_xyzz);
+  if (tmp_q != nullptr) (void)cudaFree(tmp_q);
+  if (err == cudaSuccess) {
+    cached->limlee_num_groups = num_groups;
+    cached->limlee_group_size = group_size;
+    cached->limlee_v_sub = v_sub;
+    cached->limlee_total_entries = total_entries;
+  }
+  return err;
 }
 
 static int32_t get_fused_common_points_cache(
@@ -256,6 +388,27 @@ static int32_t get_fused_common_points_cache(
   const size_t multiple8_bytes =
       term_count * 256u * sizeof(cubbs_sppark_bucket_t);
   if (large_window4) {
+    const bool use_limlee_large =
+        !universal_window4 && term_count >= 18u && term_count <= 2100u &&
+        bbs_limlee_comb_enabled();
+    if (use_limlee_large) {
+      cudaError_t cuda_status = cudaMalloc(&cached->device_points, point_bytes);
+      if (cuda_status == cudaSuccess) {
+        cuda_status = cudaMemcpy(cached->device_points, decoded_points.data(),
+                                 point_bytes, cudaMemcpyHostToDevice);
+      }
+      if (cuda_status == cudaSuccess) {
+        cuda_status = build_limlee_table_for_cache(cached.get(), term_count);
+      }
+      if (cuda_status == cudaSuccess) {
+        cuda_status = cudaStreamCreateWithFlags(&cached->stream,
+                                                cudaStreamNonBlocking);
+      }
+      if (cuda_status != cudaSuccess) return CUBBS_BBS_GPU_ERR_INTERNAL;
+      retain_fused_common_points_cache(key, cached);
+      *cached_out = cached;
+      return CUBBS_BBS_GPU_SUCCESS;
+    }
     const bool build_window8 = bbs_large_shape_window8_enabled();
     cudaError_t cuda_status = cudaMalloc(&cached->device_points, point_bytes);
     if (cuda_status == cudaSuccess) {
@@ -326,6 +479,34 @@ static int32_t get_fused_common_points_cache(
   const bool build_fixed_comb = bbs_homogeneous_comb_enabled();
   const bool build_affine_comb =
       build_fixed_comb && affine_comb && bbs_homogeneous_affine_comb_enabled();
+  const bool build_limlee =
+      build_affine_comb && term_count >= 18u && term_count <= 2100u &&
+      bbs_limlee_comb_enabled();
+  if (build_limlee) {
+    cudaError_t cuda_status = cudaMalloc(&cached->device_points, point_bytes);
+    if (cuda_status == cudaSuccess) {
+      cuda_status = cudaMemcpy(cached->device_points, decoded_points.data(),
+                               point_bytes, cudaMemcpyHostToDevice);
+    }
+    if (cuda_status == cudaSuccess) {
+      cuda_status = build_limlee_table_for_cache(cached.get(), term_count);
+    }
+    if (cuda_status == cudaSuccess) {
+      cuda_status = cudaStreamCreateWithFlags(&cached->stream,
+                                              cudaStreamNonBlocking);
+    }
+    if (cuda_status != cudaSuccess) return CUBBS_BBS_GPU_ERR_INTERNAL;
+    retain_fused_common_points_cache(key, cached);
+    *cached_out = cached;
+    return CUBBS_BBS_GPU_SUCCESS;
+  }
+  const char *glv_comb_env = std::getenv("CUBBS_BBS_GPU_GLV_AFFINE_COMB");
+  const bool build_glv_affine_comb =
+      build_affine_comb &&
+      (fixed_comb_bits == 8u || fixed_comb_bits == 9u || fixed_comb_bits == 10u) &&
+      (glv_comb_env == nullptr || env_flag_enabled("CUBBS_BBS_GPU_GLV_AFFINE_COMB"));
+  const bool build_legacy_fixed_comb = build_fixed_comb && !build_glv_affine_comb;
+  const bool build_legacy_affine_comb = build_affine_comb && !build_glv_affine_comb;
   const size_t fixed_comb4_bytes =
       term_count * 64u * 16u * sizeof(cubbs_sppark_bucket_t);
   const size_t fixed_comb5_bytes =
@@ -368,7 +549,7 @@ static int32_t get_fused_common_points_cache(
     cuda_status =
         cudaMalloc(&cached->device_point_multiples8, multiple8_bytes);
   }
-  if (cuda_status == cudaSuccess && build_fixed_comb) {
+  if (cuda_status == cudaSuccess && build_legacy_fixed_comb) {
     if (fixed_comb_bits == 4u) {
       cuda_status = cudaMalloc(&cached->device_fixed_comb4, fixed_comb4_bytes);
     } else if (fixed_comb_bits == 5u) {
@@ -383,7 +564,7 @@ static int32_t get_fused_common_points_cache(
       cuda_status = cudaMalloc(&cached->device_fixed_comb10, fixed_comb10_bytes);
     }
   }
-  if (cuda_status == cudaSuccess && build_affine_comb) {
+  if (cuda_status == cudaSuccess && build_legacy_affine_comb) {
     if (fixed_comb_bits == 8u) {
       cuda_status = cudaMalloc(
           &cached->device_fixed_affine_comb8,
@@ -396,6 +577,25 @@ static int32_t get_fused_common_points_cache(
       cuda_status = cudaMalloc(
           &cached->device_fixed_affine_comb10,
           fixed_affine_comb10_count * sizeof(cubbs_sppark_plain_affine_t));
+    }
+  }
+  const size_t glv_comb_count = fixed_comb_bits == 8u
+      ? (term_count * 17u * 129u)
+      : (fixed_comb_bits == 9u ? (term_count * 15u * 257u)
+                               : (term_count * 13u * 513u));
+  if (cuda_status == cudaSuccess && build_glv_affine_comb) {
+    if (fixed_comb_bits == 8u) {
+      cuda_status = cudaMalloc(
+          &cached->device_fixed_glv_affine_comb8,
+          glv_comb_count * sizeof(cubbs_sppark_plain_affine_t));
+    } else if (fixed_comb_bits == 9u) {
+      cuda_status = cudaMalloc(
+          &cached->device_fixed_glv_affine_comb9,
+          glv_comb_count * sizeof(cubbs_sppark_plain_affine_t));
+    } else if (fixed_comb_bits == 10u) {
+      cuda_status = cudaMalloc(
+          &cached->device_fixed_glv_affine_comb10,
+          glv_comb_count * sizeof(cubbs_sppark_plain_affine_t));
     }
   }
   if (cuda_status == cudaSuccess) {
@@ -412,7 +612,7 @@ static int32_t get_fused_common_points_cache(
                              point_multiples8.data(), multiple8_bytes,
                              cudaMemcpyHostToDevice);
   }
-  if (cuda_status == cudaSuccess && build_fixed_comb) {
+  if (cuda_status == cudaSuccess && build_legacy_fixed_comb) {
     if (fixed_comb_bits == 4u) {
       cubbs_bbs_g1_fixed_comb4_precompute_kernel
           <<<static_cast<uint32_t>(term_count), 16u>>>(
@@ -443,7 +643,7 @@ static int32_t get_fused_common_points_cache(
       cuda_status = cudaDeviceSynchronize();
     }
   }
-  if (cuda_status == cudaSuccess && build_affine_comb) {
+  if (cuda_status == cudaSuccess && build_legacy_affine_comb) {
     const auto normalize = [&](const cubbs_sppark_bucket_t *input,
                                cubbs_sppark_plain_affine_t *output,
                                size_t count) {
@@ -468,6 +668,40 @@ static int32_t get_fused_common_points_cache(
                               fixed_affine_comb10_count);
     }
     if (cuda_status == cudaSuccess) cuda_status = cudaDeviceSynchronize();
+  }
+  if (cuda_status == cudaSuccess && build_glv_affine_comb) {
+    cubbs_sppark_bucket_t *tmp_glv = nullptr;
+    cuda_status = cudaMalloc(&tmp_glv, glv_comb_count * sizeof(cubbs_sppark_bucket_t));
+    if (cuda_status == cudaSuccess) {
+      cubbs_sppark_plain_affine_t *target_affine = nullptr;
+      if (fixed_comb_bits == 8u) {
+        cubbs_bbs_g1_fixed_glv_comb_precompute_kernel<8u, 17u, 129u>
+            <<<static_cast<uint32_t>(term_count), 128u>>>(
+                cached->device_points, term_count, tmp_glv);
+        target_affine = cached->device_fixed_glv_affine_comb8;
+      } else if (fixed_comb_bits == 9u) {
+        cubbs_bbs_g1_fixed_glv_comb_precompute_kernel<9u, 15u, 257u>
+            <<<static_cast<uint32_t>(term_count), 256u>>>(
+                cached->device_points, term_count, tmp_glv);
+        target_affine = cached->device_fixed_glv_affine_comb9;
+      } else {
+        cubbs_bbs_g1_fixed_glv_comb_precompute_kernel<10u, 13u, 513u>
+            <<<static_cast<uint32_t>(term_count), 256u>>>(
+                cached->device_points, term_count, tmp_glv);
+        target_affine = cached->device_fixed_glv_affine_comb10;
+      }
+      cuda_status = cudaGetLastError();
+      if (cuda_status == cudaSuccess) {
+        constexpr uint32_t threads = 256u;
+        const uint32_t blocks =
+            static_cast<uint32_t>((glv_comb_count + threads - 1u) / threads);
+        cubbs_bbs_g1_comb_xyzz_to_affine_kernel<<<blocks, threads>>>(
+            tmp_glv, target_affine, glv_comb_count);
+        cuda_status = cudaGetLastError();
+      }
+      if (cuda_status == cudaSuccess) cuda_status = cudaDeviceSynchronize();
+      (void)cudaFree(tmp_glv);
+    }
   }
   // Create a dedicated stream for this point set so launches and copies for
   // different VC-shape groups can overlap instead of serializing on the

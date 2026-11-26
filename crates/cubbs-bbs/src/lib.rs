@@ -653,20 +653,15 @@ impl BbsEngine {
         reqs: &[Arc<SignRequest>],
         fail_fast: bool,
     ) -> BbsBatchRunResult<Vec<u8>> {
-        let Some(first) = reqs.first() else {
+        if reqs.is_empty() {
             return batch_run_result(0, Vec::new());
-        };
-        if reqs.iter().all(|req| Arc::ptr_eq(req, first)) {
-            return match self {
-                Self::ZkryptiumCpu(engine) => {
-                    engine.sign_batch(vec![(**first).clone(); reqs.len()], fail_fast)
-                }
-                Self::GpuRequestedCpuFallback(engine) => {
-                    engine.sign_batch_repeated(first, reqs.len(), fail_fast)
-                }
-            };
         }
-        self.sign_batch(reqs.iter().map(|req| (**req).clone()).collect(), fail_fast)
+        match self {
+            Self::ZkryptiumCpu(engine) => {
+                engine.sign_batch(reqs.iter().map(|req| (**req).clone()).collect(), fail_fast)
+            }
+            Self::GpuRequestedCpuFallback(engine) => engine.sign_batch_shared(reqs, fail_fast),
+        }
     }
 
     pub fn verify_batch(
@@ -696,20 +691,15 @@ impl BbsEngine {
         reqs: &[Arc<VerifyRequest>],
         fail_fast: bool,
     ) -> BbsBatchRunResult<bool> {
-        let Some(first) = reqs.first() else {
+        if reqs.is_empty() {
             return batch_run_result(0, Vec::new());
-        };
-        if reqs.iter().all(|req| Arc::ptr_eq(req, first)) {
-            return match self {
-                Self::ZkryptiumCpu(engine) => {
-                    engine.verify_batch(vec![(**first).clone(); reqs.len()], fail_fast)
-                }
-                Self::GpuRequestedCpuFallback(engine) => {
-                    engine.verify_batch_repeated(first, reqs.len(), fail_fast)
-                }
-            };
         }
-        self.verify_batch(reqs.iter().map(|req| (**req).clone()).collect(), fail_fast)
+        match self {
+            Self::ZkryptiumCpu(engine) => {
+                engine.verify_batch(reqs.iter().map(|req| (**req).clone()).collect(), fail_fast)
+            }
+            Self::GpuRequestedCpuFallback(engine) => engine.verify_batch_shared(reqs, fail_fast),
+        }
     }
 
     pub fn proof_gen_batch(
@@ -723,6 +713,27 @@ impl BbsEngine {
         }
     }
 
+    /// Generate selective-disclosure proofs for structurally cached requests
+    /// without deep-cloning their message vectors. Every entry still executes
+    /// one fresh randomized BBS ProofGen operation.
+    pub fn proof_gen_batch_shared(
+        &self,
+        reqs: &[Arc<ProofGenRequest>],
+        fail_fast: bool,
+    ) -> BbsBatchRunResult<Vec<u8>> {
+        if reqs.is_empty() {
+            return batch_run_result(0, Vec::new());
+        }
+        match self {
+            Self::ZkryptiumCpu(engine) => {
+                engine.proof_gen_batch(reqs.iter().map(|req| (**req).clone()).collect(), fail_fast)
+            }
+            Self::GpuRequestedCpuFallback(engine) => {
+                engine.proof_gen_batch_shared(reqs, fail_fast)
+            }
+        }
+    }
+
     pub fn proof_verify_batch(
         &self,
         reqs: Vec<ProofVerifyRequest>,
@@ -731,6 +742,26 @@ impl BbsEngine {
         match self {
             Self::ZkryptiumCpu(engine) => engine.proof_verify_batch(reqs, fail_fast),
             Self::GpuRequestedCpuFallback(engine) => engine.proof_verify_batch(reqs, fail_fast),
+        }
+    }
+
+    /// Verify selective-disclosure proofs for structurally cached requests
+    /// without deep-cloning their message vectors. Every entry still executes
+    /// full BBS ProofVerify.
+    pub fn proof_verify_batch_shared(
+        &self,
+        reqs: &[Arc<ProofVerifyRequest>],
+        fail_fast: bool,
+    ) -> BbsBatchRunResult<bool> {
+        if reqs.is_empty() {
+            return batch_run_result(0, Vec::new());
+        }
+        match self {
+            Self::ZkryptiumCpu(engine) => engine
+                .proof_verify_batch(reqs.iter().map(|req| (**req).clone()).collect(), fail_fast),
+            Self::GpuRequestedCpuFallback(engine) => {
+                engine.proof_verify_batch_shared(reqs, fail_fast)
+            }
         }
     }
 

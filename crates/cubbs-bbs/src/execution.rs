@@ -289,16 +289,62 @@ pub(super) fn proof_verify_precomputed_items_strict_gpu(
     kernel: &GpuKernelLibrary,
     attempted: usize,
     items: &[ProofVerifyPrecomputedMsmItem],
+    precomputed_pairing: Option<BbsBatchRunResult<bool>>,
     fail_fast: bool,
 ) -> BbsBatchRunResult<bool> {
+    let challenge_outcomes: Vec<Result<BbsPairingEqInput>> = if items.len() >= 128 {
+        let workers = proof_host_worker_count(items.len()).min(4);
+        if workers > 1 {
+            let chunk = items.len().div_ceil(workers);
+            thread::scope(|scope| {
+                items
+                    .chunks(chunk)
+                    .map(|slice| {
+                        scope.spawn(move || {
+                            slice
+                                .iter()
+                                .map(|(_, req, scalars, t1, t2, domain, meta)| {
+                                    proof_verify_challenge_and_pairing_eq_input_from_prepared(
+                                        req, scalars, t1, t2, *domain, meta,
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .flat_map(|h| h.join().expect("proof-verify challenge worker panicked"))
+                    .collect()
+            })
+        } else {
+            items
+                .iter()
+                .map(|(_, req, scalars, t1, t2, domain, meta)| {
+                    proof_verify_challenge_and_pairing_eq_input_from_prepared(
+                        req, scalars, t1, t2, *domain, meta,
+                    )
+                })
+                .collect()
+        }
+    } else {
+        items
+            .iter()
+            .map(|(_, req, scalars, t1, t2, domain, meta)| {
+                proof_verify_challenge_and_pairing_eq_input_from_prepared(
+                    req, scalars, t1, t2, *domain, meta,
+                )
+            })
+            .collect()
+    };
+
     let mut results = Vec::with_capacity(items.len());
     let mut valid_positions = Vec::with_capacity(items.len());
     let mut pairing_inputs = Vec::with_capacity(items.len());
 
-    for (position, (index, req, scalars, t1, t2, domain, meta)) in items.iter().enumerate() {
-        match proof_verify_challenge_and_pairing_eq_input_from_prepared(
-            req, scalars, t1, t2, *domain, meta,
-        ) {
+    for (position, ((index, _, _, _, _, _, _), outcome)) in
+        items.iter().zip(challenge_outcomes).enumerate()
+    {
+        match outcome {
             Ok(input) => {
                 valid_positions.push((position, *index));
                 pairing_inputs.push(input);
@@ -316,7 +362,18 @@ pub(super) fn proof_verify_precomputed_items_strict_gpu(
     }
 
     if !pairing_inputs.is_empty() {
-        let pairing_result = if !kernel.can_pairing_eq() {
+        let reusable_precomputed = precomputed_pairing.filter(|pre| {
+            pairing_inputs.len() == items.len()
+                && pre.failed == 0
+                && pre.results.len() == items.len()
+                && pre
+                    .results
+                    .iter()
+                    .all(|r| matches!(r.result, Ok(true)))
+        });
+        let pairing_result = if let Some(pre) = reusable_precomputed {
+            pre
+        } else if !kernel.can_pairing_eq() {
             batch_call_error(
                 pairing_inputs.len(),
                 Error::Gpu(
@@ -3848,10 +3905,9 @@ pub(super) fn gpu_verify_dual_same_points_enabled_from_env(
 }
 
 pub(super) fn proof_verify_pairing_overlap_enabled(item_count: usize) -> bool {
-    let _ = item_count;
     std::env::var("CUBBS_BBS_PROOF_VERIFY_PAIRING_OVERLAP")
         .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
-        .unwrap_or(false)
+        .unwrap_or(item_count >= 16)
 }
 
 pub(super) fn gpu_split_variable_msm_enabled() -> bool {

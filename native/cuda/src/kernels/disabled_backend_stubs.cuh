@@ -36,4 +36,29 @@ int32_t cubbs_bbs_cuda_g1_dual_msm_same_points_lanes(
     const CuBbsBbsGpuByteSlice *, size_t, size_t, uint8_t *, uint8_t *) {
   return CUBBS_BBS_GPU_ERR_INTERNAL;
 }
+
+int32_t cubbs_bbs_cuda_sign_fused_common_batch(
+    const CuBbsBbsGpuSignFusedCommonBatchItem *, CuBbsBbsGpuResult *) {
+  return CUBBS_BBS_GPU_ERR_INTERNAL;
+}
+
+int32_t cubbs_bbs_cuda_verify_pre_b_aggregate_fused(
+    const CuBbsBbsGpuVerifyPreBAggregateFusedItem *, CuBbsBbsGpuResult *) {
+  return CUBBS_BBS_GPU_ERR_INTERNAL;
+}
+
+int32_t cubbs_bbs_cuda_pipeline_pinned_scratch(
+    size_t, size_t, uint8_t **, uint64_t **, uint64_t **) {
+  return CUBBS_BBS_GPU_ERR_INTERNAL;
+}
+
+int32_t cubbs_bbs_cuda_proof_gen_fused_common_batch(
+    const CuBbsBbsGpuProofGenFusedCommonBatchItem *, CuBbsBbsGpuResult *) {
+  return CUBBS_BBS_GPU_ERR_INTERNAL;
+}
+
+int32_t cubbs_bbs_cuda_proof_verify_fused_common_batch(
+    const CuBbsBbsGpuProofVerifyFusedCommonBatchItem *, CuBbsBbsGpuResult *) {
+  return CUBBS_BBS_GPU_ERR_INTERNAL;
+}
 #endif

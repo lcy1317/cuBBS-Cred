@@ -8,9 +8,29 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <stdint.h>
 #include <thread>
 #include <vector>
+
+void cubbs_bbs_ensure_cuda_device_schedule() {
+  static std::once_flag schedule_once;
+  std::call_once(schedule_once, []() {
+    const char *mode = std::getenv("CUBBS_BBS_CUDA_SCHEDULE");
+    unsigned int flag = cudaDeviceScheduleBlockingSync;
+    if (mode != nullptr && mode[0] != '\0') {
+      if (std::strcmp(mode, "spin") == 0) {
+        flag = cudaDeviceScheduleSpin;
+      } else if (std::strcmp(mode, "yield") == 0) {
+        flag = cudaDeviceScheduleYield;
+      } else if (std::strcmp(mode, "auto") == 0) {
+        flag = cudaDeviceScheduleAuto;
+      }
+    }
+    (void)cudaSetDeviceFlags(flag);
+    (void)cudaGetLastError();
+  });
+}
 
 __global__ void cubbs_bbs_canary_kernel(uint32_t *out) {
   if (threadIdx.x == 0 && blockIdx.x == 0) {
@@ -197,20 +217,90 @@ struct CuBbsHashToScalarWorkspace {
   uint8_t *scalars{nullptr};
   uint8_t *sign_contexts{nullptr};
   uint8_t *sign_e_scalars{nullptr};
+  // Pinned host staging buffers for zero-bounce-copy async DMA transfers.
+  uint8_t *host_messages{nullptr};
+  size_t *host_offsets{nullptr};
+  size_t *host_lengths{nullptr};
+  uint8_t *host_scalars{nullptr};
+  uint8_t *host_sign_contexts{nullptr};
+  uint8_t *host_sign_e_scalars{nullptr};
   size_t message_capacity{0};
   size_t item_capacity{0};
   size_t dst_capacity{0};
   size_t sign_context_capacity{0};
   size_t sign_e_scalar_capacity{0};
+  size_t host_message_capacity{0};
+  size_t host_item_capacity{0};
+  size_t host_sign_context_capacity{0};
+  size_t host_sign_e_scalar_capacity{0};
   size_t last_scalar_count{0};
   cudaStream_t stream{nullptr};
 
   CuBbsHashToScalarWorkspace() {
+    cubbs_bbs_ensure_cuda_device_schedule();
     (void)cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+  }
+
+  cudaError_t ensure_host_messages(size_t bytes) {
+    const size_t required = std::max<size_t>(1u, bytes);
+    if (host_message_capacity >= required) return cudaSuccess;
+    if (host_messages != nullptr) (void)cudaFreeHost(host_messages);
+    host_messages = nullptr;
+    host_message_capacity = 0;
+    const size_t alloc = std::max(required, host_message_capacity * 2u);
+    cudaError_t err = cudaMallocHost(&host_messages, alloc);
+    if (err == cudaSuccess) host_message_capacity = alloc;
+    return err;
+  }
+
+  cudaError_t ensure_host_items(size_t count) {
+    const size_t required = std::max<size_t>(1u, count);
+    if (host_item_capacity >= required) return cudaSuccess;
+    if (host_offsets != nullptr) (void)cudaFreeHost(host_offsets);
+    if (host_lengths != nullptr) (void)cudaFreeHost(host_lengths);
+    if (host_scalars != nullptr) (void)cudaFreeHost(host_scalars);
+    host_offsets = nullptr;
+    host_lengths = nullptr;
+    host_scalars = nullptr;
+    host_item_capacity = 0;
+    cudaError_t err = cudaMallocHost(&host_offsets, required * sizeof(size_t));
+    if (err == cudaSuccess)
+      err = cudaMallocHost(&host_lengths, required * sizeof(size_t));
+    if (err == cudaSuccess)
+      err = cudaMallocHost(&host_scalars, required * 32u);
+    if (err == cudaSuccess) host_item_capacity = required;
+    return err;
+  }
+
+  cudaError_t ensure_host_sign(size_t context_bytes, size_t e_count) {
+    const size_t req_ctx = std::max<size_t>(1u, context_bytes);
+    const size_t req_e = std::max<size_t>(1u, e_count);
+    cudaError_t err = cudaSuccess;
+    if (host_sign_context_capacity < req_ctx) {
+      if (host_sign_contexts != nullptr) (void)cudaFreeHost(host_sign_contexts);
+      host_sign_contexts = nullptr;
+      host_sign_context_capacity = 0;
+      err = cudaMallocHost(&host_sign_contexts, req_ctx);
+      if (err == cudaSuccess) host_sign_context_capacity = req_ctx;
+    }
+    if (err == cudaSuccess && host_sign_e_scalar_capacity < req_e) {
+      if (host_sign_e_scalars != nullptr) (void)cudaFreeHost(host_sign_e_scalars);
+      host_sign_e_scalars = nullptr;
+      host_sign_e_scalar_capacity = 0;
+      err = cudaMallocHost(&host_sign_e_scalars, req_e * 32u);
+      if (err == cudaSuccess) host_sign_e_scalar_capacity = req_e;
+    }
+    return err;
   }
 
   ~CuBbsHashToScalarWorkspace() {
     if (stream != nullptr) (void)cudaStreamSynchronize(stream);
+    if (host_sign_e_scalars != nullptr) (void)cudaFreeHost(host_sign_e_scalars);
+    if (host_sign_contexts != nullptr) (void)cudaFreeHost(host_sign_contexts);
+    if (host_scalars != nullptr) (void)cudaFreeHost(host_scalars);
+    if (host_lengths != nullptr) (void)cudaFreeHost(host_lengths);
+    if (host_offsets != nullptr) (void)cudaFreeHost(host_offsets);
+    if (host_messages != nullptr) (void)cudaFreeHost(host_messages);
     cudaFree(sign_e_scalars);
     cudaFree(sign_contexts);
     cudaFree(scalars);
@@ -373,26 +463,20 @@ extern "C" int32_t cubbs_bbs_gpu_messages_to_scalar_batch_v2(
     total_len += items[i].message.len;
   }
 
-  struct HostPackWorkspace {
-    std::vector<uint8_t> packed;
-    std::vector<size_t> offsets;
-    std::vector<size_t> lengths;
-    std::vector<uint8_t> scalars;
-  };
-  static thread_local HostPackWorkspace host_workspace;
-  host_workspace.packed.resize(total_len);
-  host_workspace.offsets.resize(item_count);
-  host_workspace.lengths.resize(item_count);
-  host_workspace.scalars.resize(item_count * 32u);
-  auto &packed = host_workspace.packed;
-  auto &offsets = host_workspace.offsets;
-  auto &lengths = host_workspace.lengths;
+  auto &workspace = cubbs_hash_to_scalar_workspace();
+  if (workspace.ensure_host_messages(total_len) != cudaSuccess ||
+      workspace.ensure_host_items(item_count) != cudaSuccess) {
+    return CUBBS_BBS_GPU_ERR_INTERNAL;
+  }
+  uint8_t *packed = workspace.host_messages;
+  size_t *offsets = workspace.host_offsets;
+  size_t *lengths = workspace.host_lengths;
   size_t cursor = 0;
   for (size_t i = 0; i < item_count; ++i) {
     offsets[i] = cursor;
     lengths[i] = items[i].message.len;
     if (items[i].message.len > 0) {
-      std::memcpy(packed.data() + cursor, items[i].message.data, items[i].message.len);
+      std::memcpy(packed + cursor, items[i].message.data, items[i].message.len);
     }
     cursor += items[i].message.len;
   }
@@ -415,20 +499,22 @@ extern "C" int32_t cubbs_bbs_gpu_messages_to_scalar_batch_v2(
     contiguous_output =
         items[i].scalar_out.data == direct_output + (i * 32u);
   }
-  auto &staged_scalars = host_workspace.scalars;
-  uint8_t *scalar_output =
-      contiguous_output ? direct_output : staged_scalars.data();
+  // Always D2H into pinned host_scalars for true async DMA, then copy out.
+  uint8_t *staged_scalars = workspace.host_scalars;
   const int32_t status = cubbs_bbs_gpu_hash_to_scalar_sha256_batch_for_test_v2(
-      abi_version, packed.data(), offsets.data(), lengths.data(), item_count, first_dst.data,
-      first_dst.len, scalar_output);
+      abi_version, packed, offsets, lengths, item_count, first_dst.data,
+      first_dst.len, staged_scalars);
   if (status != CUBBS_BBS_GPU_SUCCESS) {
     return status;
   }
 
+  if (contiguous_output) {
+    std::memcpy(direct_output, staged_scalars, item_count * 32u);
+  }
   for (size_t i = 0; i < item_count; ++i) {
     if (!contiguous_output) {
       std::memcpy(items[i].scalar_out.data,
-                  staged_scalars.data() + (i * 32u), 32u);
+                  staged_scalars + (i * 32u), 32u);
     }
     items[i].scalar_out.len = 32u;
     results[i].code = CUBBS_BBS_GPU_SUCCESS;
@@ -598,14 +684,20 @@ extern "C" int32_t cubbs_bbs_gpu_sign_e_from_resident_scalars_batch_v2(
     status = cudaMalloc(&workspace.dst, required_dst);
     if (status == cudaSuccess) workspace.dst_capacity = required_dst;
   }
-
-  std::vector<uint8_t> raw_messages;
-  std::vector<size_t> raw_offsets;
-  std::vector<size_t> raw_lengths;
+  if (status == cudaSuccess) {
+    status = workspace.ensure_host_sign(context_bytes, item_count);
+  }
   if (status == cudaSuccess && raw_pipeline) {
-    raw_messages.resize(total_raw_message_bytes);
-    raw_offsets.resize(total_scalar_count);
-    raw_lengths.resize(total_scalar_count);
+    status = workspace.ensure_host_messages(total_raw_message_bytes);
+    if (status == cudaSuccess) {
+      status = workspace.ensure_host_items(total_scalar_count);
+    }
+  }
+
+  if (status == cudaSuccess && raw_pipeline) {
+    uint8_t *raw_messages = workspace.host_messages;
+    size_t *raw_offsets = workspace.host_offsets;
+    size_t *raw_lengths = workspace.host_lengths;
     size_t message_index = 0u;
     size_t cursor = 0u;
     for (size_t item = 0u; item < item_count; ++item) {
@@ -615,7 +707,7 @@ extern "C" int32_t cubbs_bbs_gpu_sign_e_from_resident_scalars_batch_v2(
         raw_offsets[message_index] = cursor;
         raw_lengths[message_index] = slice.len;
         if (slice.len > 0u) {
-          std::memcpy(raw_messages.data() + cursor, slice.data, slice.len);
+          std::memcpy(raw_messages + cursor, slice.data, slice.len);
         }
         cursor += slice.len;
         ++message_index;
@@ -623,18 +715,18 @@ extern "C" int32_t cubbs_bbs_gpu_sign_e_from_resident_scalars_batch_v2(
     }
     if (total_raw_message_bytes > 0u) {
       status = cudaMemcpyAsync(
-          workspace.messages, raw_messages.data(), total_raw_message_bytes,
+          workspace.messages, raw_messages, total_raw_message_bytes,
           cudaMemcpyHostToDevice, workspace.stream);
     }
     if (status == cudaSuccess) {
       status = cudaMemcpyAsync(
-          workspace.offsets, raw_offsets.data(),
+          workspace.offsets, raw_offsets,
           total_scalar_count * sizeof(size_t), cudaMemcpyHostToDevice,
           workspace.stream);
     }
     if (status == cudaSuccess) {
       status = cudaMemcpyAsync(
-          workspace.lengths, raw_lengths.data(),
+          workspace.lengths, raw_lengths,
           total_scalar_count * sizeof(size_t), cudaMemcpyHostToDevice,
           workspace.stream);
     }
@@ -652,8 +744,9 @@ extern "C" int32_t cubbs_bbs_gpu_sign_e_from_resident_scalars_batch_v2(
   }
 
   if (status == cudaSuccess) {
+    std::memcpy(workspace.host_sign_contexts, contexts.data(), context_bytes);
     status = cudaMemcpyAsync(
-        workspace.sign_contexts, contexts.data(), context_bytes,
+        workspace.sign_contexts, workspace.host_sign_contexts, context_bytes,
         cudaMemcpyHostToDevice, workspace.stream);
   }
   if (status == cudaSuccess && e_dst.len > 0u) {
@@ -677,19 +770,18 @@ extern "C" int32_t cubbs_bbs_gpu_sign_e_from_resident_scalars_batch_v2(
         workspace.stream);
   }
 
-  std::vector<uint8_t> staged_message_scalars(
-      raw_pipeline ? total_scalar_count * 32u : 0u);
-  std::vector<uint8_t> staged_e_scalars(item_count * 32u);
+  uint8_t *staged_message_scalars = workspace.host_scalars;
+  uint8_t *staged_e_scalars = workspace.host_sign_e_scalars;
   if (status == cudaSuccess && raw_pipeline) {
     status = cudaMemcpyAsync(
-        staged_message_scalars.data(), workspace.scalars,
-        staged_message_scalars.size(), cudaMemcpyDeviceToHost,
+        staged_message_scalars, workspace.scalars,
+        total_scalar_count * 32u, cudaMemcpyDeviceToHost,
         workspace.stream);
   }
   if (status == cudaSuccess) {
     status = cudaMemcpyAsync(
-        staged_e_scalars.data(), workspace.sign_e_scalars,
-        staged_e_scalars.size(), cudaMemcpyDeviceToHost, workspace.stream);
+        staged_e_scalars, workspace.sign_e_scalars,
+        item_count * 32u, cudaMemcpyDeviceToHost, workspace.stream);
   }
   if (status == cudaSuccess) status = cudaStreamSynchronize(workspace.stream);
   if (status != cudaSuccess) {
@@ -703,11 +795,11 @@ extern "C" int32_t cubbs_bbs_gpu_sign_e_from_resident_scalars_batch_v2(
       const size_t begin = items[item].message_scalar_offset * 32u;
       const size_t bytes = items[item].message_count * 32u;
       std::memcpy(items[item].message_scalars_out.data,
-                  staged_message_scalars.data() + begin, bytes);
+                  staged_message_scalars + begin, bytes);
       items[item].message_scalars_out.len = bytes;
     }
     std::memcpy(items[item].scalar_out.data,
-                staged_e_scalars.data() + item * 32u, 32u);
+                staged_e_scalars + item * 32u, 32u);
     items[item].scalar_out.len = 32u;
     results[item].code = CUBBS_BBS_GPU_SUCCESS;
     results[item].value = 0u;
@@ -717,6 +809,7 @@ extern "C" int32_t cubbs_bbs_gpu_sign_e_from_resident_scalars_batch_v2(
 }
 
 static bool cuda_canary_ok() {
+  cubbs_bbs_ensure_cuda_device_schedule();
   int device_count = 0;
   if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
     return false;
@@ -1222,4 +1315,50 @@ extern "C" int32_t cubbs_bbs_gpu_proof_gen_t2_prepare_batch_v2(
     }
   }
   return cubbs_bbs_cuda_proof_gen_t2_prepare(items, item_count, results);
+}
+
+extern "C" int32_t cubbs_bbs_gpu_sign_fused_common_batch_v2(
+    uint32_t abi_version, const CuBbsBbsGpuSignFusedCommonBatchItem *item,
+    CuBbsBbsGpuResult *results) {
+  if (!abi_ok(abi_version) || item == nullptr ||
+      (item->item_count > 0u && results == nullptr)) {
+    return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
+  }
+  return cubbs_bbs_cuda_sign_fused_common_batch(item, results);
+}
+
+extern "C" int32_t cubbs_bbs_gpu_verify_pre_b_aggregate_fused_v2(
+    uint32_t abi_version, const CuBbsBbsGpuVerifyPreBAggregateFusedItem *item,
+    CuBbsBbsGpuResult *result) {
+  if (!abi_ok(abi_version) || item == nullptr || result == nullptr) {
+    return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
+  }
+  return cubbs_bbs_cuda_verify_pre_b_aggregate_fused(item, result);
+}
+
+extern "C" int32_t cubbs_bbs_gpu_pipeline_pinned_scratch_v2(
+    uint32_t abi_version, size_t msg_bytes, size_t msg_count,
+    uint8_t **messages_out, uint64_t **offsets_out, uint64_t **lengths_out) {
+  if (!abi_ok(abi_version)) return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
+  return cubbs_bbs_cuda_pipeline_pinned_scratch(
+      msg_bytes, msg_count, messages_out, offsets_out, lengths_out);
+}
+
+extern "C" int32_t cubbs_bbs_gpu_proof_gen_fused_common_batch_v2(
+    uint32_t abi_version, const CuBbsBbsGpuProofGenFusedCommonBatchItem *item,
+    CuBbsBbsGpuResult *results) {
+  if (!abi_ok(abi_version) || item == nullptr ||
+      (item->item_count > 0u && results == nullptr)) {
+    return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
+  }
+  return cubbs_bbs_cuda_proof_gen_fused_common_batch(item, results);
+}
+
+extern "C" int32_t cubbs_bbs_gpu_proof_verify_fused_common_batch_v2(
+    uint32_t abi_version, const CuBbsBbsGpuProofVerifyFusedCommonBatchItem *item,
+    CuBbsBbsGpuResult *result) {
+  if (!abi_ok(abi_version) || item == nullptr || result == nullptr) {
+    return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
+  }
+  return cubbs_bbs_cuda_proof_verify_fused_common_batch(item, result);
 }

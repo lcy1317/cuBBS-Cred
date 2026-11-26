@@ -11,10 +11,11 @@ static int32_t compute_g1_msm_fused_common_points_with_cuda(
   if (output_count == 0u) {
     return CUBBS_BBS_GPU_SUCCESS;
   }
+  cubbs_bbs_ensure_cuda_device_schedule();
 
   std::shared_ptr<CuBbsFusedCommonPointsCache> cached;
   const bool affine_common =
-      !large_window4 && term_count >= 18u && output_count > 512u &&
+      !large_window4 && term_count >= 18u && output_count >= 16u &&
       bbs_homogeneous_affine_comb_enabled();
   int32_t status = get_fused_common_points_cache(
       points, term_count, &cached, large_window4, affine_common, 0u,
@@ -242,8 +243,11 @@ static int32_t compute_g1_msm_fused_common_points_with_cuda(
         device_scalars + scalar_bytes, device_scalar_invalid, stream);
   }
   uint32_t host_scalar_invalid = 0u;
-  const bool eager_scalar_validation =
-      gpu_packed_scalar_decode && has_device_row_scale;
+  // Never insert a mid-stream synchronize before launching the MSM: invalid
+  // scalars are zeroed by cubbs_bbs_decode_packed_scalar_rows_be_kernel so
+  // arithmetic remains well-defined, and host_scalar_invalid is read back at
+  // the end of the first chunk's synchronization boundary.
+  const bool eager_scalar_validation = false;
   if (cuda_status == cudaSuccess && eager_scalar_validation) {
     cuda_status = cudaMemcpyAsync(
         &host_scalar_invalid, device_scalar_invalid,
@@ -345,6 +349,34 @@ static int32_t compute_g1_msm_fused_common_points_with_cuda(
       }
       return cudaGetLastError();
     };
+    if (cached->device_limlee_affines != nullptr) {
+      return add_variable_term(cubbs_bbs_launch_glv_limlee(
+          cached->device_limlee_affines, cached->device_limlee_offsets,
+          cached->device_limlee_c_total, device_scalars + scalar_offset,
+          term_count, n, cached->limlee_num_groups, cached->limlee_group_size,
+          cached->limlee_v_sub, stream, device_outputs + out_offset));
+    }
+    if (term_count >= 18u &&
+        cached->device_fixed_glv_affine_comb9 != nullptr) {
+      return add_variable_term(cubbs_bbs_launch_glv_affine_comb<9u>(
+          cached->device_fixed_glv_affine_comb9,
+          device_scalars + scalar_offset, term_count, n, stream,
+          device_outputs + out_offset));
+    }
+    if (term_count >= 18u &&
+        cached->device_fixed_glv_affine_comb10 != nullptr) {
+      return add_variable_term(cubbs_bbs_launch_glv_affine_comb<10u>(
+          cached->device_fixed_glv_affine_comb10,
+          device_scalars + scalar_offset, term_count, n, stream,
+          device_outputs + out_offset));
+    }
+    if (term_count >= 18u &&
+        cached->device_fixed_glv_affine_comb8 != nullptr) {
+      return add_variable_term(cubbs_bbs_launch_glv_affine_comb<8u>(
+          cached->device_fixed_glv_affine_comb8,
+          device_scalars + scalar_offset, term_count, n, stream,
+          device_outputs + out_offset));
+    }
     if (term_count >= 18u &&
         cached->device_fixed_affine_comb9 != nullptr) {
       return add_variable_term(cubbs_bbs_launch_affine_comb<9u>(
@@ -568,39 +600,45 @@ static int32_t compute_g1_msm_fused_common_points_with_cuda(
   };
 
   auto compress_range = [&](size_t row_begin, size_t row_end) {
-    const size_t worker_count = fused_compress_worker_count(row_end - row_begin);
-    if (worker_count <= 1u) {
-      for (size_t row = row_begin; row < row_end; ++row) {
-        const cubbs_sppark_point_t projective =
-            static_cast<cubbs_sppark_point_t>(host_outputs[row]);
-        const int32_t rs = cubbs_bbs_blst_compress_g1_projective(
-            &projective, point_outs[row].data);
+    const size_t count = row_end - row_begin;
+    if (count == 0u) return;
+    if (count >= 4u) {
+      thread_local std::vector<cubbs_sppark_point_t> projectives;
+      thread_local std::vector<const void *> projective_ptrs;
+      thread_local std::vector<uint8_t *> compressed_outs;
+      projectives.resize(count);
+      projective_ptrs.resize(count);
+      compressed_outs.resize(count);
+      for (size_t i = 0u; i < count; ++i) {
+        projectives[i] =
+            static_cast<cubbs_sppark_point_t>(host_outputs[row_begin + i]);
+        projective_ptrs[i] = &projectives[i];
+        compressed_outs[i] = point_outs[row_begin + i].data;
+      }
+      const int32_t rs = cubbs_bbs_blst_compress_g1_projective_batch(
+          projective_ptrs.data(), compressed_outs.data(), count);
+      for (size_t i = 0u; i < count; ++i) {
         if (rs == CUBBS_BBS_GPU_SUCCESS) {
-          set_result_route(results, row, CUBBS_BBS_GPU_SUCCESS, 48u,
+          set_result_route(results, row_begin + i, CUBBS_BBS_GPU_SUCCESS, 48u,
                            result_route);
         } else {
-          set_result(results, row, rs, 0);
+          set_result(results, row_begin + i, rs, 0);
         }
       }
       return;
     }
-    std::atomic<size_t> next_row{row_begin};
-    cubbs_run_host_tasks(worker_count, [&](size_t) {
-      while (true) {
-        const size_t row = next_row.fetch_add(1u);
-        if (row >= row_end) break;
-        const cubbs_sppark_point_t projective =
-            static_cast<cubbs_sppark_point_t>(host_outputs[row]);
-        const int32_t rs = cubbs_bbs_blst_compress_g1_projective(
-            &projective, point_outs[row].data);
-        if (rs == CUBBS_BBS_GPU_SUCCESS) {
-          set_result_route(results, row, CUBBS_BBS_GPU_SUCCESS, 48u,
-                           result_route);
-        } else {
-          set_result(results, row, rs, 0);
-        }
+    for (size_t row = row_begin; row < row_end; ++row) {
+      const cubbs_sppark_point_t projective =
+          static_cast<cubbs_sppark_point_t>(host_outputs[row]);
+      const int32_t rs = cubbs_bbs_blst_compress_g1_projective(
+          &projective, point_outs[row].data);
+      if (rs == CUBBS_BBS_GPU_SUCCESS) {
+        set_result_route(results, row, CUBBS_BBS_GPU_SUCCESS, 48u,
+                         result_route);
+      } else {
+        set_result(results, row, rs, 0);
       }
-    });
+    }
   };
 
   if (cuda_status == cudaSuccess) {

@@ -296,14 +296,14 @@ async fn run_worker<T, R>(
         let processor = Arc::clone(&processor);
         tokio::spawn(async move {
             let mut outputs = processor(inputs).await.into_iter();
+            drop(pipeline_slot);
+            drop(queue_slot);
             for response in responses {
                 let result = outputs.next().unwrap_or_else(|| {
                     Err("W3C batch processor returned fewer results than inputs".to_owned())
                 });
                 let _ = response.send(result);
             }
-            drop(pipeline_slot);
-            drop(queue_slot);
         });
     }
 

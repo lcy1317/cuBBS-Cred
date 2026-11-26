@@ -50,6 +50,26 @@ impl ProofResponseTemplate {
         response.extend_from_slice(b"\"}}");
         Ok(Bytes::from(response))
     }
+
+    /// Encode raw CBOR proof bytes directly as multibase base64url (`u...`) into
+    /// a single pre-sized response buffer without intermediate String allocations.
+    pub(super) fn finish_cbor_multibase_u(&self, cbor_bytes: &[u8]) -> Result<Bytes, String> {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let b64_len = base64::encoded_len(cbor_bytes.len(), false)
+            .ok_or_else(|| "proofValue base64 length overflow".to_owned())?;
+        let total = self.prefix.len() + 1 + b64_len + 3;
+        let mut response = vec![0u8; total];
+        let p = self.prefix.len();
+        response[..p].copy_from_slice(&self.prefix);
+        response[p] = b'u';
+        let written = URL_SAFE_NO_PAD
+            .encode_slice(cbor_bytes, &mut response[p + 1..p + 1 + b64_len])
+            .map_err(|e| e.to_string())?;
+        let end = p + 1 + written;
+        response[end..end + 3].copy_from_slice(b"\"}}");
+        response.truncate(end + 3);
+        Ok(Bytes::from(response))
+    }
 }
 
 #[cfg(test)]

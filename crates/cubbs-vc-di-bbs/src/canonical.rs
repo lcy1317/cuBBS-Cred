@@ -23,6 +23,9 @@ pub struct CanonicalizedNQuads {
 }
 
 pub fn canonicalize_nquads(input: &str) -> CanonicalizationResult<CanonicalizedNQuads> {
+    if let Some(fast) = try_fast_canonicalize_nquads_no_bnodes(input) {
+        return Ok(fast);
+    }
     let dataset = parse_nquads(input)?;
     let issued_identifiers =
         rdf_canon::issue(&dataset).map_err(|e| CanonicalizationError::RdfCanon(e.to_string()))?;
@@ -37,6 +40,175 @@ pub fn canonicalize_nquads(input: &str) -> CanonicalizationResult<CanonicalizedN
         lines,
         canonical_id_map,
     })
+}
+
+fn try_fast_canonicalize_nquads_no_bnodes(input: &str) -> Option<CanonicalizedNQuads> {
+    let has_bnode = input.contains("_:");
+    if has_bnode {
+        return try_fast_canonicalize_nquads_single_bnode0(input);
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for line in input.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        if !is_canonical_default_graph_nquad_line(line) {
+            return None;
+        }
+        let mut owned = String::with_capacity(line.len() + 1);
+        owned.push_str(line);
+        owned.push('\n');
+        lines.push(owned);
+    }
+    lines.sort_unstable();
+    lines.dedup();
+    let total_len: usize = lines.iter().map(String::len).sum();
+    let mut serialized = String::with_capacity(total_len);
+    for line in &lines {
+        serialized.push_str(line);
+    }
+    Some(CanonicalizedNQuads {
+        serialized,
+        lines,
+        canonical_id_map: BTreeMap::new(),
+    })
+}
+
+/// Fast path for datasets whose only blank node is `_:0` in subject position
+/// (the exact shape produced by W3C Data Integrity proof configurations).
+/// Under RDFC-1.0, a dataset with a single blank node `_:0` deterministically
+/// assigns `0 -> c14n0`.
+fn try_fast_canonicalize_nquads_single_bnode0(input: &str) -> Option<CanonicalizedNQuads> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut saw_bnode0 = false;
+    for line in input.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("_:0 ") else {
+            return None;
+        };
+        // Ensure no other blank nodes appear in predicate/object/graph positions.
+        if rest.contains("_:") {
+            return None;
+        }
+        // Validate predicate + object + " ." using a synthetic IRI subject.
+        if !is_canonical_default_graph_nquad_rest(rest) {
+            return None;
+        }
+        saw_bnode0 = true;
+        let mut owned = String::with_capacity(rest.len() + 9);
+        owned.push_str("_:c14n0 ");
+        owned.push_str(rest);
+        owned.push('\n');
+        lines.push(owned);
+    }
+    if !saw_bnode0 {
+        return None;
+    }
+    lines.sort_unstable();
+    lines.dedup();
+    let total_len: usize = lines.iter().map(String::len).sum();
+    let mut serialized = String::with_capacity(total_len);
+    for line in &lines {
+        serialized.push_str(line);
+    }
+    Some(CanonicalizedNQuads {
+        serialized,
+        lines,
+        canonical_id_map: BTreeMap::from([("0".to_owned(), "c14n0".to_owned())]),
+    })
+}
+
+fn is_simple_iri(iri: &str) -> bool {
+    !iri.is_empty()
+        && iri.bytes().all(|b| {
+            b > 0x20
+                && b != 0x7f
+                && !matches!(b, b'<' | b'>' | b'"' | b'{' | b'}' | b'|' | b'^' | b'`' | b'\\')
+        })
+}
+
+fn is_canonical_default_graph_nquad_line(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix('<') else {
+        return false;
+    };
+    let Some(subj_end) = rest.find('>') else {
+        return false;
+    };
+    if !is_simple_iri(&rest[..subj_end]) {
+        return false;
+    }
+    let Some(after_subj) = rest[subj_end + 1..].strip_prefix(' ') else {
+        return false;
+    };
+    is_canonical_default_graph_nquad_rest(after_subj)
+}
+
+fn is_canonical_default_graph_nquad_rest(after_subj: &str) -> bool {
+    let Some(body) = after_subj.strip_suffix(" .") else {
+        return false;
+    };
+    let Some(rest) = body.strip_prefix('<') else {
+        return false;
+    };
+    let Some(pred_end) = rest.find('>') else {
+        return false;
+    };
+    if !is_simple_iri(&rest[..pred_end]) {
+        return false;
+    }
+    let Some(obj) = rest[pred_end + 1..].strip_prefix(' ') else {
+        return false;
+    };
+    if let Some(iri) = obj.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
+        return is_simple_iri(iri);
+    }
+    let Some(lit) = obj.strip_prefix('"') else {
+        return false;
+    };
+    let bytes = lit.as_bytes();
+    let mut i = 0;
+    let mut close_quote = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b < 0x20 || b == 0x7f {
+            return false;
+        }
+        if b == b'\\' {
+            i += 1;
+            if i >= bytes.len() {
+                return false;
+            }
+            if !matches!(bytes[i], b'"' | b'\\' | b'n' | b'r' | b't' | b'b' | b'f') {
+                return false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            close_quote = Some(i);
+            break;
+        }
+        i += 1;
+    }
+    let Some(end_idx) = close_quote else {
+        return false;
+    };
+    let suffix = &lit[end_idx + 1..];
+    if suffix.is_empty() {
+        return true;
+    }
+    if let Some(dt) = suffix.strip_prefix("^^<").and_then(|s| s.strip_suffix('>')) {
+        return is_simple_iri(dt) && dt != "http://www.w3.org/2001/XMLSchema#string";
+    }
+    if let Some(lang) = suffix.strip_prefix('@') {
+        return !lang.is_empty()
+            && lang
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    }
+    false
 }
 
 pub fn split_canonical_nquads(serialized: &str) -> Vec<String> {

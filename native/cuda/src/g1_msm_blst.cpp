@@ -1639,3 +1639,19 @@ extern "C" int32_t cubbs_bbs_gpu_pairing_eq_aggregate_v2(
   result->value = 1u;
   return CUBBS_BBS_GPU_SUCCESS;
 }
+
+int32_t cubbs_bbs_blst_get_prepared_g2_lines(
+    CuBbsBbsGpuByteSlice g2_compressed, void *lines_out_68x288) {
+  if (g2_compressed.len != 96u || g2_compressed.data == nullptr ||
+      lines_out_68x288 == nullptr) {
+    return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
+  }
+  std::shared_ptr<BlstPreparedG2Lines> prepared;
+  const int32_t status = get_prepared_g2_lines(g2_compressed, &prepared);
+  if (status != CUBBS_BBS_GPU_SUCCESS || prepared == nullptr) {
+    return status == CUBBS_BBS_GPU_SUCCESS ? CUBBS_BBS_GPU_ERR_INTERNAL : status;
+  }
+  std::memcpy(lines_out_68x288, prepared->lines.data(),
+              sizeof(prepared->lines));
+  return CUBBS_BBS_GPU_SUCCESS;
+}

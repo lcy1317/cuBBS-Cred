@@ -27,6 +27,14 @@ pub(super) struct GpuKernelLibrary {
     pub(super) pairing_eq_batch: Option<gpu_abi::CuBbsBbsGpuPairingEqBatchV2>,
     pub(super) pairing_eq_aggregate: Option<gpu_abi::CuBbsBbsGpuPairingEqAggregateV2>,
     pub(super) proof_gen_t2_prepare_batch: Option<gpu_abi::CuBbsBbsGpuProofGenT2PrepareBatchV2>,
+    pub(super) sign_fused_common_batch: Option<gpu_abi::CuBbsBbsGpuSignFusedCommonBatchV2>,
+    pub(super) verify_pre_b_aggregate_fused:
+        Option<gpu_abi::CuBbsBbsGpuVerifyPreBAggregateFusedV2>,
+    pub(super) pipeline_pinned_scratch: Option<gpu_abi::CuBbsBbsGpuPipelinePinnedScratchV2>,
+    pub(super) proof_gen_fused_common_batch:
+        Option<gpu_abi::CuBbsBbsGpuProofGenFusedCommonBatchV2>,
+    pub(super) proof_verify_fused_common_batch:
+        Option<gpu_abi::CuBbsBbsGpuProofVerifyFusedCommonBatchV2>,
     pub(super) backend_kind: u32,
     pub(super) hardware_acceleration: bool,
 }
@@ -426,6 +434,46 @@ impl GpuKernelLibrary {
                 .ok()
                 .map(|symbol| *symbol)
         };
+        let sign_fused_common_batch = unsafe {
+            library
+                .get::<gpu_abi::CuBbsBbsGpuSignFusedCommonBatchV2>(
+                    gpu_abi::CUBBS_BBS_GPU_SIGN_FUSED_COMMON_BATCH_SYMBOL,
+                )
+                .ok()
+                .map(|symbol| *symbol)
+        };
+        let verify_pre_b_aggregate_fused = unsafe {
+            library
+                .get::<gpu_abi::CuBbsBbsGpuVerifyPreBAggregateFusedV2>(
+                    gpu_abi::CUBBS_BBS_GPU_VERIFY_PRE_B_AGGREGATE_FUSED_SYMBOL,
+                )
+                .ok()
+                .map(|symbol| *symbol)
+        };
+        let pipeline_pinned_scratch = unsafe {
+            library
+                .get::<gpu_abi::CuBbsBbsGpuPipelinePinnedScratchV2>(
+                    gpu_abi::CUBBS_BBS_GPU_PIPELINE_PINNED_SCRATCH_SYMBOL,
+                )
+                .ok()
+                .map(|symbol| *symbol)
+        };
+        let proof_gen_fused_common_batch = unsafe {
+            library
+                .get::<gpu_abi::CuBbsBbsGpuProofGenFusedCommonBatchV2>(
+                    gpu_abi::CUBBS_BBS_GPU_PROOF_GEN_FUSED_COMMON_BATCH_SYMBOL,
+                )
+                .ok()
+                .map(|symbol| *symbol)
+        };
+        let proof_verify_fused_common_batch = unsafe {
+            library
+                .get::<gpu_abi::CuBbsBbsGpuProofVerifyFusedCommonBatchV2>(
+                    gpu_abi::CUBBS_BBS_GPU_PROOF_VERIFY_FUSED_COMMON_BATCH_SYMBOL,
+                )
+                .ok()
+                .map(|symbol| *symbol)
+        };
         let backend_info = unsafe {
             match library.get::<gpu_abi::CuBbsBbsGpuBackendInfoV2>(
                 gpu_abi::CUBBS_BBS_GPU_BACKEND_INFO_SYMBOL,
@@ -471,6 +519,11 @@ impl GpuKernelLibrary {
             pairing_eq_batch,
             pairing_eq_aggregate,
             proof_gen_t2_prepare_batch,
+            sign_fused_common_batch,
+            verify_pre_b_aggregate_fused,
+            pipeline_pinned_scratch,
+            proof_gen_fused_common_batch,
+            proof_verify_fused_common_batch,
             backend_kind: backend_info.backend_kind,
             hardware_acceleration: backend_info.hardware_acceleration != 0,
         })
@@ -542,6 +595,447 @@ impl GpuKernelLibrary {
 
     pub(super) fn can_proof_gen_t2_prepare(&self) -> bool {
         self.proof_gen_t2_prepare_batch.is_some()
+    }
+
+    pub(super) fn can_sign_fused_common_batch(&self) -> bool {
+        self.sign_fused_common_batch.is_some()
+            && !std::env::var("CUBBS_BBS_GPU_SIGN_FUSED_RESIDENT")
+                .map(|v| matches!(v.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
+                .unwrap_or(false)
+    }
+
+    pub(super) fn can_verify_pre_b_aggregate_fused(&self) -> bool {
+        self.verify_pre_b_aggregate_fused.is_some()
+            && !std::env::var("CUBBS_BBS_GPU_VERIFY_FUSED_RESIDENT")
+                .map(|v| matches!(v.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
+                .unwrap_or(false)
+    }
+
+    pub(super) fn can_proof_gen_fused_common_batch(&self) -> bool {
+        self.proof_gen_fused_common_batch.is_some()
+            && !std::env::var("CUBBS_BBS_GPU_PROOF_GEN_FUSED_RESIDENT")
+                .map(|v| matches!(v.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
+                .unwrap_or(false)
+    }
+
+    pub(super) fn can_proof_verify_fused_common_batch(&self) -> bool {
+        self.proof_verify_fused_common_batch.is_some()
+            && !std::env::var("CUBBS_BBS_GPU_PROOF_VERIFY_FUSED_RESIDENT")
+                .map(|v| matches!(v.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
+                .unwrap_or(false)
+    }
+
+    /// Returns thread-local CUDA pinned host slices `(messages, offsets, lengths)`
+    /// owned by the native pipeline workspace for zero-copy single-pass packing.
+    pub(super) unsafe fn pipeline_pinned_scratch_slices(
+        &self,
+        msg_bytes: usize,
+        msg_count: usize,
+    ) -> Option<(&mut [u8], &mut [u64], &mut [u64])> {
+        let call = self.pipeline_pinned_scratch?;
+        let mut msg_ptr: *mut u8 = std::ptr::null_mut();
+        let mut off_ptr: *mut u64 = std::ptr::null_mut();
+        let mut len_ptr: *mut u64 = std::ptr::null_mut();
+        let status = call(
+            gpu_abi::CUBBS_BBS_GPU_ABI_VERSION,
+            msg_bytes,
+            msg_count,
+            &mut msg_ptr,
+            &mut off_ptr,
+            &mut len_ptr,
+        );
+        if status != gpu_abi::CUBBS_BBS_GPU_SUCCESS {
+            return None;
+        }
+        let msgs = if msg_bytes == 0 {
+            &mut [][..]
+        } else {
+            if msg_ptr.is_null() {
+                return None;
+            }
+            std::slice::from_raw_parts_mut(msg_ptr, msg_bytes)
+        };
+        let offs = if msg_count == 0 {
+            &mut [][..]
+        } else {
+            if off_ptr.is_null() || len_ptr.is_null() {
+                return None;
+            }
+            std::slice::from_raw_parts_mut(off_ptr, msg_count)
+        };
+        let lens = if msg_count == 0 {
+            &mut [][..]
+        } else {
+            std::slice::from_raw_parts_mut(len_ptr, msg_count)
+        };
+        Some((msgs, offs, lens))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn sign_fused_common_batch(
+        &self,
+        common_points: &[Vec<u8>],
+        item_count: usize,
+        secret_keys_be: &[u8],
+        secret_key_stride: usize,
+        domains_be: &[u8],
+        domain_stride: usize,
+        packed_messages: &[u8],
+        message_offsets: &[u64],
+        message_lengths: &[u64],
+    ) -> Result<Vec<u8>> {
+        let call = self.sign_fused_common_batch.ok_or_else(|| {
+            Error::Gpu("GPU fused resident Sign symbol is unavailable".to_owned())
+        })?;
+        let point_slices = common_points
+            .iter()
+            .map(|p| byte_slice(p))
+            .collect::<Vec<_>>();
+        let message_dst = bbs_message_scalar_dst();
+        let e_dst = bbs_signature_e_dst();
+        let mut signatures_out = vec![0u8; item_count * SIGNATURE_LEN];
+        let mut gpu_results = empty_gpu_results(item_count);
+        let item = gpu_abi::CuBbsBbsGpuSignFusedCommonBatchItem {
+            common_points: point_slices.as_ptr(),
+            common_term_count: point_slices.len(),
+            item_count,
+            secret_keys_be: secret_keys_be.as_ptr(),
+            secret_key_stride,
+            domains_be: domains_be.as_ptr(),
+            domain_stride,
+            packed_messages: if packed_messages.is_empty() {
+                std::ptr::null()
+            } else {
+                packed_messages.as_ptr()
+            },
+            packed_messages_len: packed_messages.len(),
+            message_offsets: if message_offsets.is_empty() {
+                std::ptr::null()
+            } else {
+                message_offsets.as_ptr()
+            },
+            message_lengths: if message_lengths.is_empty() {
+                std::ptr::null()
+            } else {
+                message_lengths.as_ptr()
+            },
+            message_dst: byte_slice(&message_dst),
+            e_dst: byte_slice(&e_dst),
+            signatures_out: signatures_out.as_mut_ptr(),
+        };
+        let status = unsafe {
+            call(
+                gpu_abi::CUBBS_BBS_GPU_ABI_VERSION,
+                &item,
+                gpu_results.as_mut_ptr(),
+            )
+        };
+        if status != gpu_abi::CUBBS_BBS_GPU_SUCCESS {
+            return Err(Error::Gpu(gpu_status_message(status)));
+        }
+        if gpu_results.iter().any(|r| {
+            r.code != gpu_abi::CUBBS_BBS_GPU_SUCCESS || r.bytes_written != SIGNATURE_LEN
+        }) {
+            return Err(Error::Gpu(
+                "GPU fused resident Sign returned per-item failure".to_owned(),
+            ));
+        }
+        Ok(signatures_out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn verify_pre_b_aggregate_fused(
+        &self,
+        common_points: &[Vec<u8>],
+        item_count: usize,
+        signatures: &[u8],
+        coefficients_le: &[u8],
+        domains_be: &[u8],
+        domain_stride: usize,
+        item_message_counts: Option<&[u32]>,
+        item_message_starts: Option<&[u64]>,
+        packed_messages: &[u8],
+        message_offsets: &[u64],
+        message_lengths: &[u64],
+        public_key: &[u8],
+        g2_generator: &[u8],
+    ) -> Result<bool> {
+        let call = self.verify_pre_b_aggregate_fused.ok_or_else(|| {
+            Error::Gpu("GPU fused resident Verify symbol is unavailable".to_owned())
+        })?;
+        let point_slices = common_points
+            .iter()
+            .map(|p| byte_slice(p))
+            .collect::<Vec<_>>();
+        let message_dst = bbs_message_scalar_dst();
+        let mut gpu_result = gpu_abi::CuBbsBbsGpuResult {
+            code: gpu_abi::CUBBS_BBS_GPU_ERR_INTERNAL,
+            value: 0,
+            bytes_written: 0,
+        };
+        let item = gpu_abi::CuBbsBbsGpuVerifyPreBAggregateFusedItem {
+            common_points: point_slices.as_ptr(),
+            common_term_count: point_slices.len(),
+            item_count,
+            signatures: signatures.as_ptr(),
+            coefficients_le: coefficients_le.as_ptr(),
+            domains_be: domains_be.as_ptr(),
+            domain_stride,
+            item_message_counts: item_message_counts
+                .map(|s| s.as_ptr())
+                .unwrap_or(std::ptr::null()),
+            item_message_starts: item_message_starts
+                .map(|s| s.as_ptr())
+                .unwrap_or(std::ptr::null()),
+            packed_messages: if packed_messages.is_empty() {
+                std::ptr::null()
+            } else {
+                packed_messages.as_ptr()
+            },
+            packed_messages_len: packed_messages.len(),
+            message_offsets: if message_offsets.is_empty() {
+                std::ptr::null()
+            } else {
+                message_offsets.as_ptr()
+            },
+            message_lengths: if message_lengths.is_empty() {
+                std::ptr::null()
+            } else {
+                message_lengths.as_ptr()
+            },
+            total_message_count: message_offsets.len(),
+            message_dst: byte_slice(&message_dst),
+            public_key: byte_slice(public_key),
+            g2_generator: byte_slice(g2_generator),
+        };
+        let status = unsafe {
+            call(
+                gpu_abi::CUBBS_BBS_GPU_ABI_VERSION,
+                &item,
+                &mut gpu_result,
+            )
+        };
+        if status != gpu_abi::CUBBS_BBS_GPU_SUCCESS
+            || gpu_result.code != gpu_abi::CUBBS_BBS_GPU_SUCCESS
+        {
+            return Err(Error::Gpu(gpu_status_message(if status != 0 {
+                status
+            } else {
+                gpu_result.code
+            })));
+        }
+        Ok(gpu_result.value != 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn proof_gen_fused_common_batch(
+        &self,
+        common_points: &[Vec<u8>],
+        undisclosed_points: &[Vec<u8>],
+        disclosed_indexes: &[u32],
+        undisclosed_indexes: &[u32],
+        item_count: usize,
+        signatures: &[u8],
+        domains_be: &[u8],
+        domain_stride: usize,
+        packed_messages: &[u8],
+        message_offsets: &[u64],
+        message_lengths: &[u64],
+        packed_ph: &[u8],
+        ph_offsets: &[u64],
+        ph_lengths: &[u64],
+        csprng_seed: &[u8; 32],
+    ) -> Result<(Vec<u8>, usize)> {
+        let call = self.proof_gen_fused_common_batch.ok_or_else(|| {
+            Error::Gpu("GPU fused ProofGen symbol is unavailable".to_owned())
+        })?;
+        let point_slices = common_points
+            .iter()
+            .map(|p| byte_slice(p))
+            .collect::<Vec<_>>();
+        let undisc_point_slices = undisclosed_points
+            .iter()
+            .map(|p| byte_slice(p))
+            .collect::<Vec<_>>();
+        let proof_stride = 272usize + (undisclosed_indexes.len() * 32usize);
+        let mut proofs_out = vec![0u8; item_count * proof_stride];
+        let mut gpu_results = empty_gpu_results(item_count);
+        let message_dst = bbs_message_scalar_dst();
+        let challenge_dst = bbs_signature_e_dst();
+        let item = gpu_abi::CuBbsBbsGpuProofGenFusedCommonBatchItem {
+            common_points: point_slices.as_ptr(),
+            common_term_count: point_slices.len(),
+            undisclosed_points: if undisc_point_slices.is_empty() {
+                std::ptr::null()
+            } else {
+                undisc_point_slices.as_ptr()
+            },
+            disclosed_indexes: if disclosed_indexes.is_empty() {
+                std::ptr::null()
+            } else {
+                disclosed_indexes.as_ptr()
+            },
+            disclosed_count: disclosed_indexes.len(),
+            undisclosed_indexes: if undisclosed_indexes.is_empty() {
+                std::ptr::null()
+            } else {
+                undisclosed_indexes.as_ptr()
+            },
+            undisclosed_count: undisclosed_indexes.len(),
+            item_count,
+            signatures: signatures.as_ptr(),
+            domains_be: domains_be.as_ptr(),
+            domain_stride,
+            packed_messages: if packed_messages.is_empty() {
+                std::ptr::null()
+            } else {
+                packed_messages.as_ptr()
+            },
+            packed_messages_len: packed_messages.len(),
+            message_offsets: if message_offsets.is_empty() {
+                std::ptr::null()
+            } else {
+                message_offsets.as_ptr()
+            },
+            message_lengths: if message_lengths.is_empty() {
+                std::ptr::null()
+            } else {
+                message_lengths.as_ptr()
+            },
+            packed_ph: if packed_ph.is_empty() {
+                std::ptr::null()
+            } else {
+                packed_ph.as_ptr()
+            },
+            packed_ph_len: packed_ph.len(),
+            ph_offsets: ph_offsets.as_ptr(),
+            ph_lengths: ph_lengths.as_ptr(),
+            message_dst: byte_slice(&message_dst),
+            challenge_dst: byte_slice(&challenge_dst),
+            csprng_seed: csprng_seed.as_ptr(),
+            proofs_out: proofs_out.as_mut_ptr(),
+            proof_stride,
+        };
+        let status = unsafe {
+            call(
+                gpu_abi::CUBBS_BBS_GPU_ABI_VERSION,
+                &item,
+                gpu_results.as_mut_ptr(),
+            )
+        };
+        if status != gpu_abi::CUBBS_BBS_GPU_SUCCESS {
+            return Err(Error::Gpu(gpu_status_message(status)));
+        }
+        if gpu_results.iter().any(|r| {
+            r.code != gpu_abi::CUBBS_BBS_GPU_SUCCESS || r.bytes_written != proof_stride
+        }) {
+            return Err(Error::Gpu("GPU fused ProofGen returned an item error".to_owned()));
+        }
+        Ok((proofs_out, proof_stride))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn proof_verify_fused_common_batch(
+        &self,
+        common_points: &[Vec<u8>],
+        disclosed_indexes: &[u32],
+        undisclosed_indexes: &[u32],
+        item_count: usize,
+        proofs: &[u8],
+        proof_stride: usize,
+        coefficients_le: &[u8],
+        domains_be: &[u8],
+        domain_stride: usize,
+        packed_disclosed_messages: &[u8],
+        message_offsets: &[u64],
+        message_lengths: &[u64],
+        packed_ph: &[u8],
+        ph_offsets: &[u64],
+        ph_lengths: &[u64],
+        public_key: &[u8],
+        g2_generator: &[u8],
+    ) -> Result<bool> {
+        let call = self.proof_verify_fused_common_batch.ok_or_else(|| {
+            Error::Gpu("GPU fused ProofVerify symbol is unavailable".to_owned())
+        })?;
+        let point_slices = common_points
+            .iter()
+            .map(|p| byte_slice(p))
+            .collect::<Vec<_>>();
+        let mut gpu_result = gpu_abi::CuBbsBbsGpuResult {
+            code: gpu_abi::CUBBS_BBS_GPU_SUCCESS,
+            value: 0,
+            bytes_written: 0,
+        };
+        let message_dst = bbs_message_scalar_dst();
+        let challenge_dst = bbs_signature_e_dst();
+        let item = gpu_abi::CuBbsBbsGpuProofVerifyFusedCommonBatchItem {
+            common_points: point_slices.as_ptr(),
+            common_term_count: point_slices.len(),
+            disclosed_indexes: if disclosed_indexes.is_empty() {
+                std::ptr::null()
+            } else {
+                disclosed_indexes.as_ptr()
+            },
+            disclosed_count: disclosed_indexes.len(),
+            undisclosed_indexes: if undisclosed_indexes.is_empty() {
+                std::ptr::null()
+            } else {
+                undisclosed_indexes.as_ptr()
+            },
+            undisclosed_count: undisclosed_indexes.len(),
+            item_count,
+            proofs: proofs.as_ptr(),
+            proof_stride,
+            coefficients_le: coefficients_le.as_ptr(),
+            domains_be: domains_be.as_ptr(),
+            domain_stride,
+            packed_disclosed_messages: if packed_disclosed_messages.is_empty() {
+                std::ptr::null()
+            } else {
+                packed_disclosed_messages.as_ptr()
+            },
+            packed_disclosed_messages_len: packed_disclosed_messages.len(),
+            message_offsets: if message_offsets.is_empty() {
+                std::ptr::null()
+            } else {
+                message_offsets.as_ptr()
+            },
+            message_lengths: if message_lengths.is_empty() {
+                std::ptr::null()
+            } else {
+                message_lengths.as_ptr()
+            },
+            packed_ph: if packed_ph.is_empty() {
+                std::ptr::null()
+            } else {
+                packed_ph.as_ptr()
+            },
+            packed_ph_len: packed_ph.len(),
+            ph_offsets: ph_offsets.as_ptr(),
+            ph_lengths: ph_lengths.as_ptr(),
+            message_dst: byte_slice(&message_dst),
+            challenge_dst: byte_slice(&challenge_dst),
+            public_key: byte_slice(public_key),
+            g2_generator: byte_slice(g2_generator),
+        };
+        let status = unsafe {
+            call(
+                gpu_abi::CUBBS_BBS_GPU_ABI_VERSION,
+                &item,
+                &mut gpu_result,
+            )
+        };
+        if status != gpu_abi::CUBBS_BBS_GPU_SUCCESS
+            || gpu_result.code != gpu_abi::CUBBS_BBS_GPU_SUCCESS
+        {
+            return Err(Error::Gpu(gpu_status_message(if status != 0 {
+                status
+            } else {
+                gpu_result.code
+            })));
+        }
+        Ok(gpu_result.value != 0)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]

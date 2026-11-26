@@ -1,6 +1,32 @@
 //! Bounded HTTP prepared-template and verification-result caches.
 
+use std::any::Any;
+use std::cell::RefCell;
+use std::sync::atomic::AtomicUsize;
+
 use super::*;
+
+#[repr(align(64))]
+#[derive(Debug, Default)]
+struct PaddedAtomicU64(AtomicU64);
+
+const COUNTER_SLOTS: usize = 32;
+static NEXT_RAW_CACHE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_THREAD_SLOT: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static THREAD_COUNTER_SLOT: usize =
+        NEXT_THREAD_SLOT.fetch_add(1, Ordering::Relaxed) % COUNTER_SLOTS;
+    static L1_RAW_TEMPLATE_SLOTS: RefCell<[(u64, u64, Bytes, Arc<dyn Any + Send + Sync>); 4]> =
+        RefCell::new(std::array::from_fn(|_| {
+            (0, 0, Bytes::new(), Arc::new(()) as Arc<dyn Any + Send + Sync>)
+        }));
+}
+
+#[inline]
+fn thread_counter_slot() -> usize {
+    THREAD_COUNTER_SLOT.with(|slot| *slot)
+}
 
 #[derive(Debug)]
 pub(super) struct RawTemplateCacheState<V> {
@@ -21,10 +47,12 @@ impl<V> Default for RawTemplateCacheState<V> {
 
 #[derive(Debug)]
 pub(super) struct RawTemplateCache<V> {
+    id: u64,
+    generation: AtomicU64,
     pub(super) capacity: usize,
     pub(super) state: RwLock<RawTemplateCacheState<V>>,
-    pub(super) hits: AtomicU64,
-    pub(super) misses: AtomicU64,
+    hits: Box<[PaddedAtomicU64; COUNTER_SLOTS]>,
+    misses: Box<[PaddedAtomicU64; COUNTER_SLOTS]>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -36,24 +64,45 @@ pub(super) struct RawTemplateCacheSnapshot {
     pub(super) misses: u64,
 }
 
-impl<V> RawTemplateCache<V> {
+impl<V: Send + Sync + 'static> RawTemplateCache<V> {
     pub(super) fn from_env() -> Self {
         let capacity = env::var("CUBBS_W3C_PREPARED_CACHE_CAPACITY")
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(4_096);
+        Self::with_capacity(capacity)
+    }
+
+    pub(super) fn with_capacity(capacity: usize) -> Self {
         Self {
+            id: NEXT_RAW_CACHE_ID.fetch_add(1, Ordering::Relaxed),
+            generation: AtomicU64::new(1),
             capacity,
             state: RwLock::new(RawTemplateCacheState::default()),
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
+            hits: Box::new(std::array::from_fn(|_| PaddedAtomicU64::default())),
+            misses: Box::new(std::array::from_fn(|_| PaddedAtomicU64::default())),
         }
     }
 
     pub(super) fn get(&self, key: &Bytes) -> Option<Arc<V>> {
+        let slot = thread_counter_slot();
         if self.capacity == 0 {
-            self.misses.fetch_add(1, Ordering::Relaxed);
+            self.misses[slot].0.fetch_add(1, Ordering::Relaxed);
             return None;
+        }
+        let gen = self.generation.load(Ordering::Relaxed);
+        let l1_idx = (self.id as usize) & 3;
+        if let Some(hit) = L1_RAW_TEMPLATE_SLOTS.with(|slots| {
+            let slots = slots.borrow();
+            let entry = &slots[l1_idx];
+            if entry.0 == self.id && entry.1 == gen && entry.2 == *key {
+                Arc::clone(&entry.3).downcast::<V>().ok()
+            } else {
+                None
+            }
+        }) {
+            self.hits[slot].0.fetch_add(1, Ordering::Relaxed);
+            return Some(hit);
         }
         let state = self.state.read().expect("raw template cache lock poisoned");
         let value = state
@@ -62,12 +111,22 @@ impl<V> RawTemplateCache<V> {
             .filter(|(cached_key, _)| cached_key == key)
             .map(|(_, value)| Arc::clone(value))
             .or_else(|| state.entries.get(key).cloned());
-        if value.is_some() {
-            self.hits.fetch_add(1, Ordering::Relaxed);
+        if let Some(found) = value {
+            L1_RAW_TEMPLATE_SLOTS.with(|slots| {
+                let mut slots = slots.borrow_mut();
+                slots[l1_idx] = (
+                    self.id,
+                    gen,
+                    key.clone(),
+                    Arc::clone(&found) as Arc<dyn Any + Send + Sync>,
+                );
+            });
+            self.hits[slot].0.fetch_add(1, Ordering::Relaxed);
+            Some(found)
         } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
+            self.misses[slot].0.fetch_add(1, Ordering::Relaxed);
+            None
         }
-        value
     }
 
     pub(super) fn insert(&self, key: Bytes, value: V) -> Arc<V> {
@@ -82,11 +141,16 @@ impl<V> RawTemplateCache<V> {
             state.hot = Some((key, Arc::clone(&existing)));
             return existing;
         }
+        let mut evicted = false;
         while state.entries.len() >= self.capacity {
             let Some(oldest) = state.insertion_order.pop_front() else {
                 break;
             };
             state.entries.remove(&oldest);
+            evicted = true;
+        }
+        if evicted {
+            self.generation.fetch_add(1, Ordering::Relaxed);
         }
         let value = Arc::new(value);
         state.insertion_order.push_back(key.clone());
@@ -96,6 +160,16 @@ impl<V> RawTemplateCache<V> {
     }
 
     pub(super) fn snapshot(&self) -> RawTemplateCacheSnapshot {
+        let hits = self
+            .hits
+            .iter()
+            .map(|c| c.0.load(Ordering::Relaxed))
+            .sum();
+        let misses = self
+            .misses
+            .iter()
+            .map(|c| c.0.load(Ordering::Relaxed))
+            .sum();
         RawTemplateCacheSnapshot {
             capacity: self.capacity,
             entries: self
@@ -104,8 +178,8 @@ impl<V> RawTemplateCache<V> {
                 .expect("raw template cache lock poisoned")
                 .entries
                 .len(),
-            hits: self.hits.load(Ordering::Relaxed),
-            misses: self.misses.load(Ordering::Relaxed),
+            hits,
+            misses,
         }
     }
 }

@@ -44,6 +44,16 @@ pub const CUBBS_BBS_GPU_PAIRING_EQ_AGGREGATE_SYMBOL: &[u8] =
     b"cubbs_bbs_gpu_pairing_eq_aggregate_v2\0";
 pub const CUBBS_BBS_GPU_PROOF_GEN_T2_PREPARE_BATCH_SYMBOL: &[u8] =
     b"cubbs_bbs_gpu_proof_gen_t2_prepare_batch_v2\0";
+pub const CUBBS_BBS_GPU_SIGN_FUSED_COMMON_BATCH_SYMBOL: &[u8] =
+    b"cubbs_bbs_gpu_sign_fused_common_batch_v2\0";
+pub const CUBBS_BBS_GPU_VERIFY_PRE_B_AGGREGATE_FUSED_SYMBOL: &[u8] =
+    b"cubbs_bbs_gpu_verify_pre_b_aggregate_fused_v2\0";
+pub const CUBBS_BBS_GPU_PIPELINE_PINNED_SCRATCH_SYMBOL: &[u8] =
+    b"cubbs_bbs_gpu_pipeline_pinned_scratch_v2\0";
+pub const CUBBS_BBS_GPU_PROOF_GEN_FUSED_COMMON_BATCH_SYMBOL: &[u8] =
+    b"cubbs_bbs_gpu_proof_gen_fused_common_batch_v2\0";
+pub const CUBBS_BBS_GPU_PROOF_VERIFY_FUSED_COMMON_BATCH_SYMBOL: &[u8] =
+    b"cubbs_bbs_gpu_proof_verify_fused_common_batch_v2\0";
 
 pub const CUBBS_BBS_GPU_SUCCESS: i32 = 0;
 pub const CUBBS_BBS_GPU_ERR_INVALID_INPUT: i32 = 1;
@@ -461,6 +471,138 @@ pub type CuBbsBbsGpuProofGenT2PrepareBatchV2 = unsafe extern "C" fn(
     items: *mut CuBbsBbsGpuProofGenT2PrepareItem,
     item_count: usize,
     results: *mut CuBbsBbsGpuResult,
+) -> i32;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct CuBbsBbsGpuSignFusedCommonBatchItem {
+    pub common_points: *const CuBbsBbsGpuByteSlice,
+    pub common_term_count: usize,
+    pub item_count: usize,
+    pub secret_keys_be: *const u8,
+    pub secret_key_stride: usize,
+    pub domains_be: *const u8,
+    pub domain_stride: usize,
+    pub packed_messages: *const u8,
+    pub packed_messages_len: usize,
+    pub message_offsets: *const u64,
+    pub message_lengths: *const u64,
+    pub message_dst: CuBbsBbsGpuByteSlice,
+    pub e_dst: CuBbsBbsGpuByteSlice,
+    pub signatures_out: *mut u8,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct CuBbsBbsGpuVerifyPreBAggregateFusedItem {
+    pub common_points: *const CuBbsBbsGpuByteSlice,
+    pub common_term_count: usize,
+    pub item_count: usize,
+    pub signatures: *const u8,
+    pub coefficients_le: *const u8,
+    pub domains_be: *const u8,
+    pub domain_stride: usize,
+    pub item_message_counts: *const u32,
+    pub item_message_starts: *const u64,
+    pub packed_messages: *const u8,
+    pub packed_messages_len: usize,
+    pub message_offsets: *const u64,
+    pub message_lengths: *const u64,
+    pub total_message_count: usize,
+    pub message_dst: CuBbsBbsGpuByteSlice,
+    pub public_key: CuBbsBbsGpuByteSlice,
+    pub g2_generator: CuBbsBbsGpuByteSlice,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct CuBbsBbsGpuProofGenFusedCommonBatchItem {
+    pub common_points: *const CuBbsBbsGpuByteSlice,
+    pub common_term_count: usize,
+    pub undisclosed_points: *const CuBbsBbsGpuByteSlice,
+    pub disclosed_indexes: *const u32,
+    pub disclosed_count: usize,
+    pub undisclosed_indexes: *const u32,
+    pub undisclosed_count: usize,
+    pub item_count: usize,
+    pub signatures: *const u8,
+    pub domains_be: *const u8,
+    pub domain_stride: usize,
+    pub packed_messages: *const u8,
+    pub packed_messages_len: usize,
+    pub message_offsets: *const u64,
+    pub message_lengths: *const u64,
+    pub packed_ph: *const u8,
+    pub packed_ph_len: usize,
+    pub ph_offsets: *const u64,
+    pub ph_lengths: *const u64,
+    pub message_dst: CuBbsBbsGpuByteSlice,
+    pub challenge_dst: CuBbsBbsGpuByteSlice,
+    pub csprng_seed: *const u8,
+    pub proofs_out: *mut u8,
+    pub proof_stride: usize,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct CuBbsBbsGpuProofVerifyFusedCommonBatchItem {
+    pub common_points: *const CuBbsBbsGpuByteSlice,
+    pub common_term_count: usize,
+    pub disclosed_indexes: *const u32,
+    pub disclosed_count: usize,
+    pub undisclosed_indexes: *const u32,
+    pub undisclosed_count: usize,
+    pub item_count: usize,
+    pub proofs: *const u8,
+    pub proof_stride: usize,
+    pub coefficients_le: *const u8,
+    pub domains_be: *const u8,
+    pub domain_stride: usize,
+    pub packed_disclosed_messages: *const u8,
+    pub packed_disclosed_messages_len: usize,
+    pub message_offsets: *const u64,
+    pub message_lengths: *const u64,
+    pub packed_ph: *const u8,
+    pub packed_ph_len: usize,
+    pub ph_offsets: *const u64,
+    pub ph_lengths: *const u64,
+    pub message_dst: CuBbsBbsGpuByteSlice,
+    pub challenge_dst: CuBbsBbsGpuByteSlice,
+    pub public_key: CuBbsBbsGpuByteSlice,
+    pub g2_generator: CuBbsBbsGpuByteSlice,
+}
+
+pub type CuBbsBbsGpuSignFusedCommonBatchV2 = unsafe extern "C" fn(
+    abi_version: u32,
+    item: *const CuBbsBbsGpuSignFusedCommonBatchItem,
+    results: *mut CuBbsBbsGpuResult,
+) -> i32;
+
+pub type CuBbsBbsGpuVerifyPreBAggregateFusedV2 = unsafe extern "C" fn(
+    abi_version: u32,
+    item: *const CuBbsBbsGpuVerifyPreBAggregateFusedItem,
+    result: *mut CuBbsBbsGpuResult,
+) -> i32;
+
+pub type CuBbsBbsGpuPipelinePinnedScratchV2 = unsafe extern "C" fn(
+    abi_version: u32,
+    msg_bytes: usize,
+    msg_count: usize,
+    messages_out: *mut *mut u8,
+    offsets_out: *mut *mut u64,
+    lengths_out: *mut *mut u64,
+) -> i32;
+
+pub type CuBbsBbsGpuProofGenFusedCommonBatchV2 = unsafe extern "C" fn(
+    abi_version: u32,
+    item: *const CuBbsBbsGpuProofGenFusedCommonBatchItem,
+    results: *mut CuBbsBbsGpuResult,
+) -> i32;
+
+pub type CuBbsBbsGpuProofVerifyFusedCommonBatchV2 = unsafe extern "C" fn(
+    abi_version: u32,
+    item: *const CuBbsBbsGpuProofVerifyFusedCommonBatchItem,
+    result: *mut CuBbsBbsGpuResult,
 ) -> i32;
 
 pub const fn fixed_lengths() -> (usize, usize, usize, usize) {

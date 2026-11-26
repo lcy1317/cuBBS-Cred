@@ -546,6 +546,7 @@ static bool g1_msm_items_have_common_points(const CuBbsG1MsmInput *items,
 #include "kernels/large_msm.cuh"
 #include "kernels/comb_msm.cuh"
 #include "kernels/comb_precompute.cuh"
+#include "kernels/limlee_msm.cuh"
 #include "kernels/affine_msm.cuh"
 #include "kernels/common_cache.cuh"
 #include "kernels/common_reference.cuh"
@@ -558,4 +559,8 @@ static bool g1_msm_items_have_common_points(const CuBbsG1MsmInput *items,
 #include "kernels/proof_verify.cuh"
 #include "kernels/proof_gen.cuh"
 #include "kernels/aggregate_dual_msm.cuh"
+#define CUBBS_BBS_SHA256_DEVICE_ONLY
+#include "sha256.cuh"
+#include "kernels/fused_sign_verify.cuh"
+#include "kernels/fused_proof.cuh"
 #include "kernels/disabled_backend_stubs.cuh"

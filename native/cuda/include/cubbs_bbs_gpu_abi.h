@@ -224,6 +224,103 @@ typedef struct CuBbsBbsGpuProofGenT2PrepareItem {
   CuBbsBbsGpuByteBuffer t1_out;        /* 48-byte compressed t1 = abar*e_tilde + d*r1_tilde */
 } CuBbsBbsGpuProofGenT2PrepareItem;
 
+/* Fully GPU-resident BBS Sign for a common-generator batch (same message count M).
+ * Computes message H2S, signature e, (sk + e)^-1, scaled B-MSM, and G1 compression
+ * on one CUDA stream with zero intermediate host scalar round-trips. */
+typedef struct CuBbsBbsGpuSignFusedCommonBatchItem {
+  const CuBbsBbsGpuByteSlice *common_points; /* M + 2 compressed G1 points */
+  size_t common_term_count;                  /* M + 2 */
+  size_t item_count;                         /* B */
+  const uint8_t *secret_keys_be;             /* B * 32 bytes BE (or 32 if stride == 0) */
+  size_t secret_key_stride;                  /* 0 or 32 */
+  const uint8_t *domains_be;                 /* B * 32 bytes BE (or 32 if stride == 0) */
+  size_t domain_stride;                      /* 0 or 32 */
+  const uint8_t *packed_messages;            /* contiguous raw message bytes */
+  size_t packed_messages_len;
+  const uint64_t *message_offsets;           /* B * M byte offsets */
+  const uint64_t *message_lengths;           /* B * M byte lengths */
+  CuBbsBbsGpuByteSlice message_dst;
+  CuBbsBbsGpuByteSlice e_dst;
+  uint8_t *signatures_out;                   /* B * 80 bytes: [A_compressed(48) || e_be(32)] */
+} CuBbsBbsGpuSignFusedCommonBatchItem;
+
+/* Fully GPU-resident BBS pre-B aggregate Verify for a same-public-key batch
+ * (uniform or mixed message counts <= max_M). Computes message H2S, random-coefficient
+ * B-scalar reduction, 1-row B-MSM, dual A-MSM, G1 addition, and aggregate pairing on GPU. */
+typedef struct CuBbsBbsGpuVerifyPreBAggregateFusedItem {
+  const CuBbsBbsGpuByteSlice *common_points; /* max_M + 2 compressed G1 points */
+  size_t common_term_count;                  /* max_M + 2 */
+  size_t item_count;                         /* B */
+  const uint8_t *signatures;                 /* B * 80 bytes: [A_compressed(48) || e_be(32)] */
+  const uint8_t *coefficients_le;            /* B * 32 bytes LE random nonzero scalars */
+  const uint8_t *domains_be;                 /* B * 32 bytes BE (or 32 if stride == 0) */
+  size_t domain_stride;                      /* 0 or 32 */
+  const uint32_t *item_message_counts;       /* NULL if uniform M == common_term_count - 2 */
+  const uint64_t *item_message_starts;       /* NULL if uniform; else B start offsets */
+  const uint8_t *packed_messages;            /* contiguous raw message bytes */
+  size_t packed_messages_len;
+  const uint64_t *message_offsets;           /* total_message_count byte offsets */
+  const uint64_t *message_lengths;           /* total_message_count byte lengths */
+  size_t total_message_count;
+  CuBbsBbsGpuByteSlice message_dst;
+  CuBbsBbsGpuByteSlice public_key;           /* 96 bytes compressed G2 */
+  CuBbsBbsGpuByteSlice g2_generator;         /* 96 bytes compressed G2 */
+} CuBbsBbsGpuVerifyPreBAggregateFusedItem;
+
+typedef struct CuBbsBbsGpuProofGenFusedCommonBatchItem {
+  const CuBbsBbsGpuByteSlice *common_points;      /* M + 2 compressed G1 points */
+  size_t common_term_count;                       /* M + 2 */
+  const CuBbsBbsGpuByteSlice *undisclosed_points; /* U compressed G1 points (NULL if U == 0) */
+  const uint32_t *disclosed_indexes;              /* R sorted ascending indexes */
+  size_t disclosed_count;                         /* R */
+  const uint32_t *undisclosed_indexes;            /* U sorted ascending indexes */
+  size_t undisclosed_count;                       /* U = M - R */
+  size_t item_count;                              /* B */
+  const uint8_t *signatures;                      /* B * 80 bytes: [A(48) || e_be(32)] */
+  const uint8_t *domains_be;                      /* B * 32 or 32 bytes if stride == 0 */
+  size_t domain_stride;                           /* 0 or 32 */
+  const uint8_t *packed_messages;                 /* contiguous raw message bytes */
+  size_t packed_messages_len;
+  const uint64_t *message_offsets;                /* B * M byte offsets */
+  const uint64_t *message_lengths;                /* B * M byte lengths */
+  const uint8_t *packed_ph;                       /* contiguous presentation headers */
+  size_t packed_ph_len;
+  const uint64_t *ph_offsets;                     /* B byte offsets */
+  const uint64_t *ph_lengths;                     /* B byte lengths */
+  CuBbsBbsGpuByteSlice message_dst;
+  CuBbsBbsGpuByteSlice challenge_dst;
+  const uint8_t *csprng_seed;                     /* 32-byte fresh OS entropy seed */
+  uint8_t *proofs_out;                            /* B * proof_stride contiguous buffer */
+  size_t proof_stride;                            /* 272 + U * 32 */
+} CuBbsBbsGpuProofGenFusedCommonBatchItem;
+
+typedef struct CuBbsBbsGpuProofVerifyFusedCommonBatchItem {
+  const CuBbsBbsGpuByteSlice *common_points; /* M + 2 compressed G1 points */
+  size_t common_term_count;                  /* M + 2 */
+  const uint32_t *disclosed_indexes;         /* R sorted ascending indexes */
+  size_t disclosed_count;                    /* R */
+  const uint32_t *undisclosed_indexes;       /* U sorted ascending indexes */
+  size_t undisclosed_count;                  /* U = M - R */
+  size_t item_count;                         /* B */
+  const uint8_t *proofs;                     /* B * proof_stride raw proof bytes */
+  size_t proof_stride;                       /* 272 + U * 32 */
+  const uint8_t *coefficients_le;            /* B * 32 bytes LE 128-bit random nonzero */
+  const uint8_t *domains_be;                 /* B * 32 or 32 bytes if stride == 0 */
+  size_t domain_stride;                      /* 0 or 32 */
+  const uint8_t *packed_disclosed_messages;  /* contiguous raw disclosed messages */
+  size_t packed_disclosed_messages_len;
+  const uint64_t *message_offsets;           /* B * R byte offsets */
+  const uint64_t *message_lengths;           /* B * R byte lengths */
+  const uint8_t *packed_ph;                  /* contiguous presentation headers */
+  size_t packed_ph_len;
+  const uint64_t *ph_offsets;                /* B byte offsets */
+  const uint64_t *ph_lengths;                /* B byte lengths */
+  CuBbsBbsGpuByteSlice message_dst;
+  CuBbsBbsGpuByteSlice challenge_dst;
+  CuBbsBbsGpuByteSlice public_key;           /* 96 bytes compressed G2 */
+  CuBbsBbsGpuByteSlice g2_generator;         /* 96 bytes compressed G2 */
+} CuBbsBbsGpuProofVerifyFusedCommonBatchItem;
+
 int32_t cubbs_bbs_gpu_backend_info_v2(uint32_t abi_version,
                                        CuBbsBbsGpuBackendInfo *info_out);
 
@@ -306,6 +403,26 @@ int32_t cubbs_bbs_gpu_pairing_eq_aggregate_v2(
 int32_t cubbs_bbs_gpu_proof_gen_t2_prepare_batch_v2(
     uint32_t abi_version, CuBbsBbsGpuProofGenT2PrepareItem *items,
     size_t item_count, CuBbsBbsGpuResult *results);
+
+int32_t cubbs_bbs_gpu_sign_fused_common_batch_v2(
+    uint32_t abi_version, const CuBbsBbsGpuSignFusedCommonBatchItem *item,
+    CuBbsBbsGpuResult *results);
+
+int32_t cubbs_bbs_gpu_verify_pre_b_aggregate_fused_v2(
+    uint32_t abi_version, const CuBbsBbsGpuVerifyPreBAggregateFusedItem *item,
+    CuBbsBbsGpuResult *result);
+
+int32_t cubbs_bbs_gpu_pipeline_pinned_scratch_v2(
+    uint32_t abi_version, size_t msg_bytes, size_t msg_count,
+    uint8_t **messages_out, uint64_t **offsets_out, uint64_t **lengths_out);
+
+int32_t cubbs_bbs_gpu_proof_gen_fused_common_batch_v2(
+    uint32_t abi_version, const CuBbsBbsGpuProofGenFusedCommonBatchItem *item,
+    CuBbsBbsGpuResult *results);
+
+int32_t cubbs_bbs_gpu_proof_verify_fused_common_batch_v2(
+    uint32_t abi_version, const CuBbsBbsGpuProofVerifyFusedCommonBatchItem *item,
+    CuBbsBbsGpuResult *result);
 
 #ifdef __cplusplus
 }

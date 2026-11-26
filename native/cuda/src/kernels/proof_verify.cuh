@@ -12,6 +12,7 @@ int32_t cubbs_bbs_cuda_proof_verify_msm_pair_matrix(
       std::getenv("CUBBS_BBS_GPU_PROOF_VERIFY_PAIR_PROFILE") != nullptr;
   const auto profile_started = ProfileClock::now();
   if (output_count == 0u) return CUBBS_BBS_GPU_SUCCESS;
+  cubbs_bbs_ensure_cuda_device_schedule();
   if (common_term_count == 0u || common_points == nullptr ||
       common_scalar_rows == nullptr || proof_points == nullptr ||
       proof_scalars == nullptr || t1_outs == nullptr || t2_outs == nullptr ||
@@ -34,13 +35,17 @@ int32_t cubbs_bbs_cuda_proof_verify_msm_pair_matrix(
       bbs_universal_tiled_common_supported(common_term_count);
   const bool tiled_common = large_common || universal_common;
   const bool affine_common =
-      !tiled_common && common_term_count >= 18u && output_count > 512u &&
+      !tiled_common && common_term_count >= 18u && output_count >= 16u &&
       bbs_homogeneous_affine_comb_enabled();
   int32_t status = get_fused_common_points_cache(
       common_points, common_term_count, &cached, tiled_common, affine_common,
       affine_common ? 9u : 0u, universal_common);
   if (status != CUBBS_BBS_GPU_SUCCESS ||
-      (cached->device_fixed_comb6 == nullptr &&
+      (cached->device_limlee_affines == nullptr &&
+       cached->device_fixed_glv_affine_comb8 == nullptr &&
+       cached->device_fixed_glv_affine_comb9 == nullptr &&
+       cached->device_fixed_glv_affine_comb10 == nullptr &&
+       cached->device_fixed_comb6 == nullptr &&
        cached->device_fixed_comb8 == nullptr &&
        cached->device_fixed_comb9 == nullptr &&
        cached->device_fixed_comb10 == nullptr &&
@@ -51,9 +56,76 @@ int32_t cubbs_bbs_cuda_proof_verify_msm_pair_matrix(
   const size_t common_scalar_count = output_count * common_term_count;
   const size_t proof_point_count = output_count * 3u;
   const size_t proof_scalar_count = output_count * 4u;
-  std::vector<uint8_t> common_scalars_le(common_scalar_count * 32u);
-  std::vector<uint8_t> proof_scalars_le(proof_scalar_count * 32u);
-  std::vector<cubbs_sppark_plain_affine_t> proof_bases(proof_point_count);
+  struct CuBbsProofVerifyPinnedWorkspace {
+    uint8_t *common_scalars_le{nullptr};
+    uint8_t *proof_scalars_le{nullptr};
+    cubbs_sppark_plain_affine_t *proof_bases{nullptr};
+    cubbs_sppark_bucket_t *host_t1{nullptr};
+    cubbs_sppark_bucket_t *host_t2{nullptr};
+    size_t common_scalar_bytes_cap{0u};
+    size_t proof_scalar_bytes_cap{0u};
+    size_t proof_point_cap{0u};
+    size_t output_cap{0u};
+    std::vector<cubbs_sppark_point_t> projectives;
+    std::vector<const void *> projective_ptrs;
+    std::vector<uint8_t *> compressed_outs;
+
+    cudaError_t ensure(size_t common_bytes, size_t proof_s_bytes,
+                       size_t proof_pts, size_t outputs) {
+      cudaError_t err = cudaSuccess;
+      if (common_scalar_bytes_cap < common_bytes) {
+        if (common_scalars_le != nullptr) (void)cudaFreeHost(common_scalars_le);
+        common_scalars_le = nullptr;
+        common_scalar_bytes_cap = 0u;
+        err = cudaMallocHost(&common_scalars_le, std::max<size_t>(1u, common_bytes));
+        if (err == cudaSuccess) common_scalar_bytes_cap = std::max<size_t>(1u, common_bytes);
+      }
+      if (err == cudaSuccess && proof_scalar_bytes_cap < proof_s_bytes) {
+        if (proof_scalars_le != nullptr) (void)cudaFreeHost(proof_scalars_le);
+        proof_scalars_le = nullptr;
+        proof_scalar_bytes_cap = 0u;
+        err = cudaMallocHost(&proof_scalars_le, std::max<size_t>(1u, proof_s_bytes));
+        if (err == cudaSuccess) proof_scalar_bytes_cap = std::max<size_t>(1u, proof_s_bytes);
+      }
+      if (err == cudaSuccess && proof_point_cap < proof_pts) {
+        if (proof_bases != nullptr) (void)cudaFreeHost(proof_bases);
+        proof_bases = nullptr;
+        proof_point_cap = 0u;
+        err = cudaMallocHost(&proof_bases, std::max<size_t>(1u, proof_pts) * sizeof(*proof_bases));
+        if (err == cudaSuccess) proof_point_cap = std::max<size_t>(1u, proof_pts);
+      }
+      if (err == cudaSuccess && output_cap < outputs) {
+        if (host_t1 != nullptr) (void)cudaFreeHost(host_t1);
+        if (host_t2 != nullptr) (void)cudaFreeHost(host_t2);
+        host_t1 = nullptr;
+        host_t2 = nullptr;
+        output_cap = 0u;
+        err = cudaMallocHost(&host_t1, std::max<size_t>(1u, outputs) * sizeof(*host_t1));
+        if (err == cudaSuccess)
+          err = cudaMallocHost(&host_t2, std::max<size_t>(1u, outputs) * sizeof(*host_t2));
+        if (err == cudaSuccess) output_cap = std::max<size_t>(1u, outputs);
+      }
+      return err;
+    }
+
+    ~CuBbsProofVerifyPinnedWorkspace() {
+      if (host_t2 != nullptr) (void)cudaFreeHost(host_t2);
+      if (host_t1 != nullptr) (void)cudaFreeHost(host_t1);
+      if (proof_bases != nullptr) (void)cudaFreeHost(proof_bases);
+      if (proof_scalars_le != nullptr) (void)cudaFreeHost(proof_scalars_le);
+      if (common_scalars_le != nullptr) (void)cudaFreeHost(common_scalars_le);
+    }
+  };
+  static thread_local CuBbsProofVerifyPinnedWorkspace pv_host_ws;
+  const size_t common_scalars_bytes = common_scalar_count * 32u;
+  const size_t proof_scalars_bytes = proof_scalar_count * 32u;
+  if (pv_host_ws.ensure(common_scalars_bytes, proof_scalars_bytes,
+                        proof_point_count, output_count) != cudaSuccess) {
+    return CUBBS_BBS_GPU_ERR_INTERNAL;
+  }
+  uint8_t *common_scalars_le = pv_host_ws.common_scalars_le;
+  uint8_t *proof_scalars_le = pv_host_ws.proof_scalars_le;
+  cubbs_sppark_plain_affine_t *proof_bases = pv_host_ws.proof_bases;
   const char *decode_workers_config =
       std::getenv("CUBBS_BBS_GPU_PROOF_VERIFY_DECODE_WORKERS");
   const size_t decode_workers_default = output_count < 128u
@@ -69,11 +141,11 @@ int32_t cubbs_bbs_cuda_proof_verify_msm_pair_matrix(
   const bool host_glv_split =
       env_flag_enabled("CUBBS_BBS_GPU_PROOF_VERIFY_HOST_GLV_SPLIT");
   status = cubbs_fused_decode_scalars_parallel(
-      common_scalar_rows, common_scalar_count, common_scalars_le.data(),
+      common_scalar_rows, common_scalar_count, common_scalars_le,
       decode_workers);
   if (status == CUBBS_BBS_GPU_SUCCESS) {
     status = cubbs_fused_decode_scalars_parallel(
-        proof_scalars, proof_scalar_count, proof_scalars_le.data(),
+        proof_scalars, proof_scalar_count, proof_scalars_le,
         decode_workers);
   }
   if (status == CUBBS_BBS_GPU_SUCCESS && host_glv_split) {
@@ -87,26 +159,29 @@ int32_t cubbs_bbs_cuda_proof_verify_msm_pair_matrix(
       const size_t begin = worker * split_chunk;
       const size_t end = std::min(proof_scalar_count, begin + split_chunk);
       for (size_t scalar = begin; scalar < end; ++scalar) {
-        uint8_t *value = proof_scalars_le.data() + scalar * 32u;
+        uint8_t *value = proof_scalars_le + scalar * 32u;
         cubbs_bbs_scalar_div_by_z2_host(value, value);
       }
     });
   }
   const bool proof_points_cached = status == CUBBS_BBS_GPU_SUCCESS &&
-      load_cached_g1_affines(proof_points, proof_point_count, proof_bases.data());
+      load_cached_g1_affines(proof_points, proof_point_count, proof_bases);
   if (status == CUBBS_BBS_GPU_SUCCESS && !proof_points_cached) {
     status = cubbs_bbs_blst_decode_g1_points(
         proof_points, proof_point_count,
-        reinterpret_cast<uint8_t *>(proof_bases.data()),
+        reinterpret_cast<uint8_t *>(proof_bases),
         sizeof(cubbs_sppark_plain_affine_t));
   }
   if (status != CUBBS_BBS_GPU_SUCCESS) return status;
   if (!proof_points_cached)
-    cache_proof_pair_affines(proof_points, proof_bases.data(), output_count);
+    cache_proof_pair_affines(proof_points, proof_bases, output_count);
   const auto decode_finished = ProfileClock::now();
 
-  const cudaStream_t stream =
-      cached->stream != nullptr ? cached->stream : static_cast<cudaStream_t>(0);
+  // Use a per-calling-thread CUDA stream so concurrent ProofVerify callers
+  // sharing one cached point table overlap cleanly instead of serializing
+  // and phase-locking on cached->stream.
+  const cudaStream_t stream = cubbs_fused_pinned_host_workspace().execution_stream(
+      cached->stream != nullptr ? cached->stream : static_cast<cudaStream_t>(0));
   const char *overlap_configured =
       std::getenv("CUBBS_BBS_GPU_PROOF_VERIFY_MSM_OVERLAP");
   bool overlap = overlap_configured != nullptr
@@ -170,9 +245,9 @@ int32_t cubbs_bbs_cuda_proof_verify_msm_pair_matrix(
   }
   configure_cubbs_async_mempool();
   cudaError_t error = cudaMallocAsync(
-      &device_common_scalars, common_scalars_le.size(), stream);
+      &device_common_scalars, common_scalars_bytes, stream);
   if (error == cudaSuccess)
-    error = cudaMallocAsync(&device_proof_scalars, proof_scalars_le.size(), stream);
+    error = cudaMallocAsync(&device_proof_scalars, proof_scalars_bytes, stream);
   if (error == cudaSuccess)
     error = cudaMallocAsync(&device_proof_bases,
                             proof_point_count * sizeof(*device_proof_bases), stream);
@@ -201,13 +276,13 @@ int32_t cubbs_bbs_cuda_proof_verify_msm_pair_matrix(
   if (error == cudaSuccess && profile)
     error = cudaEventRecord(profile_events[0], stream);
   if (error == cudaSuccess)
-    error = cudaMemcpyAsync(device_common_scalars, common_scalars_le.data(),
-                            common_scalars_le.size(), cudaMemcpyHostToDevice, stream);
+    error = cudaMemcpyAsync(device_common_scalars, common_scalars_le,
+                            common_scalars_bytes, cudaMemcpyHostToDevice, stream);
   if (error == cudaSuccess)
-    error = cudaMemcpyAsync(device_proof_scalars, proof_scalars_le.data(),
-                            proof_scalars_le.size(), cudaMemcpyHostToDevice, stream);
+    error = cudaMemcpyAsync(device_proof_scalars, proof_scalars_le,
+                            proof_scalars_bytes, cudaMemcpyHostToDevice, stream);
   if (error == cudaSuccess)
-    error = cudaMemcpyAsync(device_proof_bases, proof_bases.data(),
+    error = cudaMemcpyAsync(device_proof_bases, proof_bases,
                             proof_point_count * sizeof(*device_proof_bases),
                             cudaMemcpyHostToDevice, stream);
   if (error == cudaSuccess && global_radix16_tables) {
@@ -226,7 +301,13 @@ int32_t cubbs_bbs_cuda_proof_verify_msm_pair_matrix(
   if (error == cudaSuccess) {
     const uint32_t common_threads =
         fused_common_points_adaptive_threads(common_term_count, output_count);
-    if (tiled_common) {
+    if (cached->device_limlee_affines != nullptr) {
+      error = cubbs_bbs_launch_glv_limlee(
+          cached->device_limlee_affines, cached->device_limlee_offsets,
+          cached->device_limlee_c_total, device_common_scalars,
+          common_term_count, output_count, cached->limlee_num_groups,
+          cached->limlee_group_size, cached->limlee_v_sub, stream, device_t2);
+    } else if (tiled_common) {
       constexpr uint32_t glv_threads = 128u;
       const dim3 tiled_grid(static_cast<uint32_t>(output_count),
                             static_cast<uint32_t>(large_tile_count));
@@ -243,6 +324,18 @@ int32_t cubbs_bbs_cuda_proof_verify_msm_pair_matrix(
                stream>>>(device_common_partials, large_tile_count,
                          output_count, device_t2);
       }
+    } else if (cached->device_fixed_glv_affine_comb9 != nullptr) {
+      error = cubbs_bbs_launch_glv_affine_comb<9u>(
+          cached->device_fixed_glv_affine_comb9, device_common_scalars,
+          common_term_count, output_count, stream, device_t2);
+    } else if (cached->device_fixed_glv_affine_comb10 != nullptr) {
+      error = cubbs_bbs_launch_glv_affine_comb<10u>(
+          cached->device_fixed_glv_affine_comb10, device_common_scalars,
+          common_term_count, output_count, stream, device_t2);
+    } else if (cached->device_fixed_glv_affine_comb8 != nullptr) {
+      error = cubbs_bbs_launch_glv_affine_comb<8u>(
+          cached->device_fixed_glv_affine_comb8, device_common_scalars,
+          common_term_count, output_count, stream, device_t2);
     } else if (cached->device_fixed_affine_comb9 != nullptr) {
       error = cubbs_bbs_launch_affine_comb<9u>(
           cached->device_fixed_affine_comb9, device_common_scalars,
@@ -360,14 +453,14 @@ int32_t cubbs_bbs_cuda_proof_verify_msm_pair_matrix(
   if (error == cudaSuccess && profile)
     error = cudaEventRecord(profile_events[3], stream);
 
-  std::vector<cubbs_sppark_bucket_t> host_t1(output_count);
-  std::vector<cubbs_sppark_bucket_t> host_t2(output_count);
+  cubbs_sppark_bucket_t *host_t1 = pv_host_ws.host_t1;
+  cubbs_sppark_bucket_t *host_t2 = pv_host_ws.host_t2;
   if (error == cudaSuccess)
-    error = cudaMemcpyAsync(host_t1.data(), device_t1,
+    error = cudaMemcpyAsync(host_t1, device_t1,
                             output_count * sizeof(host_t1[0]),
                             cudaMemcpyDeviceToHost, stream);
   if (error == cudaSuccess)
-    error = cudaMemcpyAsync(host_t2.data(), device_t2,
+    error = cudaMemcpyAsync(host_t2, device_t2,
                             output_count * sizeof(host_t2[0]),
                             cudaMemcpyDeviceToHost, stream);
   if (error == cudaSuccess && profile)
@@ -401,9 +494,12 @@ int32_t cubbs_bbs_cuda_proof_verify_msm_pair_matrix(
   }
   if (error != cudaSuccess) return CUBBS_BBS_GPU_ERR_INTERNAL;
 
-  std::vector<cubbs_sppark_point_t> projectives(output_count * 2u);
-  std::vector<const void *> projective_ptrs(output_count * 2u);
-  std::vector<uint8_t *> compressed_outs(output_count * 2u);
+  auto &projectives = pv_host_ws.projectives;
+  auto &projective_ptrs = pv_host_ws.projective_ptrs;
+  auto &compressed_outs = pv_host_ws.compressed_outs;
+  projectives.resize(output_count * 2u);
+  projective_ptrs.resize(output_count * 2u);
+  compressed_outs.resize(output_count * 2u);
   for (size_t row = 0u; row < output_count; ++row) {
     projectives[row * 2u] = static_cast<cubbs_sppark_point_t>(host_t1[row]);
     projectives[row * 2u + 1u] = static_cast<cubbs_sppark_point_t>(host_t2[row]);

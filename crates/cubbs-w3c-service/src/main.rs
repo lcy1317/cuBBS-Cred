@@ -27,21 +27,23 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use batcher::{BatchQueue, BatchReceiver, BatcherConfig, BatcherSnapshot};
 use cubbs_bbs::{
-    BbsBackend, BbsEngine, ProofVerifyRequest, SignRequest, VerifyRequest as BbsVerifyRequest,
-    SECRET_KEY_LEN,
+    BbsBackend, BbsEngine, ProofGenRequest, ProofVerifyRequest, SignRequest,
+    VerifyRequest as BbsVerifyRequest, SECRET_KEY_LEN,
 };
 use cubbs_vc_di_bbs::{
-    acquire_w3c_verify_crypto_admission_for_backend, canonicalization_cache_snapshot,
-    default_bbs_2023_proof_options, derive_jsonld_disclosure_proof_batch, did_key_from_public_key,
-    issue_jsonld_base_proof_batch, json_content_digest, jsonld_batch_workers,
-    lower_base_verification, lower_disclosure_verification, prepare_jsonld_base_issue,
-    prepare_jsonld_base_verification, prepare_jsonld_disclosure_verification,
+    acquire_w3c_verify_crypto_admission_for_backend, assemble_jsonld_disclosure_proof,
+    canonicalization_cache_snapshot, complete_disclosure_proof, default_bbs_2023_proof_options,
+    derive_jsonld_disclosure_proof_batch, did_key_from_public_key, issue_jsonld_base_proof_batch,
+    json_content_digest, jsonld_batch_workers, lower_base_verification, lower_disclosure_proof,
+    lower_disclosure_verification, prepare_jsonld_base_issue, prepare_jsonld_base_verification,
+    prepare_jsonld_disclosure_proof, prepare_jsonld_disclosure_verification,
     prepared_cache_snapshot, shared_jsonld_loader_enabled, verification_method_from_public_key,
-    w3c_batch_timing_snapshot, w3c_verify_crypto_admission_snapshot_for_backend, BatchRunResult,
+    w3c_batch_timing_snapshot, w3c_verify_crypto_admission_snapshot_for_backend,
     CanonicalizationCacheSnapshot, DeriveJsonLdDisclosureProofBatchRequest,
     DeriveJsonLdDisclosureProofRequest, IssueJsonLdBaseProofBatchRequest,
-    IssueJsonLdBaseProofRequest, PreparedCacheSnapshot, PreparedJsonLdBaseIssue,
-    W3cBatchTimingSnapshot, W3cVerifyCryptoAdmissionSnapshot, HMAC_KEY_LEN,
+    IssueJsonLdBaseProofRequest, LoweredDisclosureProof, PreparedCacheSnapshot,
+    PreparedJsonLdBaseIssue, PreparedJsonLdDisclosureProof, W3cBatchTimingSnapshot,
+    W3cVerifyCryptoAdmissionSnapshot, HMAC_KEY_LEN,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -71,10 +73,11 @@ struct AppState {
     listen_backlog: u32,
     batcher_config: BatcherConfig,
     issue_queue: BatchQueue<IssueBatchItem, IssueBatchOutput>,
-    derive_queue: BatchQueue<DeriveJsonLdDisclosureProofRequest, Value>,
+    derive_queue: BatchQueue<DeriveBatchItem, DeriveBatchOutput>,
     verify_signature_queue: BatchQueue<Arc<BbsVerifyRequest>, bool>,
     proof_verify_queue: BatchQueue<Arc<ProofVerifyRequest>, bool>,
     issue_template_cache: Arc<RawTemplateCache<PreparedIssueTemplate>>,
+    derive_template_cache: Arc<RawTemplateCache<PreparedDeriveTemplate>>,
     verification_template_cache: Arc<RawTemplateCache<PreparedVerification>>,
     verification_cache: Arc<VerificationResultCache>,
     managed_vc_store: Arc<ManagedVcStore>,
@@ -86,10 +89,27 @@ struct AppState {
     managed_bulk_max_items: usize,
 }
 
+fn find_unique_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    let mut found = None;
+    for i in 0..=haystack.len() - needle.len() {
+        if &haystack[i..i + needle.len()] == needle {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(i);
+        }
+    }
+    found
+}
+
 #[derive(Debug)]
 struct PreparedIssueTemplate {
     prepared: PreparedJsonLdBaseIssue,
     response: ProofResponseTemplate,
+    cbor_template: Option<(Vec<u8>, usize, usize)>,
 }
 
 impl PreparedIssueTemplate {
@@ -97,9 +117,21 @@ impl PreparedIssueTemplate {
         let response = prepared
             .assemble_document(String::new())
             .map_err(|error| error.to_string())?;
+        let sig_sentinel = vec![0xA5u8; 80];
+        let hmac_sentinel = [0x5Au8; HMAC_KEY_LEN];
+        let cbor_template = prepared
+            .proof_value(sig_sentinel.clone(), &hmac_sentinel)
+            .ok()
+            .and_then(|pv| pv.strip_prefix('u').and_then(|s| URL_SAFE_NO_PAD.decode(s).ok()))
+            .and_then(|cbor| {
+                let sig_off = find_unique_subslice(&cbor, &sig_sentinel)?;
+                let hmac_off = find_unique_subslice(&cbor, &hmac_sentinel)?;
+                Some((cbor, sig_off, hmac_off))
+            });
         Ok(Self {
             prepared,
             response: ProofResponseTemplate::new(response)?,
+            cbor_template,
         })
     }
 
@@ -108,6 +140,22 @@ impl PreparedIssueTemplate {
     }
 
     fn finish(&self, signature: Vec<u8>, hmac_key: &[u8]) -> Result<Bytes, String> {
+        if signature.len() == 80 && hmac_key.len() == HMAC_KEY_LEN {
+            if let Some((tmpl, sig_off, hmac_off)) = &self.cbor_template {
+                if tmpl.len() <= 1024 {
+                    let mut stack_buf = [0u8; 1024];
+                    let buf = &mut stack_buf[..tmpl.len()];
+                    buf.copy_from_slice(tmpl);
+                    buf[*sig_off..*sig_off + 80].copy_from_slice(&signature);
+                    buf[*hmac_off..*hmac_off + HMAC_KEY_LEN].copy_from_slice(hmac_key);
+                    return self.response.finish_cbor_multibase_u(buf);
+                }
+                let mut buf = tmpl.clone();
+                buf[*sig_off..*sig_off + 80].copy_from_slice(&signature);
+                buf[*hmac_off..*hmac_off + HMAC_KEY_LEN].copy_from_slice(hmac_key);
+                return self.response.finish_cbor_multibase_u(&buf);
+            }
+        }
         let proof_value = self
             .prepared
             .proof_value(signature, hmac_key)
@@ -127,6 +175,82 @@ enum IssueBatchItem {
 
 #[derive(Debug, Clone)]
 enum IssueBatchOutput {
+    Serialized(Bytes),
+    Value(Value),
+}
+
+#[derive(Debug)]
+struct PreparedDeriveTemplate {
+    lowered: Arc<LoweredDisclosureProof>,
+    request: Arc<ProofGenRequest>,
+    response: ProofResponseTemplate,
+    cbor_template: Option<(Vec<u8>, usize, usize)>,
+}
+
+impl PreparedDeriveTemplate {
+    fn new(prepared: PreparedJsonLdDisclosureProof) -> Result<Self, String> {
+        let response_doc =
+            assemble_jsonld_disclosure_proof(&prepared, String::new()).map_err(|e| e.to_string())?;
+        let lowered = lower_disclosure_proof(prepared.primitive).map_err(|e| e.to_string())?;
+        let request = Arc::new(lowered.request.clone());
+        let undisclosed = request
+            .messages
+            .len()
+            .saturating_sub(request.disclosed_indexes.len());
+        let expected_proof_len = 272 + undisclosed * 32;
+        let proof_sentinel = vec![0xC3u8; expected_proof_len];
+        let cbor_template = complete_disclosure_proof(&lowered, proof_sentinel.clone())
+            .ok()
+            .and_then(|mat| {
+                mat.proof_value
+                    .strip_prefix('u')
+                    .and_then(|s| URL_SAFE_NO_PAD.decode(s).ok())
+            })
+            .and_then(|cbor| {
+                let off = find_unique_subslice(&cbor, &proof_sentinel)?;
+                Some((cbor, off, expected_proof_len))
+            });
+        Ok(Self {
+            lowered: Arc::new(lowered),
+            request,
+            response: ProofResponseTemplate::new(response_doc)?,
+            cbor_template,
+        })
+    }
+
+    fn proof_gen_request(&self) -> Arc<ProofGenRequest> {
+        Arc::clone(&self.request)
+    }
+
+    fn finish(&self, bbs_proof: Vec<u8>) -> Result<Bytes, String> {
+        if let Some((tmpl, proof_off, proof_len)) = &self.cbor_template {
+            if bbs_proof.len() == *proof_len {
+                if tmpl.len() <= 4096 {
+                    let mut stack_buf = [0u8; 4096];
+                    let buf = &mut stack_buf[..tmpl.len()];
+                    buf.copy_from_slice(tmpl);
+                    buf[*proof_off..*proof_off + *proof_len].copy_from_slice(&bbs_proof);
+                    return self.response.finish_cbor_multibase_u(buf);
+                }
+                let mut buf = tmpl.clone();
+                buf[*proof_off..*proof_off + *proof_len].copy_from_slice(&bbs_proof);
+                return self.response.finish_cbor_multibase_u(&buf);
+            }
+        }
+        let derived =
+            complete_disclosure_proof(&self.lowered, bbs_proof).map_err(|e| e.to_string())?;
+        self.response.finish(&derived.proof_value)
+    }
+}
+
+#[derive(Debug, Clone)]
+enum DeriveBatchItem {
+    Prepared(Arc<PreparedDeriveTemplate>),
+    General(DeriveJsonLdDisclosureProofRequest),
+}
+
+#[derive(Debug, Clone)]
+enum DeriveBatchOutput {
     Serialized(Bytes),
     Value(Value),
 }
@@ -242,6 +366,7 @@ struct HealthResponse {
     canonicalization_cache: CanonicalizationCacheSnapshot,
     prepared_cache: PreparedCacheSnapshot,
     issue_template_cache: RawTemplateCacheSnapshot,
+    derive_template_cache: RawTemplateCacheSnapshot,
     verification_template_cache: RawTemplateCacheSnapshot,
     verification_result_cache: VerificationResultCacheSnapshot,
     managed_vc: ManagedVcSnapshot,
@@ -418,10 +543,10 @@ fn create_state() -> AppState {
         verification_method_from_public_key(&keys.public_key).expect("valid generated public key");
     let listen_backlog = w3c_listen_backlog();
     let batcher_config = BatcherConfig::from_env();
-    let issue_config = BatcherConfig::from_env_for("issue", 128, 20);
-    let derive_config = BatcherConfig::from_env_for("derive", 128, 20);
-    let verify_signature_config = BatcherConfig::from_env_for("verify-base", 512, 5);
-    let proof_verify_config = BatcherConfig::from_env_for("proof-verify", 128, 20);
+    let issue_config = BatcherConfig::from_env_for("issue", 1024, 8);
+    let derive_config = BatcherConfig::from_env_for("derive", 1024, 8);
+    let verify_signature_config = BatcherConfig::from_env_for("verify-base", 2048, 8);
+    let proof_verify_config = BatcherConfig::from_env_for("proof-verify", 1024, 8);
     let managed_derive_config = BatcherConfig::from_env_for("managed-derive", 4096, 1);
     let managed_verify_base_config = BatcherConfig::from_env_for("managed-verify-base", 4096, 1);
     let managed_proof_verify_config = BatcherConfig::from_env_for("managed-proof-verify", 4096, 1);
@@ -453,9 +578,16 @@ fn create_state() -> AppState {
             )
         }
     });
+    let derive_engine = Arc::clone(&engine);
     let derive_queue = BatchQueue::spawn_with_slots(derive_config, Arc::clone(&pipeline_slots), {
         let verification_cache = Arc::clone(&verification_cache);
-        move |items| process_derive_batch(items, Arc::clone(&verification_cache))
+        move |items| {
+            process_derive_batch(
+                Arc::clone(&derive_engine),
+                items,
+                Arc::clone(&verification_cache),
+            )
+        }
     });
     let verify_engine = Arc::clone(&engine);
     let verify_backend = backend;
@@ -478,6 +610,7 @@ fn create_state() -> AppState {
         },
     );
     let issue_template_cache = Arc::new(RawTemplateCache::from_env());
+    let derive_template_cache = Arc::new(RawTemplateCache::from_env());
     let verification_template_cache = Arc::new(RawTemplateCache::from_env());
     let managed_vc_store = Arc::new(ManagedVcStore::from_env());
     let managed_bulk_pipelines = managed_bulk_pipelines();
@@ -547,6 +680,7 @@ fn create_state() -> AppState {
         verify_signature_queue,
         proof_verify_queue,
         issue_template_cache,
+        derive_template_cache,
         verification_template_cache,
         verification_cache,
         managed_vc_store,
@@ -655,6 +789,7 @@ async fn healthz(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
         canonicalization_cache,
         prepared_cache,
         issue_template_cache: state.issue_template_cache.snapshot(),
+        derive_template_cache: state.derive_template_cache.snapshot(),
         verification_template_cache: state.verification_template_cache.snapshot(),
         verification_result_cache: state.verification_cache.snapshot(),
         managed_vc: state.managed_vc_store.snapshot(),
@@ -1046,18 +1181,36 @@ async fn verify_batch(
 
 async fn derive(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<DeriveRequest>,
-) -> Result<Json<Value>, ApiError> {
-    let derived = state
-        .derive_queue
-        .submit(DeriveJsonLdDisclosureProofRequest {
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    require_json_content_type(&headers)?;
+    let item = if let Some(template) = state.derive_template_cache.get(&body) {
+        DeriveBatchItem::Prepared(template)
+    } else {
+        let req = serde_json::from_slice::<DeriveRequest>(&body)
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        let request = DeriveJsonLdDisclosureProofRequest {
             signed_document: req.verifiable_credential,
             selective_pointers: req.options.selective_pointers,
             presentation_header: req.options.presentation_header,
-        })
+        };
+        let prepared = prepare_jsonld_disclosure_proof(request).await?;
+        let template = PreparedDeriveTemplate::new(prepared).map_err(ApiError::bad_request)?;
+        let template = state.derive_template_cache.insert(body, template);
+        DeriveBatchItem::Prepared(template)
+    };
+    let derived = state
+        .derive_queue
+        .submit(item)
         .await
         .map_err(ApiError::bad_request)?;
-    Ok(Json(derived))
+    Ok(match derived {
+        DeriveBatchOutput::Serialized(body) => {
+            ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+        }
+        DeriveBatchOutput::Value(value) => Json(value).into_response(),
+    })
 }
 
 async fn derive_batch(
@@ -1069,18 +1222,30 @@ async fn derive_batch(
         pending.push(
             state
                 .derive_queue
-                .enqueue(DeriveJsonLdDisclosureProofRequest {
+                .enqueue(DeriveBatchItem::General(DeriveJsonLdDisclosureProofRequest {
                     signed_document: item.verifiable_credential,
                     selective_pointers: item.options.selective_pointers,
                     presentation_header: item.options.presentation_header,
-                })
+                }))
                 .await
                 .map_err(ApiError::bad_request)?,
         );
     }
-    Ok(Json(
-        api_results_from_receivers(pending, req.fail_fast).await,
-    ))
+    let mut results = Vec::with_capacity(pending.len());
+    for receiver in pending {
+        let result = receiver.receive().await.and_then(|output| match output {
+            DeriveBatchOutput::Value(value) => Ok(value),
+            DeriveBatchOutput::Serialized(body) => {
+                serde_json::from_slice(&body).map_err(|error| error.to_string())
+            }
+        });
+        let failed = result.is_err();
+        results.push(result);
+        if req.fail_fast && failed {
+            break;
+        }
+    }
+    Ok(Json(api_results_from_values(results, req.fail_fast)))
 }
 
 #[derive(Debug)]
@@ -1392,43 +1557,6 @@ fn api_results_from_values<T>(
     }
 }
 
-async fn api_results_from_receivers<T>(
-    receivers: Vec<BatchReceiver<T>>,
-    fail_fast: bool,
-) -> ApiBatchResult<T> {
-    let mut results = Vec::with_capacity(receivers.len());
-    for (index, receiver) in receivers.into_iter().enumerate() {
-        let result = receiver.receive().await;
-        let failed = result.is_err();
-        results.push(match result {
-            Ok(value) => ApiBatchItem {
-                index,
-                ok: true,
-                value: Some(value),
-                error: None,
-            },
-            Err(error) => ApiBatchItem {
-                index,
-                ok: false,
-                value: None,
-                error: Some(error),
-            },
-        });
-        if fail_fast && failed {
-            break;
-        }
-    }
-    let succeeded = results.iter().filter(|item| item.ok).count();
-    let failed = results.len() - succeeded;
-    ApiBatchResult {
-        ok: failed == 0,
-        attempted: results.len(),
-        succeeded,
-        failed,
-        results,
-    }
-}
-
 fn managed_verification_values(results: Vec<Result<bool, String>>) -> Vec<Result<Value, String>> {
     results
         .into_iter()
@@ -1464,24 +1592,33 @@ async fn process_issue_batch(
     }
 
     if !sign_requests.is_empty() {
-        match tokio::task::spawn_blocking(move || engine.sign_batch_shared(&sign_requests, false))
-            .await
-        {
-            Ok(batch) => {
-                for item in batch.results {
-                    if let Some((index, template, hmac_key)) = prepared_contexts.get(item.index) {
-                        let result = item
-                            .result
-                            .map_err(|error| error.to_string())
-                            .and_then(|signature| template.finish(signature, hmac_key))
-                            .map(IssueBatchOutput::Serialized);
-                        ordered[*index] = Some(result);
-                    }
+        let finished = tokio::task::spawn_blocking(move || {
+            let batch = engine.sign_batch_shared(&sign_requests, false);
+            let mut out = Vec::with_capacity(batch.results.len());
+            for item in batch.results {
+                if let Some((index, template, hmac_key)) = prepared_contexts.get(item.index) {
+                    let result = item
+                        .result
+                        .map_err(|error| error.to_string())
+                        .and_then(|signature| template.finish(signature, hmac_key))
+                        .map(IssueBatchOutput::Serialized);
+                    out.push((*index, result));
+                }
+            }
+            out
+        })
+        .await;
+        match finished {
+            Ok(items) => {
+                for (index, result) in items {
+                    ordered[index] = Some(result);
                 }
             }
             Err(error) => {
-                for (index, _, _) in &prepared_contexts {
-                    ordered[*index] = Some(Err(format!("BBS Sign worker failed: {error}")));
+                for slot in &mut ordered {
+                    if slot.is_none() {
+                        *slot = Some(Err(format!("BBS Sign worker failed: {error}")));
+                    }
                 }
             }
         }
@@ -1523,30 +1660,95 @@ async fn process_issue_batch(
 }
 
 async fn process_derive_batch(
-    items: Vec<DeriveJsonLdDisclosureProofRequest>,
+    engine: Arc<BbsEngine>,
+    items: Vec<DeriveBatchItem>,
     verification_cache: Arc<VerificationResultCache>,
-) -> Vec<Result<Value, String>> {
+) -> Vec<Result<DeriveBatchOutput, String>> {
     let expected = items.len();
-    let cacheable_outputs = items
-        .iter()
-        .map(|item| verification_cache.contains(&item.signed_document))
-        .collect::<Vec<_>>();
-    let results = ordered_batch_results(
-        derive_jsonld_disclosure_proof_batch(DeriveJsonLdDisclosureProofBatchRequest {
-            items,
-            fail_fast: false,
-        })
-        .await,
-        expected,
-    );
-    for (cacheable, result) in cacheable_outputs.into_iter().zip(&results) {
-        if cacheable {
-            if let Ok(document) = result {
-                verification_cache.insert(document);
+    let mut ordered = (0..expected)
+        .map(|_| None)
+        .collect::<Vec<Option<Result<DeriveBatchOutput, String>>>>();
+    let mut prepared_contexts = Vec::new();
+    let mut proof_gen_requests = Vec::new();
+    let mut general_indexes = Vec::new();
+    let mut general_requests = Vec::new();
+
+    for (index, item) in items.into_iter().enumerate() {
+        match item {
+            DeriveBatchItem::Prepared(template) => {
+                proof_gen_requests.push(template.proof_gen_request());
+                prepared_contexts.push((index, template));
+            }
+            DeriveBatchItem::General(request) => {
+                general_indexes.push(index);
+                general_requests.push(request);
             }
         }
     }
-    results
+
+    if !proof_gen_requests.is_empty() {
+        let finished = tokio::task::spawn_blocking(move || {
+            let batch = engine.proof_gen_batch_shared(&proof_gen_requests, false);
+            let mut out = Vec::with_capacity(batch.results.len());
+            for item in batch.results {
+                if let Some((index, template)) = prepared_contexts.get(item.index) {
+                    let result = item
+                        .result
+                        .map_err(|error| error.to_string())
+                        .and_then(|bbs_proof| template.finish(bbs_proof))
+                        .map(DeriveBatchOutput::Serialized);
+                    out.push((*index, result));
+                }
+            }
+            out
+        })
+        .await;
+        match finished {
+            Ok(items) => {
+                for (index, result) in items {
+                    ordered[index] = Some(result);
+                }
+            }
+            Err(error) => {
+                for slot in &mut ordered {
+                    if slot.is_none() {
+                        *slot = Some(Err(format!("BBS ProofGen worker failed: {error}")));
+                    }
+                }
+            }
+        }
+    }
+
+    if !general_requests.is_empty() {
+        let cacheable_outputs = if verification_cache.enabled() {
+            general_requests
+                .iter()
+                .map(|item| verification_cache.contains(&item.signed_document))
+                .collect::<Vec<_>>()
+        } else {
+            vec![false; general_requests.len()]
+        };
+        let batch = derive_jsonld_disclosure_proof_batch(DeriveJsonLdDisclosureProofBatchRequest {
+            items: general_requests,
+            fail_fast: false,
+        })
+        .await;
+        for item in batch.results {
+            if let Some(&index) = general_indexes.get(item.index) {
+                if cacheable_outputs.get(item.index).copied().unwrap_or(false) {
+                    if let Ok(document) = &item.result {
+                        verification_cache.insert(document);
+                    }
+                }
+                ordered[index] = Some(item.result.map(DeriveBatchOutput::Value));
+            }
+        }
+    }
+
+    ordered
+        .into_iter()
+        .map(|result| result.unwrap_or_else(|| Err("missing W3C Derive batch result".to_owned())))
+        .collect()
 }
 
 async fn process_prepared_base_verification(
@@ -1600,8 +1802,7 @@ async fn process_prepared_proof_verification(
         Err(error) => return (0..expected).map(|_| Err(error.clone())).collect(),
     };
     let batch = match tokio::task::spawn_blocking(move || {
-        let requests = items.iter().map(|item| (**item).clone()).collect();
-        engine.proof_verify_batch(requests, false)
+        engine.proof_verify_batch_shared(&items, false)
     })
     .await
     {
@@ -1630,21 +1831,6 @@ async fn process_prepared_proof_verification(
         .collect()
 }
 
-fn ordered_batch_results<T>(batch: BatchRunResult<T>, expected: usize) -> Vec<Result<T, String>> {
-    let mut ordered = (0..expected)
-        .map(|_| None)
-        .collect::<Vec<Option<Result<T, String>>>>();
-    for item in batch.results {
-        if item.index < expected {
-            ordered[item.index] = Some(item.result);
-        }
-    }
-    ordered
-        .into_iter()
-        .map(|result| result.unwrap_or_else(|| Err("missing W3C batch result".to_owned())))
-        .collect()
-}
-
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.status, Json(json!({"error": self.message}))).into_response()
@@ -1657,12 +1843,7 @@ mod tests {
 
     #[test]
     fn raw_template_hot_entry_remains_exact_and_bounded() {
-        let cache = RawTemplateCache {
-            capacity: 1,
-            state: RwLock::new(RawTemplateCacheState::default()),
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-        };
+        let cache = RawTemplateCache::with_capacity(1);
         let first = Bytes::from_static(br#"{"subject":"alice"}"#);
         let second = Bytes::from_static(br#"{"subject":"bob"}"#);
 

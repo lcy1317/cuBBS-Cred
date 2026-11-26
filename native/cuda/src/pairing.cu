@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 
 #if defined(CUBBS_BBS_ENABLE_SPPARK_MSM)
 #define FEATURE_BLS12_381
