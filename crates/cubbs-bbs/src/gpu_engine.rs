@@ -493,12 +493,19 @@ impl GpuBbsEngine {
                 if let Some((p_msgs, _, _)) =
                     unsafe { kernel.pipeline_pinned_scratch_slices(total_bytes, 0) }
                 {
+                    let dst_base = p_msgs.as_mut_ptr();
                     let mut byte_cursor = 0usize;
                     for &req_idx in &indices {
-                        for msg in &reqs[req_idx].borrow().messages {
+                        let msgs = reqs[req_idx].borrow().messages.as_slice();
+                        let n = msgs.len();
+                        for k in 0..n {
+                            if k + 8 < n {
+                                prefetch_msg_ptr(msgs[k + 8].as_ptr());
+                            }
+                            let msg = &msgs[k];
                             let len = msg.len();
                             if len > 0 {
-                                p_msgs[byte_cursor..byte_cursor + len].copy_from_slice(msg);
+                                unsafe { copy_msg_fast(msg.as_ptr(), dst_base.add(byte_cursor), len) };
                                 byte_cursor += len;
                             }
                         }
@@ -1006,10 +1013,7 @@ impl GpuBbsEngine {
         for (idx, r) in reqs.iter().enumerate() {
             let req = r.borrow();
             let m = req.messages.len();
-            if req.signature.len() != SIGNATURE_LEN
-                || req.public_key.len() != PUBLIC_KEY_LEN
-                || ensure_disclosed_indexes(&req.disclosed_indexes, m).is_err()
-            {
+            if req.signature.len() != SIGNATURE_LEN || req.public_key.len() != PUBLIC_KEY_LEN {
                 return None;
             }
             if let Some((_, _, indices)) = groups
@@ -1018,7 +1022,12 @@ impl GpuBbsEngine {
             {
                 indices.push(idx);
             } else {
-                groups.push((m, req.disclosed_indexes.clone(), vec![idx]));
+                if ensure_disclosed_indexes(&req.disclosed_indexes, m).is_err() {
+                    return None;
+                }
+                let mut indices = Vec::with_capacity(attempted);
+                indices.push(idx);
+                groups.push((m, req.disclosed_indexes.clone(), indices));
             }
         }
 
@@ -1115,12 +1124,19 @@ impl GpuBbsEngine {
                 if let Some((p_msgs, _, _)) =
                     unsafe { kernel.pipeline_pinned_scratch_slices(total_bytes, 0) }
                 {
+                    let dst_base = p_msgs.as_mut_ptr();
                     let mut byte_cursor = 0usize;
                     for &req_idx in &indices {
-                        for msg in &reqs[req_idx].borrow().messages {
+                        let msgs = reqs[req_idx].borrow().messages.as_slice();
+                        let n = msgs.len();
+                        for k in 0..n {
+                            if k + 8 < n {
+                                prefetch_msg_ptr(msgs[k + 8].as_ptr());
+                            }
+                            let msg = &msgs[k];
                             let len = msg.len();
                             if len > 0 {
-                                p_msgs[byte_cursor..byte_cursor + len].copy_from_slice(msg);
+                                unsafe { copy_msg_fast(msg.as_ptr(), dst_base.add(byte_cursor), len) };
                                 byte_cursor += len;
                             }
                         }
@@ -1306,8 +1322,8 @@ impl GpuBbsEngine {
         for (idx, r) in reqs.iter().enumerate() {
             let req = r.borrow();
             let m = req.total_message_count;
-            if ensure_disclosed_indexes(&req.disclosed_indexes, m).is_err()
-                || req.disclosed_messages.len() != req.disclosed_indexes.len()
+            if req.disclosed_messages.len() != req.disclosed_indexes.len()
+                || req.disclosed_indexes.len() > m
             {
                 return None;
             }
@@ -1321,7 +1337,12 @@ impl GpuBbsEngine {
             {
                 indices.push(idx);
             } else {
-                groups.push((m, req.disclosed_indexes.clone(), vec![idx]));
+                if ensure_disclosed_indexes(&req.disclosed_indexes, m).is_err() {
+                    return None;
+                }
+                let mut indices = Vec::with_capacity(attempted);
+                indices.push(idx);
+                groups.push((m, req.disclosed_indexes.clone(), indices));
             }
         }
 
@@ -1395,12 +1416,18 @@ impl GpuBbsEngine {
                 s.coefficients_le.clear();
                 s.coefficients_le.resize(group_len * 32, 0u8);
                 let mut rng = rand::thread_rng();
+                let raw_start = group_len * 16;
+                rng.fill_bytes(&mut s.coefficients_le[raw_start..]);
                 for i in 0..group_len {
-                    let slot = &mut s.coefficients_le[i * 32..i * 32 + 16];
-                    rng.fill_bytes(slot);
-                    if slot.iter().all(|&b| b == 0) {
-                        slot[0] = 1;
+                    let src_off = raw_start + i * 16;
+                    let dst_off = i * 32;
+                    let mut c = [0u8; 16];
+                    c.copy_from_slice(&s.coefficients_le[src_off..src_off + 16]);
+                    if c == [0u8; 16] {
+                        c[0] = 1;
                     }
+                    s.coefficients_le[dst_off..dst_off + 16].copy_from_slice(&c);
+                    s.coefficients_le[dst_off + 16..dst_off + 32].fill(0);
                 }
 
                 s.proofs.clear();
@@ -1455,12 +1482,21 @@ impl GpuBbsEngine {
                     if let Some((p_msgs, _, _)) =
                         unsafe { kernel.pipeline_pinned_scratch_slices(total_bytes, 0) }
                     {
+                        let dst_base = p_msgs.as_mut_ptr();
                         let mut byte_cursor = 0usize;
                         for &req_idx in &indices {
-                            for msg in &reqs[req_idx].borrow().disclosed_messages {
+                            let msgs = reqs[req_idx].borrow().disclosed_messages.as_slice();
+                            let n = msgs.len();
+                            for k in 0..n {
+                                if k + 8 < n {
+                                    prefetch_msg_ptr(msgs[k + 8].as_ptr());
+                                }
+                                let msg = &msgs[k];
                                 let len = msg.len();
                                 if len > 0 {
-                                    p_msgs[byte_cursor..byte_cursor + len].copy_from_slice(msg);
+                                    unsafe {
+                                        copy_msg_fast(msg.as_ptr(), dst_base.add(byte_cursor), len)
+                                    };
                                     byte_cursor += len;
                                 }
                             }
@@ -4011,12 +4047,16 @@ impl GpuBbsEngine {
     ) -> BbsBatchRunResult<Vec<u8>> {
         match &self.kernel {
             Some(kernel) if kernel.can_precompute_message_scalars() => {
+                if !(force_gpu_execution() && !kernel.can_g1_msm()) {
+                    if let Some(result) =
+                        self.sign_batch_fused_resident_gpu(kernel, &reqs, fail_fast)
+                    {
+                        return result;
+                    }
+                }
                 let plan = planner::CuBbsPlanner::plan_sign(&reqs);
                 if let Some(error) = gpu_runtime_plan_error(kernel, &plan) {
                     return batch_call_error(reqs.len(), error, fail_fast);
-                }
-                if let Some(result) = self.sign_batch_fused_resident_gpu(kernel, &reqs, fail_fast) {
-                    return result;
                 }
                 if sign_shape_batching_enabled() {
                     if let Some(result) = self.sign_batch_with_gpu_shape_batching(
@@ -4163,6 +4203,13 @@ impl GpuBbsEngine {
     ) -> BbsBatchRunResult<bool> {
         match &self.kernel {
             Some(kernel) if kernel.can_precompute_message_scalars() => {
+                if !(force_gpu_execution() && (!kernel.can_g1_msm() || !kernel.can_pairing_eq())) {
+                    if let Some(result) =
+                        self.verify_batch_pre_b_aggregate_fused_resident_gpu(kernel, reqs, None)
+                    {
+                        return result;
+                    }
+                }
                 let plan = planner::CuBbsPlanner::plan_verify(reqs);
                 if let Some(error) = gpu_runtime_plan_error(kernel, &plan) {
                     return batch_call_error(reqs.len(), error, fail_fast);
@@ -4231,14 +4278,16 @@ impl GpuBbsEngine {
     ) -> BbsBatchRunResult<Vec<u8>> {
         match &self.kernel {
             Some(kernel) if kernel.can_precompute_message_scalars() => {
+                if !(force_gpu_execution() && !kernel.can_g1_msm()) {
+                    if let Some(result) =
+                        self.proof_gen_batch_fused_resident_gpu(kernel, &reqs, fail_fast)
+                    {
+                        return result;
+                    }
+                }
                 let plan = planner::CuBbsPlanner::plan_proof_gen(&reqs);
                 if let Some(error) = gpu_runtime_plan_error(kernel, &plan) {
                     return batch_call_error(reqs.len(), error, fail_fast);
-                }
-                if let Some(result) =
-                    self.proof_gen_batch_fused_resident_gpu(kernel, &reqs, fail_fast)
-                {
-                    return result;
                 }
                 if proof_bbs_mixed_shape_batching_enabled() {
                     if proof_gen_shape_batching_eligible(&reqs) {
@@ -4288,14 +4337,16 @@ impl GpuBbsEngine {
     ) -> BbsBatchRunResult<bool> {
         match &self.kernel {
             Some(kernel) if kernel.can_precompute_message_scalars() => {
+                if !(force_gpu_execution() && (!kernel.can_g1_msm() || !kernel.can_pairing_eq())) {
+                    if let Some(result) =
+                        self.proof_verify_batch_fused_resident_gpu(kernel, &reqs, fail_fast)
+                    {
+                        return result;
+                    }
+                }
                 let plan = planner::CuBbsPlanner::plan_proof_verify(&reqs);
                 if let Some(error) = gpu_runtime_plan_error(kernel, &plan) {
                     return batch_call_error(reqs.len(), error, fail_fast);
-                }
-                if let Some(result) =
-                    self.proof_verify_batch_fused_resident_gpu(kernel, &reqs, fail_fast)
-                {
-                    return result;
                 }
                 if kernel.can_precompute_message_scalars() && kernel.can_g1_msm() {
                     return self.profile_proof_verify_batch(reqs, fail_fast).result;

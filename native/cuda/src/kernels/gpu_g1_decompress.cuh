@@ -227,7 +227,8 @@ __global__ static void cubbs_bbs_g1_uncompress_strided_kernel(
 }
 
 // Kernel: scale each affine G1 point P_i by a 128-bit LE scalar r_i (at 32B stride)
-// using signed radix-16 windowing (no GLV needed since r_i is already <= 128 bits!).
+// using Non-Adjacent Form (NAF: signed binary {-1, 0, +1}, 0 SMEM, ~42.7 mixed
+// affine additions instead of ~64 — 33% fewer additions than binary!).
 // Outputs XYZZ points for fast 64-thread Montgomery batch normalization to affine.
 __global__ static void cubbs_bbs_g1_scale_128bit_to_xyzz_kernel(
     const cubbs_sppark_plain_affine_t *points_in,
@@ -241,23 +242,56 @@ __global__ static void cubbs_bbs_g1_scale_128bit_to_xyzz_kernel(
   const cubbs_sppark_plain_affine_t p = points_in[idx * point_stride];
   const uint8_t *s_le = scalars_le_stride32 + (idx * 32u);
 
-  // Build small 4-bit unsigned table in registers? Even better: 2-bit table [1P, 2P, 3P]
-  // in XYZZ or direct binary signed-radix-4 (only 64 iterations, 128 doublings + ~42 adds,
-  // 0 SMEM, tiny register footprint, < 25 us for 512 points!).
   uint64_t lo = 0ull, hi = 0ull;
   memcpy(&lo, s_le, 8u);
   memcpy(&hi, s_le + 8u, 8u);
 
+  // Convert 128-bit unsigned (hi:lo) to 129-digit NAF bitmasks (pos, neg, top_pos).
+  uint64_t pos_lo = 0ull, pos_hi = 0ull;
+  uint64_t neg_lo = 0ull, neg_hi = 0ull;
+  uint32_t carry = 0u;
+  #pragma unroll 1
+  for (uint32_t b = 0u; b < 128u; ++b) {
+    if ((lo & 1ull) != 0ull) {
+      if ((lo & 2ull) != 0ull) {
+        // digit = -1, add 1 to (carry:hi:lo) before shifting right by 1.
+        if (b < 64u) neg_lo |= (1ull << b);
+        else neg_hi |= (1ull << (b - 64u));
+        lo += 1ull;
+        if (lo == 0ull) {
+          hi += 1ull;
+          if (hi == 0ull) carry += 1u;
+        }
+      } else {
+        // digit = +1, subtract 1 (clears LSB, handled by >> 1).
+        if (b < 64u) pos_lo |= (1ull << b);
+        else pos_hi |= (1ull << (b - 64u));
+      }
+    }
+    lo = (lo >> 1u) | (hi << 63u);
+    hi = (hi >> 1u) | (static_cast<uint64_t>(carry) << 63u);
+    carry >>= 1u;
+  }
+  const bool top_pos = (lo != 0ull);
+
   cubbs_sppark_bucket_t acc;
-  acc.inf();
+  if (top_pos) {
+    acc = p;
+  } else {
+    acc.inf();
+  }
   #pragma unroll 1
   for (int bit = 127; bit >= 0; --bit) {
     if (!acc.is_inf()) {
       cubbs_bbs_xyzz_dbl_u(acc);
     }
-    const uint64_t word = (bit >= 64) ? hi : lo;
-    if (((word >> (bit & 63)) & 1ull) != 0ull) {
+    const uint32_t shift = static_cast<uint32_t>(bit & 63);
+    const uint64_t pw = (bit >= 64) ? pos_hi : pos_lo;
+    const uint64_t nw = (bit >= 64) ? neg_hi : neg_lo;
+    if (((pw >> shift) & 1ull) != 0ull) {
       acc.uadd(p, false);
+    } else if (((nw >> shift) & 1ull) != 0ull) {
+      acc.uadd(p, true);
     }
   }
   xyzz_out[idx] = acc;

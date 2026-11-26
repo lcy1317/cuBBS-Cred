@@ -1196,12 +1196,16 @@ __global__ static void cubbs_bbs_verify_reduce_tiled_partials_kernel(
   memcpy(agg_b_scalars_le + ((2u + j) * 32u), &acc, 32u);
 }
 
-// Builds dual A-MSM scalar buffer on GPU:
-//   dual_scalars_le[0 .. B-1]     = c_i
-//   dual_scalars_le[B .. 2*B-1]   = -(e_i * c_i) mod r
+// Builds A-MSM scalar buffer on GPU:
+//   Same-PK (unique_pk == false):
+//     dual_scalars_le[0 .. B-1]   = c_i
+//     dual_scalars_le[B .. 2*B-1] = -(e_i * c_i) mod r
+//   Unique-PK (unique_pk == true):
+//     dual_scalars_le[0 .. B-1]   = -(e_i * c_i) mod r  (skip unused c_i stream!)
 __global__ static void cubbs_bbs_verify_build_dual_a_scalars_kernel(
     const uint8_t *signatures_e_be, const uint8_t *coefficients_le,
-    size_t item_count, uint8_t *dual_scalars_le, uint32_t *invalid_out) {
+    size_t item_count, bool unique_pk, uint8_t *dual_scalars_le,
+    uint32_t *invalid_out) {
   const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= item_count) return;
 
@@ -1209,7 +1213,9 @@ __global__ static void cubbs_bbs_verify_build_dual_a_scalars_kernel(
   if (!cubbs_bbs_scalar_be_is_canonical(e_be)) {
     atomicExch(invalid_out, 1u);
     memset(dual_scalars_le + (i * 32u), 0, 32u);
-    memset(dual_scalars_le + ((item_count + i) * 32u), 0, 32u);
+    if (!unique_pk) {
+      memset(dual_scalars_le + ((item_count + i) * 32u), 0, 32u);
+    }
     return;
   }
   uint8_t e_le[32];
@@ -1220,15 +1226,31 @@ __global__ static void cubbs_bbs_verify_build_dual_a_scalars_kernel(
   cubbs_sppark_scalar_t fr_c;
   memcpy(&fr_e, e_le, 32u);
   memcpy(&fr_c, coefficients_le + (i * 32u), 32u);
-  // Write lhs scalar c_i verbatim (already LE).
-  memcpy(dual_scalars_le + (i * 32u), &fr_c, 32u);
+  if (!unique_pk) {
+    // Write lhs scalar c_i verbatim (already LE).
+    memcpy(dual_scalars_le + (i * 32u), &fr_c, 32u);
+  }
 
   fr_e.to();
   fr_c.to();
   cubbs_sppark_scalar_t prod = fr_e * fr_c;
   prod.cneg(true);
   prod.from();
-  memcpy(dual_scalars_le + ((item_count + i) * 32u), &prod, 32u);
+  const size_t ae_slot = unique_pk ? i : (item_count + i);
+  memcpy(dual_scalars_le + (ae_slot * 32u), &prod, 32u);
+}
+
+// Single-stream GLV table mul for small-B Unique-PK Verify (50% less work than dual!).
+__global__ static void cubbs_bbs_g1_single_msm_same_points_table_mul_kernel(
+    const cubbs_sppark_bucket_t *tables,
+    const uint8_t *components_le, size_t item_count,
+    cubbs_sppark_bucket_t *products) {
+  const size_t item = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (item >= item_count) return;
+  const uint8_t *components = components_le + (item * 32u);
+  products[item] =
+      cubbs_bbs_g1_scalar_mul_glv_signed_radix16_shared(
+          tables + (item * 9u), components, components + 16u);
 }
 
 // ============================================================================
@@ -1264,7 +1286,8 @@ __device__ __forceinline__ static void cubbs_bbs_recode_s8_128_store(
 
 __global__ static void cubbs_bbs_verify_pippenger_recode_kernel(
     const uint8_t *signatures_e_be, const uint8_t *coefficients_le,
-    size_t item_count, int16_t *digits_out, uint32_t *invalid_out) {
+    size_t item_count, bool skip_c_stream, int16_t *digits_out,
+    uint32_t *invalid_out) {
   const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= item_count) return;
 
@@ -1279,7 +1302,9 @@ __global__ static void cubbs_bbs_verify_pippenger_recode_kernel(
     const uint8_t zero16[16] = {};
     cubbs_bbs_recode_s8_128_store(zero16, i, item_count, digits_out);
     cubbs_bbs_recode_s8_128_store(zero16, i, item_count, digits_out + (17u * item_count));
-    cubbs_bbs_recode_s8_128_store(zero16, i, item_count, digits_out + (34u * item_count));
+    if (!skip_c_stream) {
+      cubbs_bbs_recode_s8_128_store(zero16, i, item_count, digits_out + (34u * item_count));
+    }
     return;
   }
 
@@ -1303,9 +1328,15 @@ __global__ static void cubbs_bbs_verify_pippenger_recode_kernel(
   uint8_t k2_le[16];
   cubbs_bbs_scalar_div_by_z2_device(prod_le, k1_le, k2_le);
 
-  cubbs_bbs_recode_s8_128_store(c_le, i, item_count, digits_out);
-  cubbs_bbs_recode_s8_128_store(k1_le, i, item_count, digits_out + (17u * item_count));
-  cubbs_bbs_recode_s8_128_store(k2_le, i, item_count, digits_out + (34u * item_count));
+  if (skip_c_stream) {
+    // Unique-PK Verify: only need (-r_i * e_i) * A_i (2 GLV streams, 33% less work!).
+    cubbs_bbs_recode_s8_128_store(k1_le, i, item_count, digits_out);
+    cubbs_bbs_recode_s8_128_store(k2_le, i, item_count, digits_out + (17u * item_count));
+  } else {
+    cubbs_bbs_recode_s8_128_store(c_le, i, item_count, digits_out);
+    cubbs_bbs_recode_s8_128_store(k1_le, i, item_count, digits_out + (17u * item_count));
+    cubbs_bbs_recode_s8_128_store(k2_le, i, item_count, digits_out + (34u * item_count));
+  }
 }
 
 // Generic Signed 8-bit (17-window, 128-bucket) Pippenger bucket accumulator.
@@ -1428,11 +1459,15 @@ cubbs_bbs_verify_pippenger_buckets_s8_kernel(
   }
 }
 
+// combine_mode:
+//   0 = direct outputs[s] = s_out[s] (ProofVerify: 2 streams Same-PK or 1 stream Unique-PK)
+//   1 = Same-PK Verify (3 streams): outputs[0] = s_out[0], outputs[1] = s_out[1] + endo(s_out[2])
+//   2 = Unique-PK Verify (2 GLV streams): outputs[0] = inf, outputs[1] = s_out[0] + endo(s_out[1])
 __global__ static void cubbs_bbs_verify_pippenger_combine_s8_kernel(
     const cubbs_sppark_bucket_t *win_chunk_sums,
     uint32_t chunks,
     uint32_t num_streams,
-    bool combine_glv_12,
+    uint32_t combine_mode,
     cubbs_sppark_bucket_t *outputs) {
   __shared__ __align__(16) uint8_t s_win_raw[3u * 17u * sizeof(cubbs_sppark_bucket_t)];
   __shared__ __align__(16) uint8_t s_out_raw[3u * sizeof(cubbs_sppark_bucket_t)];
@@ -1462,42 +1497,58 @@ __global__ static void cubbs_bbs_verify_pippenger_combine_s8_kernel(
       }
       acc.uadd(s_win[tid * 17u + static_cast<uint32_t>(w)]);
     }
-    if (combine_glv_12 && tid == 2u) {
+    if ((combine_mode == 1u && tid == 2u) || (combine_mode == 2u && tid == 1u)) {
       cubbs_bbs_apply_glv_endomorphism(acc);
     }
     s_out[tid] = acc;
   }
   __syncwarp();
 
-  if (tid == 0u) {
-    outputs[0] = s_out[0];
-  } else if (tid == 1u) {
-    cubbs_sppark_bucket_t second = s_out[1];
-    if (combine_glv_12) second.uadd(s_out[2]);
-    outputs[1] = second;
+  if (combine_mode == 2u) {
+    if (tid == 0u) {
+      outputs[0].inf();
+    } else if (tid == 1u) {
+      cubbs_sppark_bucket_t second = s_out[0];
+      second.add(s_out[1]);
+      outputs[1] = second;
+    }
+  } else if (combine_mode == 1u) {
+    if (tid == 0u) {
+      outputs[0] = s_out[0];
+    } else if (tid == 1u) {
+      cubbs_sppark_bucket_t second = s_out[1];
+      second.add(s_out[2]);
+      outputs[1] = second;
+    }
+  } else {
+    if (tid < num_streams) {
+      outputs[tid] = s_out[tid];
+    }
   }
 }
 
-// Adds rhs = b_agg + ae_agg and normalizes (a_agg, rhs_agg) to two plain affine points
-// in Montgomery form for direct consumption by cubbs_bbs_cuda_launch_pairing_eq_single_on_stream.
+// Adds rhs = b_agg + ae_agg and normalizes (a_agg, rhs_agg) to plain affine points
+// in Montgomery form. When unique_pk == true, skips unused a_agg (outputs[0]).
 __global__ static void cubbs_bbs_verify_finalize_pair_affines_kernel(
     const cubbs_sppark_bucket_t *a_and_ae_outputs,
     const cubbs_sppark_bucket_t *b_output,
+    bool unique_pk,
     cubbs_sppark_plain_affine_t *pair_affines_out,
     uint32_t *inf_flag_out) {
   const uint32_t tid = threadIdx.x;
   __shared__ __align__(16) uint8_t pts_smem[2u * sizeof(cubbs_sppark_bucket_t)];
   auto *pts = reinterpret_cast<cubbs_sppark_bucket_t *>(pts_smem);
   if (tid == 0u) {
-    pts[0] = a_and_ae_outputs[0];
+    if (unique_pk) {
+      pts[0].inf();
+    } else {
+      pts[0] = a_and_ae_outputs[0];
+    }
     cubbs_sppark_bucket_t rhs = *b_output;
     rhs.add(a_and_ae_outputs[1]);
     pts[1] = rhs;
-    if (pts[0].is_inf() || pts[1].is_inf()) {
-      *inf_flag_out = 1u;
-    } else {
-      *inf_flag_out = 0u;
-    }
+    const bool any_inf = unique_pk ? pts[1].is_inf() : (pts[0].is_inf() || pts[1].is_inf());
+    *inf_flag_out = any_inf ? 1u : 0u;
   }
   __syncthreads();
 
@@ -1767,6 +1818,7 @@ int32_t cubbs_bbs_cuda_verify_pre_b_aggregate_fused(
   const size_t d_h2s_partials_count =
       (use_fused_tiled_h2s && h2s_chunks > 1u) ? (static_cast<size_t>(h2s_chunks) * uniform_msg_count) : 0u;
   auto &arena = cubbs_bbs_thread_device_arena();
+  const uint32_t pipp_streams = unique_pk ? 2u : 3u;
   const size_t arena_bytes =
       CuBbsDeviceArena::align_up(item->packed_messages_len) +
       CuBbsDeviceArena::align_up(d_off_bytes) +
@@ -1780,8 +1832,8 @@ int32_t cubbs_bbs_cuda_verify_pre_b_aggregate_fused(
       CuBbsDeviceArena::align_up(2u * sizeof(cubbs_sppark_plain_affine_t)) +
       CuBbsDeviceArena::align_up(sizeof(uint8_t)) +
       (use_pippenger
-           ? (CuBbsDeviceArena::align_up(51u * item_count * sizeof(int16_t)) +
-              CuBbsDeviceArena::align_up(51u * chunks * sizeof(cubbs_sppark_bucket_t)))
+           ? (CuBbsDeviceArena::align_up(static_cast<size_t>(pipp_streams) * 17u * item_count * sizeof(int16_t)) +
+              CuBbsDeviceArena::align_up(static_cast<size_t>(pipp_streams) * 17u * chunks * sizeof(cubbs_sppark_bucket_t)))
            : 0u) +
       (unique_pk
            ? (CuBbsDeviceArena::align_up(item_count * sizeof(cubbs_sppark_bucket_t)) +
@@ -1821,8 +1873,8 @@ int32_t cubbs_bbs_cuda_verify_pre_b_aggregate_fused(
     d_inf_flag = arena.alloc<uint32_t>(1u);
     d_eq_out = arena.alloc<uint8_t>(1u);
     if (use_pippenger) {
-      d_digits = arena.alloc<int16_t>(51u * item_count);
-      d_win_chunk_sums = arena.alloc<cubbs_sppark_bucket_t>(51u * chunks);
+      d_digits = arena.alloc<int16_t>(static_cast<size_t>(pipp_streams) * 17u * item_count);
+      d_win_chunk_sums = arena.alloc<cubbs_sppark_bucket_t>(static_cast<size_t>(pipp_streams) * 17u * chunks);
     }
     if (unique_pk) {
       d_scaled_a_xyzz = arena.alloc<cubbs_sppark_bucket_t>(item_count);
@@ -1933,16 +1985,16 @@ int32_t cubbs_bbs_cuda_verify_pre_b_aggregate_fused(
     }
   }
 
-  // Stage 3: Dual A-MSM (sum r_i A_i, sum (-r_i e_i) A_i).
+  // Stage 3: A-MSM (Same-PK: sum r_i A_i & sum (-r_i e_i) A_i; Unique-PK: ONLY sum (-r_i e_i) A_i!).
   if (err == cudaSuccess && use_pippenger) {
     constexpr uint32_t r_threads = 128u;
     const uint32_t r_blocks = static_cast<uint32_t>(
         (item_count + r_threads - 1u) / r_threads);
     cubbs_bbs_verify_pippenger_recode_kernel<<<r_blocks, r_threads, 0u, stream_b>>>(
-        d_e, d_coef, item_count, d_digits, d_invalid);
+        d_e, d_coef, item_count, unique_pk, d_digits, d_invalid);
     err = cudaGetLastError();
     if (err == cudaSuccess) {
-      const dim3 bucket_grid(17u, 3u, chunks);
+      const dim3 bucket_grid(17u, pipp_streams, chunks);
       cubbs_bbs_verify_pippenger_buckets_s8_kernel<<<bucket_grid, 128u, 0u, stream_b>>>(
           dual_ws.points, 0u, d_digits, 17u * item_count, item_count, chunks,
           d_win_chunk_sums);
@@ -1950,7 +2002,7 @@ int32_t cubbs_bbs_cuda_verify_pre_b_aggregate_fused(
     }
     if (err == cudaSuccess) {
       cubbs_bbs_verify_pippenger_combine_s8_kernel<<<1u, 32u, 0u, stream_b>>>(
-          d_win_chunk_sums, chunks, 3u, true, dual_ws.outputs);
+          d_win_chunk_sums, chunks, pipp_streams, unique_pk ? 2u : 1u, dual_ws.outputs);
       err = cudaGetLastError();
     }
   } else if (err == cudaSuccess) {
@@ -1958,25 +2010,36 @@ int32_t cubbs_bbs_cuda_verify_pre_b_aggregate_fused(
     const uint32_t s_blocks = static_cast<uint32_t>(
         (item_count + s_threads - 1u) / s_threads);
     cubbs_bbs_verify_build_dual_a_scalars_kernel<<<s_blocks, s_threads, 0u, stream_b>>>(
-        d_e, d_coef, item_count, dual_ws.scalars, d_invalid);
+        d_e, d_coef, item_count, unique_pk, dual_ws.scalars, d_invalid);
     err = cudaGetLastError();
     if (err == cudaSuccess) {
       constexpr uint32_t threads = 128u;
-      const size_t product_count = item_count * 2u;
+      const size_t product_count = unique_pk ? item_count : (item_count * 2u);
       const uint32_t blocks = static_cast<uint32_t>(
           (product_count + threads - 1u) / threads);
       cubbs_bbs_g1_dual_msm_decompose_kernel<<<blocks, threads, 0u, stream_b>>>(
           dual_ws.scalars, product_count, dual_ws.components);
       err = cudaGetLastError();
       if (err == cudaSuccess) {
-        cubbs_bbs_g1_dual_msm_same_points_table_mul_kernel<<<blocks, threads, 0u, stream_b>>>(
-            dual_ws.tables, dual_ws.components, item_count, dual_ws.products);
+        if (unique_pk) {
+          cubbs_bbs_g1_single_msm_same_points_table_mul_kernel<<<blocks, threads, 0u, stream_b>>>(
+              dual_ws.tables, dual_ws.components, item_count, dual_ws.products);
+        } else {
+          cubbs_bbs_g1_dual_msm_same_points_table_mul_kernel<<<blocks, threads, 0u, stream_b>>>(
+              dual_ws.tables, dual_ws.components, item_count, dual_ws.products);
+        }
         err = cudaGetLastError();
       }
       if (err == cudaSuccess) {
-        const dim3 reduce_grid(1u, 2u, 1u);
-        cubbs_bbs_g1_dual_msm_reduce_all_kernel<128u><<<reduce_grid, 128u, 0u, stream_b>>>(
-            dual_ws.products, item_count, dual_ws.outputs);
+        if (unique_pk) {
+          const dim3 reduce_grid(1u, 1u, 1u);
+          cubbs_bbs_g1_dual_msm_reduce_all_kernel<128u><<<reduce_grid, 128u, 0u, stream_b>>>(
+              dual_ws.products, item_count, &dual_ws.outputs[1]);
+        } else {
+          const dim3 reduce_grid(1u, 2u, 1u);
+          cubbs_bbs_g1_dual_msm_reduce_all_kernel<128u><<<reduce_grid, 128u, 0u, stream_b>>>(
+              dual_ws.products, item_count, dual_ws.outputs);
+        }
         err = cudaGetLastError();
       }
     }
@@ -1985,7 +2048,7 @@ int32_t cubbs_bbs_cuda_verify_pre_b_aggregate_fused(
   // Stage 4: Finalize (a_agg, S_g2 = sum r_i*(B_i - e_i*A_i)) and run GPU pairing!
   if (err == cudaSuccess) {
     cubbs_bbs_verify_finalize_pair_affines_kernel<<<1u, 32u, 0u, stream_b>>>(
-        dual_ws.outputs, d_b_output, d_pair_affines, d_inf_flag);
+        dual_ws.outputs, d_b_output, unique_pk, d_pair_affines, d_inf_flag);
     err = cudaGetLastError();
   }
   if (err == cudaSuccess) {

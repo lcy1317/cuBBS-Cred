@@ -1152,8 +1152,10 @@ __global__ static void cubbs_bbs_proof_verify_parse_and_build_kernel(
     atomicExch(invalid_out, 1u);
     memset(row_common, 0, term_count * 32u);
     memset(row_ps, 0, 4u * 32u);
-    const uint8_t zero16[16] = {};
-    cubbs_bbs_recode_s8_128_store(zero16, row, item_count, coef_digits_out);
+    if (coef_digits_out != nullptr) {
+      const uint8_t zero16[16] = {};
+      cubbs_bbs_recode_s8_128_store(zero16, row, item_count, coef_digits_out);
+    }
     return;
   }
 
@@ -1202,19 +1204,60 @@ __global__ static void cubbs_bbs_proof_verify_parse_and_build_kernel(
     }
   }
 
-  cubbs_bbs_recode_s8_128_store(coef_le, row, item_count, coef_digits_out);
+  if (coef_digits_out != nullptr) {
+    cubbs_bbs_recode_s8_128_store(coef_le, row, item_count, coef_digits_out);
+  }
 }
 
-// Extract [Abar_0..Abar_{B-1}, Bbar_0..Bbar_{B-1}] from interleaved [Abar,Bbar,D]
-// for coalesced 2-stream Signed 8-bit Pippenger aggregate pairing MSM.
+// Extract [Abar_0..Abar_{B-1}, Bbar_0..Bbar_{B-1}] (Same-PK) OR ONLY [Bbar_0..Bbar_{B-1}]
+// (Unique-PK, 50% less work!) from interleaved [Abar,Bbar,D].
 __global__ static void cubbs_bbs_proof_verify_extract_ab_kernel(
     const cubbs_sppark_plain_affine_t *proof_bases_3,
-    cubbs_sppark_plain_affine_t *ab_streams_2,
-    size_t item_count) {
+    cubbs_sppark_plain_affine_t *ab_streams_out,
+    size_t item_count,
+    bool only_bbar) {
   const size_t row = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (row >= item_count) return;
-  ab_streams_2[row] = proof_bases_3[row * 3u + 0u];
-  ab_streams_2[item_count + row] = proof_bases_3[row * 3u + 1u];
+  if (only_bbar) {
+    ab_streams_out[row] = proof_bases_3[row * 3u + 1u];
+  } else {
+    ab_streams_out[row] = proof_bases_3[row * 3u + 0u];
+    ab_streams_out[item_count + row] = proof_bases_3[row * 3u + 1u];
+  }
+}
+
+// Fast 128-bit scalar mul r_i * Abar_i reusing the ALREADY-BUILT Radix-16 affine
+// table [1*Abar_i .. 8*Abar_i] from Stage 1b (~30 mixed adds instead of ~64!).
+__global__ static void cubbs_bbs_g1_scale_128bit_from_radix16_aff_kernel(
+    const cubbs_sppark_plain_affine_t *radix16_tables_3, // stride 3 * 8 per proof; Abar at +0
+    const uint8_t *scalars_le_stride32,
+    size_t item_count,
+    cubbs_sppark_bucket_t *xyzz_out) {
+  const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= item_count) return;
+
+  const uint8_t *s_le = scalars_le_stride32 + (idx * 32u);
+  uint64_t digs[3];
+  cubbs_bbs_pack_signed_radix16(s_le, digs);
+
+  const cubbs_sppark_plain_affine_t *tbl = radix16_tables_3 + (idx * 24u);
+  cubbs_sppark_bucket_t acc;
+  acc.inf();
+  #pragma unroll 1
+  for (int window = 32; window >= 0; --window) {
+    if (!acc.is_inf()) {
+      #pragma unroll 1
+      for (uint32_t doubling = 0u; doubling < 4u; ++doubling) {
+        cubbs_bbs_xyzz_dbl_u(acc);
+      }
+    }
+    const int32_t d = cubbs_bbs_signed_radix16_digit(digs, static_cast<uint32_t>(window));
+    if (d != 0) {
+      const uint32_t mag = static_cast<uint32_t>(d < 0 ? -d : d);
+      acc.uadd(tbl[mag - 1u], d < 0);
+    }
+  }
+  xyzz_out[idx] = acc;
 }
 
 // Compress T1[row] and T2[row] by packing into one contiguous 2*B array first?
@@ -1259,19 +1302,26 @@ __global__ static void cubbs_bbs_proof_verify_check_challenge_kernel(
 }
 
 // Normalize aggregate (lhs_agg, rhs_agg) to affine for inline GPU pairing check.
+// When unique_pk == true, skips unused lhs_agg (agg_outputs[0]).
 __global__ static void cubbs_bbs_proof_verify_finalize_pair_affines_kernel(
     const cubbs_sppark_bucket_t *agg_outputs,
+    bool unique_pk,
     cubbs_sppark_plain_affine_t *pair_affines_out,
     uint32_t *inf_flag_out) {
   const uint32_t tid = threadIdx.x;
   __shared__ __align__(16) uint8_t pts_smem[2u * sizeof(cubbs_sppark_bucket_t)];
   auto *pts = reinterpret_cast<cubbs_sppark_bucket_t *>(pts_smem);
   if (tid < 2u) {
-    pts[tid] = agg_outputs[tid];
+    if (unique_pk && tid == 0u) {
+      pts[0].inf();
+    } else {
+      pts[tid] = agg_outputs[tid];
+    }
   }
   __syncwarp();
   if (tid == 0u) {
-    *inf_flag_out = (pts[0].is_inf() || pts[1].is_inf()) ? 1u : 0u;
+    const bool any_inf = unique_pk ? pts[1].is_inf() : (pts[0].is_inf() || pts[1].is_inf());
+    *inf_flag_out = any_inf ? 1u : 0u;
   }
   __syncwarp();
 
@@ -1482,6 +1532,7 @@ int32_t cubbs_bbs_cuda_proof_verify_fused_common_batch(
       : (meta_u32 ? ((total_disclosed + 1u) * sizeof(uint32_t)) : 0u);
   const size_t d_len_bytes = meta_u64 ? (total_disclosed * sizeof(uint64_t)) : 0u;
   auto &arena = cubbs_bbs_thread_device_arena();
+  const uint32_t pair_streams = unique_pk ? 1u : 2u;
   const size_t arena_bytes =
       CuBbsDeviceArena::align_up(item->packed_disclosed_messages_len) +
       CuBbsDeviceArena::align_up(d_off_bytes) +
@@ -1490,12 +1541,12 @@ int32_t cubbs_bbs_cuda_proof_verify_fused_common_batch(
       CuBbsDeviceArena::align_up(std::max<size_t>(1u, off)) +
       CuBbsDeviceArena::align_up(item_count * term_count * 32u) +
       CuBbsDeviceArena::align_up(item_count * 4u * 32u) +
-      CuBbsDeviceArena::align_up(17u * item_count * sizeof(int16_t)) +
+      (!skip_pairing ? CuBbsDeviceArena::align_up(17u * item_count * sizeof(int16_t)) : 0u) +
       CuBbsDeviceArena::align_up(item_count * 2u * sizeof(cubbs_sppark_bucket_t)) +
       CuBbsDeviceArena::align_up(item_count * 2u * 48u) +
       (!skip_pairing
-           ? (CuBbsDeviceArena::align_up(item_count * 2u * sizeof(cubbs_sppark_plain_affine_t)) +
-              CuBbsDeviceArena::align_up(34u * chunks * sizeof(cubbs_sppark_bucket_t)) +
+           ? (CuBbsDeviceArena::align_up(item_count * static_cast<size_t>(pair_streams) * sizeof(cubbs_sppark_plain_affine_t)) +
+              CuBbsDeviceArena::align_up(static_cast<size_t>(pair_streams) * 17u * chunks * sizeof(cubbs_sppark_bucket_t)) +
               CuBbsDeviceArena::align_up(2u * sizeof(cubbs_sppark_bucket_t)) +
               CuBbsDeviceArena::align_up(2u * sizeof(cubbs_sppark_plain_affine_t)) +
               CuBbsDeviceArena::align_up(sizeof(uint8_t)))
@@ -1535,12 +1586,14 @@ int32_t cubbs_bbs_cuda_proof_verify_fused_common_batch(
     d_aux_in = arena.alloc<uint8_t>(std::max<size_t>(1u, off));
     d_common_scalars_le = arena.alloc<uint8_t>(item_count * term_count * 32u);
     d_proof_scalars_le = arena.alloc<uint8_t>(item_count * 4u * 32u);
-    d_coef_digits = arena.alloc<int16_t>(17u * item_count);
+    if (!skip_pairing) {
+      d_coef_digits = arena.alloc<int16_t>(17u * item_count);
+    }
     d_t12_xyzz = arena.alloc<cubbs_sppark_bucket_t>(item_count * 2u);
     d_t12_compressed = arena.alloc<uint8_t>(item_count * 2u * 48u);
     if (!skip_pairing) {
-      d_ab_streams = arena.alloc<cubbs_sppark_plain_affine_t>(item_count * 2u);
-      d_win_chunk_sums = arena.alloc<cubbs_sppark_bucket_t>(34u * chunks);
+      d_ab_streams = arena.alloc<cubbs_sppark_plain_affine_t>(item_count * static_cast<size_t>(pair_streams));
+      d_win_chunk_sums = arena.alloc<cubbs_sppark_bucket_t>(static_cast<size_t>(pair_streams) * 17u * chunks);
       d_agg_outputs = arena.alloc<cubbs_sppark_bucket_t>(2u);
       d_pair_affines = arena.alloc<cubbs_sppark_plain_affine_t>(2u);
       d_eq_out = arena.alloc<uint8_t>(1u);
@@ -1655,15 +1708,17 @@ int32_t cubbs_bbs_cuda_proof_verify_fused_common_batch(
   }
 
   // Stage 5: Aggregate Pairing (Same-PK single pairing OR Unique-PK randomized multi-pairing!).
+  // Unique-PK skips unused sum(r_i * Abar_i) (50% less Pippenger!) and reuses the already-built
+  // Radix-16 affine table in pts_cache.d_radix16_aff to compute r_i * Abar_i!
   if (err == cudaSuccess && !skip_pairing) {
     constexpr uint32_t t = 128u;
     const uint32_t b = static_cast<uint32_t>((item_count + t - 1u) / t);
     cubbs_bbs_proof_verify_extract_ab_kernel<<<b, t, 0, stream>>>(
-        pts_cache.d_points, d_ab_streams, item_count);
+        pts_cache.d_points, d_ab_streams, item_count, unique_pk);
     err = cudaGetLastError();
   }
   if (err == cudaSuccess && !skip_pairing) {
-    const dim3 bucket_grid(17u, 2u, chunks);
+    const dim3 bucket_grid(17u, pair_streams, chunks);
     cubbs_bbs_verify_pippenger_buckets_s8_kernel<<<bucket_grid, 128u, 0, stream>>>(
         d_ab_streams, item_count, d_coef_digits, 0u, item_count, chunks,
         d_win_chunk_sums);
@@ -1671,12 +1726,13 @@ int32_t cubbs_bbs_cuda_proof_verify_fused_common_batch(
   }
   if (err == cudaSuccess && !skip_pairing) {
     cubbs_bbs_verify_pippenger_combine_s8_kernel<<<1u, 32u, 0, stream>>>(
-        d_win_chunk_sums, chunks, 2u, false, d_agg_outputs);
+        d_win_chunk_sums, chunks, pair_streams, 0u,
+        unique_pk ? &d_agg_outputs[1] : d_agg_outputs);
     err = cudaGetLastError();
   }
   if (err == cudaSuccess && !skip_pairing) {
     cubbs_bbs_proof_verify_finalize_pair_affines_kernel<<<1u, 32u, 0, stream>>>(
-        d_agg_outputs, d_pair_affines, &d_flags[2]);
+        d_agg_outputs, unique_pk, d_pair_affines, &d_flags[2]);
     err = cudaGetLastError();
   }
   if (err == cudaSuccess && !skip_pairing) {
@@ -1692,8 +1748,8 @@ int32_t cubbs_bbs_cuda_proof_verify_fused_common_batch(
       //   prod_i e(r_i * Abar_i, pk_i) * e(-sum r_i * Bbar_i, G_2) == 1 (ONE FinalExp!).
       constexpr uint32_t sc_threads = 64u;
       const uint32_t sc_blocks = static_cast<uint32_t>((item_count + sc_threads - 1u) / sc_threads);
-      cubbs_bbs_g1_scale_128bit_to_xyzz_kernel<<<sc_blocks, sc_threads, 0, stream>>>(
-          pts_cache.d_points, 3u, d_coef, item_count, d_scaled_abar_xyzz);
+      cubbs_bbs_g1_scale_128bit_from_radix16_aff_kernel<<<sc_blocks, sc_threads, 0, stream>>>(
+          pts_cache.d_radix16_aff, d_coef, item_count, d_scaled_abar_xyzz);
       err = cudaGetLastError();
       if (err == cudaSuccess) {
         cubbs_bbs_xyzz_to_plain_affine_batch64_kernel<<<sc_blocks, 64u, 0, stream>>>(
