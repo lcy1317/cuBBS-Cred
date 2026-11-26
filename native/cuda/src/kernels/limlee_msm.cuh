@@ -27,7 +27,9 @@ static constexpr uint32_t CUBBS_LIMLEE_MAX_GROUP_SIZE = 18u;
 
 // Single-multiplier state-machine XYZZ doubling for BLS12-381 (a = 0).
 // Costs 6M + 3S (vs 10M + 3S for generic xyzz_t::add(acc)) with 1 mul unit.
-__device__ static void cubbs_bbs_xyzz_dbl_u(cubbs_sppark_bucket_t &pt) {
+// Kept __noinline__ so hot MSM/Straus loops only inline mixed affine uadd()
+// with zero local-memory stack spills and higher SM occupancy.
+__device__ __noinline__ static void cubbs_bbs_xyzz_dbl_u(cubbs_sppark_bucket_t &pt) {
   if (pt.is_inf()) return;
   fp_t *c = reinterpret_cast<fp_t *>(&pt);
   fp_t X = c[0];
@@ -95,7 +97,7 @@ __device__ static void cubbs_bbs_xyzz_dbl_u(cubbs_sppark_bucket_t &pt) {
   c[3] = ZZ;
 }
 
-__device__ __forceinline__ static void cubbs_bbs_limlee_xyzz_add_noinline(
+__device__ __noinline__ static void cubbs_bbs_limlee_xyzz_add_noinline(
     cubbs_sppark_bucket_t &dst, const cubbs_sppark_bucket_t &src) {
   dst.uadd(src);
 }
@@ -293,7 +295,7 @@ __device__ __forceinline__ static void cubbs_bbs_apply_glv_endomorphism(
 // Kernel B (kSplits == 1): 2 threads per row, 32 rows per 64-thread block, in-block SMEM combine
 // (no global-memory partials round-trip!) + compact uint16_t masks when group_size <= 16.
 template <typename MaskT>
-__global__ static void __launch_bounds__(64, 4)
+__global__ static void __launch_bounds__(64, 5)
 cubbs_bbs_g1_msm_glv_limlee_direct_kernel(
     const cubbs_sppark_plain_affine_t *affines,
     const size_t *subtable_offsets,
@@ -342,7 +344,7 @@ cubbs_bbs_g1_msm_glv_limlee_direct_kernel(
 
 // Kernel B (kSplits > 1): in-block SMEM tree reduction across splits (no global partials round-trip!).
 template <typename MaskT>
-__global__ static void __launch_bounds__(64, 4)
+__global__ static void __launch_bounds__(64, 5)
 cubbs_bbs_g1_msm_glv_limlee_split_kernel(
     const cubbs_sppark_plain_affine_t *affines,
     const size_t *subtable_offsets,

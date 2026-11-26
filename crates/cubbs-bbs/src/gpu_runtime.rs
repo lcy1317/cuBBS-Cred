@@ -1,6 +1,20 @@
 //! Native library lifetime, ABI calls, and prepared MSM buffers.
 
 use super::*;
+use std::cell::RefCell;
+
+thread_local! {
+    // Reusable scratch for FFI point-slice arrays (avoids 1 MB malloc/free per M=65,536 call).
+    static POINT_SLICES_SCRATCH: RefCell<Vec<gpu_abi::CuBbsBbsGpuByteSlice>> =
+        RefCell::new(Vec::new());
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum CompactMsgMeta<'a> {
+    Uniform,
+    U32Offsets(&'a [u32]),
+    U64OffsetsLengths(&'a [u64], &'a [u64]),
+}
 
 #[derive(Clone)]
 pub(super) struct GpuKernelLibrary {
@@ -671,6 +685,30 @@ impl GpuKernelLibrary {
         Some((msgs, offs, lens))
     }
 
+    /// Compact message metadata encoding passed over the existing v2 ABI:
+    /// - `Uniform`: both pointers NULL (0 B/msg metadata when all messages have equal length)
+    /// - `U32Offsets`: `message_offsets` points to `u32[N + 1]`, `message_lengths` is NULL (4 B/msg)
+    /// - `U64OffsetsLengths`: legacy `u64[N]` offsets + `u64[N]` lengths (16 B/msg)
+    pub(super) fn compact_meta_ptrs(meta: CompactMsgMeta<'_>) -> (*const u64, *const u64) {
+        match meta {
+            CompactMsgMeta::Uniform => (std::ptr::null(), std::ptr::null()),
+            CompactMsgMeta::U32Offsets(offs32) => {
+                if offs32.is_empty() {
+                    (std::ptr::null(), std::ptr::null())
+                } else {
+                    (offs32.as_ptr() as *const u64, std::ptr::null())
+                }
+            }
+            CompactMsgMeta::U64OffsetsLengths(offs, lens) => {
+                if offs.is_empty() {
+                    (std::ptr::null(), std::ptr::null())
+                } else {
+                    (offs.as_ptr(), lens.as_ptr())
+                }
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sign_fused_common_batch(
         &self,
@@ -681,8 +719,7 @@ impl GpuKernelLibrary {
         domains_be: &[u8],
         domain_stride: usize,
         packed_messages: &[u8],
-        message_offsets: &[u64],
-        message_lengths: &[u64],
+        msg_meta: CompactMsgMeta<'_>,
     ) -> Result<Vec<u8>> {
         let call = self.sign_fused_common_batch.ok_or_else(|| {
             Error::Gpu("GPU fused resident Sign symbol is unavailable".to_owned())
@@ -695,6 +732,7 @@ impl GpuKernelLibrary {
         let e_dst = bbs_signature_e_dst();
         let mut signatures_out = vec![0u8; item_count * SIGNATURE_LEN];
         let mut gpu_results = empty_gpu_results(item_count);
+        let (message_offsets, message_lengths) = Self::compact_meta_ptrs(msg_meta);
         let item = gpu_abi::CuBbsBbsGpuSignFusedCommonBatchItem {
             common_points: point_slices.as_ptr(),
             common_term_count: point_slices.len(),
@@ -709,16 +747,8 @@ impl GpuKernelLibrary {
                 packed_messages.as_ptr()
             },
             packed_messages_len: packed_messages.len(),
-            message_offsets: if message_offsets.is_empty() {
-                std::ptr::null()
-            } else {
-                message_offsets.as_ptr()
-            },
-            message_lengths: if message_lengths.is_empty() {
-                std::ptr::null()
-            } else {
-                message_lengths.as_ptr()
-            },
+            message_offsets,
+            message_lengths,
             message_dst: byte_slice(&message_dst),
             e_dst: byte_slice(&e_dst),
             signatures_out: signatures_out.as_mut_ptr(),
@@ -755,66 +785,63 @@ impl GpuKernelLibrary {
         item_message_counts: Option<&[u32]>,
         item_message_starts: Option<&[u64]>,
         packed_messages: &[u8],
-        message_offsets: &[u64],
-        message_lengths: &[u64],
+        total_message_count: usize,
+        msg_meta: CompactMsgMeta<'_>,
         public_key: &[u8],
         g2_generator: &[u8],
     ) -> Result<bool> {
         let call = self.verify_pre_b_aggregate_fused.ok_or_else(|| {
             Error::Gpu("GPU fused resident Verify symbol is unavailable".to_owned())
         })?;
-        let point_slices = common_points
-            .iter()
-            .map(|p| byte_slice(p))
-            .collect::<Vec<_>>();
         let message_dst = bbs_message_scalar_dst();
         let mut gpu_result = gpu_abi::CuBbsBbsGpuResult {
             code: gpu_abi::CUBBS_BBS_GPU_ERR_INTERNAL,
             value: 0,
             bytes_written: 0,
         };
-        let item = gpu_abi::CuBbsBbsGpuVerifyPreBAggregateFusedItem {
-            common_points: point_slices.as_ptr(),
-            common_term_count: point_slices.len(),
-            item_count,
-            signatures: signatures.as_ptr(),
-            coefficients_le: coefficients_le.as_ptr(),
-            domains_be: domains_be.as_ptr(),
-            domain_stride,
-            item_message_counts: item_message_counts
-                .map(|s| s.as_ptr())
-                .unwrap_or(std::ptr::null()),
-            item_message_starts: item_message_starts
-                .map(|s| s.as_ptr())
-                .unwrap_or(std::ptr::null()),
-            packed_messages: if packed_messages.is_empty() {
-                std::ptr::null()
-            } else {
-                packed_messages.as_ptr()
-            },
-            packed_messages_len: packed_messages.len(),
-            message_offsets: if message_offsets.is_empty() {
-                std::ptr::null()
-            } else {
-                message_offsets.as_ptr()
-            },
-            message_lengths: if message_lengths.is_empty() {
-                std::ptr::null()
-            } else {
-                message_lengths.as_ptr()
-            },
-            total_message_count: message_offsets.len(),
-            message_dst: byte_slice(&message_dst),
-            public_key: byte_slice(public_key),
-            g2_generator: byte_slice(g2_generator),
-        };
-        let status = unsafe {
-            call(
-                gpu_abi::CUBBS_BBS_GPU_ABI_VERSION,
-                &item,
-                &mut gpu_result,
-            )
-        };
+        let (message_offsets, message_lengths) = Self::compact_meta_ptrs(msg_meta);
+        let status = POINT_SLICES_SCRATCH.with(|cell| {
+            let mut point_slices = cell.borrow_mut();
+            point_slices.clear();
+            point_slices.reserve(common_points.len());
+            for p in common_points {
+                point_slices.push(byte_slice(p));
+            }
+            let item = gpu_abi::CuBbsBbsGpuVerifyPreBAggregateFusedItem {
+                common_points: point_slices.as_ptr(),
+                common_term_count: point_slices.len(),
+                item_count,
+                signatures: signatures.as_ptr(),
+                coefficients_le: coefficients_le.as_ptr(),
+                domains_be: domains_be.as_ptr(),
+                domain_stride,
+                item_message_counts: item_message_counts
+                    .map(|s| s.as_ptr())
+                    .unwrap_or(std::ptr::null()),
+                item_message_starts: item_message_starts
+                    .map(|s| s.as_ptr())
+                    .unwrap_or(std::ptr::null()),
+                packed_messages: if packed_messages.is_empty() {
+                    std::ptr::null()
+                } else {
+                    packed_messages.as_ptr()
+                },
+                packed_messages_len: packed_messages.len(),
+                message_offsets,
+                message_lengths,
+                total_message_count,
+                message_dst: byte_slice(&message_dst),
+                public_key: byte_slice(public_key),
+                g2_generator: byte_slice(g2_generator),
+            };
+            unsafe {
+                call(
+                    gpu_abi::CUBBS_BBS_GPU_ABI_VERSION,
+                    &item,
+                    &mut gpu_result,
+                )
+            }
+        });
         if status != gpu_abi::CUBBS_BBS_GPU_SUCCESS
             || gpu_result.code != gpu_abi::CUBBS_BBS_GPU_SUCCESS
         {
@@ -839,8 +866,7 @@ impl GpuKernelLibrary {
         domains_be: &[u8],
         domain_stride: usize,
         packed_messages: &[u8],
-        message_offsets: &[u64],
-        message_lengths: &[u64],
+        msg_meta: CompactMsgMeta<'_>,
         packed_ph: &[u8],
         ph_offsets: &[u64],
         ph_lengths: &[u64],
@@ -862,6 +888,7 @@ impl GpuKernelLibrary {
         let mut gpu_results = empty_gpu_results(item_count);
         let message_dst = bbs_message_scalar_dst();
         let challenge_dst = bbs_signature_e_dst();
+        let (message_offsets, message_lengths) = Self::compact_meta_ptrs(msg_meta);
         let item = gpu_abi::CuBbsBbsGpuProofGenFusedCommonBatchItem {
             common_points: point_slices.as_ptr(),
             common_term_count: point_slices.len(),
@@ -892,16 +919,8 @@ impl GpuKernelLibrary {
                 packed_messages.as_ptr()
             },
             packed_messages_len: packed_messages.len(),
-            message_offsets: if message_offsets.is_empty() {
-                std::ptr::null()
-            } else {
-                message_offsets.as_ptr()
-            },
-            message_lengths: if message_lengths.is_empty() {
-                std::ptr::null()
-            } else {
-                message_lengths.as_ptr()
-            },
+            message_offsets,
+            message_lengths,
             packed_ph: if packed_ph.is_empty() {
                 std::ptr::null()
             } else {
@@ -947,8 +966,7 @@ impl GpuKernelLibrary {
         domains_be: &[u8],
         domain_stride: usize,
         packed_disclosed_messages: &[u8],
-        message_offsets: &[u64],
-        message_lengths: &[u64],
+        msg_meta: CompactMsgMeta<'_>,
         packed_ph: &[u8],
         ph_offsets: &[u64],
         ph_lengths: &[u64],
@@ -969,6 +987,7 @@ impl GpuKernelLibrary {
         };
         let message_dst = bbs_message_scalar_dst();
         let challenge_dst = bbs_signature_e_dst();
+        let (message_offsets, message_lengths) = Self::compact_meta_ptrs(msg_meta);
         let item = gpu_abi::CuBbsBbsGpuProofVerifyFusedCommonBatchItem {
             common_points: point_slices.as_ptr(),
             common_term_count: point_slices.len(),
@@ -996,16 +1015,8 @@ impl GpuKernelLibrary {
                 packed_disclosed_messages.as_ptr()
             },
             packed_disclosed_messages_len: packed_disclosed_messages.len(),
-            message_offsets: if message_offsets.is_empty() {
-                std::ptr::null()
-            } else {
-                message_offsets.as_ptr()
-            },
-            message_lengths: if message_lengths.is_empty() {
-                std::ptr::null()
-            } else {
-                message_lengths.as_ptr()
-            },
+            message_offsets,
+            message_lengths,
             packed_ph: if packed_ph.is_empty() {
                 std::ptr::null()
             } else {

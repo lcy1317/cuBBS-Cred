@@ -418,6 +418,7 @@ pub struct GpuBbsEngine {
     fallback: reference::ZkryptiumReference,
     kernel: Option<Arc<GpuKernelLibrary>>,
     b_msm_term_templates: Arc<Mutex<gpu_engine::MsmTemplateCache>>,
+    domain_scalars: Arc<Mutex<gpu_engine::DomainScalarCache>>,
 }
 
 #[derive(Debug, Clone)]

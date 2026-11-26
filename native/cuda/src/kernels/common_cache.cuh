@@ -165,7 +165,7 @@ static std::mutex &fused_common_points_build_mutex(const std::string &key) {
 static void retain_fused_common_points_cache(
     const std::string &key, const std::shared_ptr<CuBbsFusedCommonPointsCache> &value) {
   const size_t budget = env_size_or_default(
-      "CUBBS_BBS_GPU_TABLE_CACHE_BUDGET_BYTES", 2u * 1024u * 1024u * 1024u);
+      "CUBBS_BBS_GPU_TABLE_CACHE_BUDGET_BYTES", 4ull * 1024ull * 1024ull * 1024ull);
   const size_t incoming = value->table_bytes();
   if (incoming > budget || budget == 0u) return;
   std::lock_guard<std::mutex> lock(fused_common_points_cache_mutex());
@@ -212,28 +212,44 @@ static bool bbs_limlee_comb_enabled() {
 
 static cudaError_t build_limlee_table_for_cache(
     CuBbsFusedCommonPointsCache *cached, size_t term_count) {
-  // L2-optimal group sizes on RTX 5060 Ti (32 MB L2):
-  //   - M=64 (<= 70 terms): g=14, v=4 -> 5 groups = 20 subtables, HALF table size (12.8 MB vs 25.2 MB)!
-  //   - M=256 (71..1024 terms): g=15 -> 18 groups (26.7 MB, fits in 32 MB L2!)
-  //   - M=2048 (> 1024 terms): g=16, v=1 -> 129 groups (-5.8% fewer adds & GDDR7 reads!)
-  uint32_t group_size = (term_count <= 70u) ? 14u : ((term_count > 1024u) ? 16u : 15u);
+  // Throughput-optimal (g, v) on GDDR7 (448 GB/s, 16 GB VRAM, 32 MB L2):
+  //   - <= 70 terms (M=64, U=32, U=64): g=17, v=4 -> 4 groups x 4 splits (32 doublings, ~78 MB)
+  //   - 71..512 terms (M=128/256, U=128/192): g=16, v=2 -> compact uint16_t masks, 64 doublings (~100 MB)
+  //   - > 512 terms (U=1024, M=2048): g=18, v=1 -> 114 groups (~1.37 GB, v=1 strictly enforced!)
+  uint32_t group_size =
+      (term_count <= 70u) ? 17u : ((term_count <= 512u) ? 16u : 18u);
   if (const char *genv = std::getenv("CUBBS_BBS_LIMLEE_GROUP_SIZE")) {
     const unsigned long parsed = std::strtoul(genv, nullptr, 10);
     if (parsed >= 8ul && parsed <= CUBBS_LIMLEE_MAX_GROUP_SIZE) {
       group_size = static_cast<uint32_t>(parsed);
     }
   }
-  const uint32_t num_groups =
-      static_cast<uint32_t>((term_count + group_size - 1u) / group_size);
-  uint32_t v_sub = (group_size >= 17u)
-                       ? 1u
-                       : ((term_count <= 70u) ? 4u : ((term_count <= 130u) ? 2u : 1u));
+  uint32_t v_sub =
+      (term_count <= 70u) ? 4u : ((term_count <= 512u) ? 2u : 1u);
   if (const char *venv = std::getenv("CUBBS_BBS_LIMLEE_V_SUB")) {
     const unsigned long parsed = std::strtoul(venv, nullptr, 10);
     if (parsed == 1ul || parsed == 2ul || parsed == 4ul) {
       v_sub = static_cast<uint32_t>(parsed);
     }
   }
+  // Automatically step down g/v if free VRAM cannot hold the 3x build footprint.
+  size_t free_vram = 0u, total_vram = 0u;
+  if (cudaMemGetInfo(&free_vram, &total_vram) == cudaSuccess && free_vram > 0u) {
+    while (group_size > 14u) {
+      const uint32_t ng = static_cast<uint32_t>((term_count + group_size - 1u) / group_size);
+      const size_t approx_entries =
+          static_cast<size_t>(ng) * v_sub * (size_t{1u} << (group_size - 1u));
+      // Build needs affines (96B) + tmp_xyzz (192B) = 288B/entry; keep <= 55% of free VRAM.
+      if (approx_entries * 288u <= (free_vram * 55u) / 100u) break;
+      if (v_sub > 1u) {
+        v_sub >>= 1u;
+      } else {
+        --group_size;
+      }
+    }
+  }
+  const uint32_t num_groups =
+      static_cast<uint32_t>((term_count + group_size - 1u) / group_size);
   const uint32_t total_subtables = num_groups * v_sub;
   std::vector<size_t> offsets(total_subtables);
   size_t total_entries = 0u;
@@ -345,6 +361,63 @@ static int32_t get_fused_common_points_cache(
       fixed_comb_bits != 10u) {
     return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
   }
+
+  // Lock-free thread-local L1 cache (4-slot MRU) avoids allocating/hashing
+  // up to 3.15 MB cache-key strings under the global mutex on steady-state hits
+  // while still verifying every point slice byte-for-byte.
+  struct CuBbsTlsCommonPointsEntry {
+    int device{-1};
+    bool large_window4{false};
+    bool universal_window4{false};
+    bool affine_comb{false};
+    size_t fixed_comb_bits{0u};
+    size_t term_count{0u};
+    std::vector<uint8_t> raw_points;
+    std::shared_ptr<CuBbsFusedCommonPointsCache> cached;
+  };
+  static thread_local std::array<CuBbsTlsCommonPointsEntry, 4> tls_l1;
+  static thread_local size_t tls_l1_next = 0u;
+  int current_device = 0;
+  (void)cudaGetDevice(&current_device);
+  for (const auto &entry : tls_l1) {
+    if (entry.cached != nullptr && entry.device == current_device &&
+        entry.large_window4 == large_window4 &&
+        entry.universal_window4 == universal_window4 &&
+        entry.affine_comb == affine_comb &&
+        entry.fixed_comb_bits == fixed_comb_bits &&
+        entry.term_count == term_count &&
+        entry.raw_points.size() == term_count * 48u) {
+      bool exact = true;
+      const uint8_t *expected = entry.raw_points.data();
+      for (size_t term = 0u; term < term_count; ++term) {
+        if (std::memcmp(expected + (term * 48u), points[term].data, 48u) != 0) {
+          exact = false;
+          break;
+        }
+      }
+      if (exact) {
+        *cached_out = entry.cached;
+        return CUBBS_BBS_GPU_SUCCESS;
+      }
+    }
+  }
+
+  auto store_tls_l1 = [&](const std::shared_ptr<CuBbsFusedCommonPointsCache> &val) {
+    auto &slot = tls_l1[tls_l1_next & 3u];
+    tls_l1_next = (tls_l1_next + 1u) & 3u;
+    slot.device = current_device;
+    slot.large_window4 = large_window4;
+    slot.universal_window4 = universal_window4;
+    slot.affine_comb = affine_comb;
+    slot.fixed_comb_bits = fixed_comb_bits;
+    slot.term_count = term_count;
+    slot.raw_points.resize(term_count * 48u);
+    for (size_t term = 0u; term < term_count; ++term) {
+      std::memcpy(slot.raw_points.data() + (term * 48u), points[term].data, 48u);
+    }
+    slot.cached = val;
+  };
+
   const std::string key = fused_common_points_cache_key(
       points, term_count, large_window4, affine_comb, fixed_comb_bits,
       universal_window4);
@@ -353,6 +426,7 @@ static int32_t get_fused_common_points_cache(
     auto &cache = fused_common_points_cache();
     auto found = cache.find(key);
     if (found != cache.end()) {
+      store_tls_l1(found->second);
       *cached_out = found->second;
       return CUBBS_BBS_GPU_SUCCESS;
     }

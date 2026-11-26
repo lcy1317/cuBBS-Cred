@@ -246,8 +246,8 @@ __global__ static void cubbs_large_pip_reduce_512_kernel(
   const uint32_t seg_base = tid * 16u;
   #pragma unroll 1
   for (int k = 15; k >= 0; --k) {
-    run.uadd(win_b[seg_base + static_cast<uint32_t>(k)]);
-    wsum.uadd(run);
+    cubbs_bbs_limlee_xyzz_add_noinline(run, win_b[seg_base + static_cast<uint32_t>(k)]);
+    cubbs_bbs_limlee_xyzz_add_noinline(wsum, run);
   }
   s_wsum[tid] = wsum;
   s_run[tid] = run;
@@ -256,20 +256,20 @@ __global__ static void cubbs_large_pip_reduce_512_kernel(
   if (tid == 0u) {
     cubbs_sppark_bucket_t total_w = s_wsum[0];
     for (uint32_t s = 1u; s < 32u; ++s) {
-      total_w.uadd(s_wsum[s]);
+      cubbs_bbs_limlee_xyzz_add_noinline(total_w, s_wsum[s]);
     }
     cubbs_sppark_bucket_t suf, total_suf;
     suf.inf();
     total_suf.inf();
     for (int s = 31; s >= 1; --s) {
-      suf.uadd(s_run[s]);
-      total_suf.uadd(suf);
+      cubbs_bbs_limlee_xyzz_add_noinline(suf, s_run[s]);
+      cubbs_bbs_limlee_xyzz_add_noinline(total_suf, suf);
     }
     #pragma unroll 1
     for (uint32_t d = 0u; d < 4u; ++d) {
       cubbs_bbs_xyzz_dbl_u(total_suf);
     }
-    total_w.uadd(total_suf);
+    cubbs_bbs_limlee_xyzz_add_noinline(total_w, total_suf);
     window_sums[blockIdx.x] = total_w;
   }
 }
@@ -289,7 +289,7 @@ __global__ static void cubbs_large_pip_combine_13_kernel(
     for (uint32_t d = 0u; d < CUBBS_LARGE_PIP_W; ++d) {
       cubbs_bbs_xyzz_dbl_u(acc);
     }
-    acc.uadd(ws[w]);
+    cubbs_bbs_limlee_xyzz_add_noinline(acc, ws[w]);
   }
   outputs[row] = acc;
 }

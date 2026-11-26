@@ -545,19 +545,36 @@ int32_t cubbs_bbs_cuda_pipeline_pinned_scratch(
 // ============================================================================
 
 // Hash every message directly into LE MSM scalar layout at slot (2 + msg_idx) of each row.
+// Supports 3 metadata modes:
+//   - offsets == nullptr && lengths == nullptr: uniform message length `uniform_len` (0B metadata!)
+//   - offsets != nullptr && lengths == nullptr: compact uint32_t prefix offsets[total + 1] (4B/msg)
+//   - offsets != nullptr && lengths != nullptr: legacy uint64_t offsets[total] + lengths[total]
 __global__ static void cubbs_bbs_sign_h2s_messages_to_le_kernel(
     const uint8_t *messages, const uint64_t *offsets, const uint64_t *lengths,
-    size_t item_count, size_t message_count, size_t term_count,
+    size_t uniform_len, size_t item_count, size_t message_count, size_t term_count,
     const uint8_t *message_dst, size_t message_dst_len, uint8_t *scalars_le) {
   const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const size_t total = item_count * message_count;
   if (idx >= total) return;
 
+  size_t msg_off = 0u;
+  size_t msg_len = uniform_len;
+  if (lengths != nullptr) {
+    msg_off = static_cast<size_t>(offsets[idx]);
+    msg_len = static_cast<size_t>(lengths[idx]);
+  } else if (offsets != nullptr) {
+    const auto *offs32 = reinterpret_cast<const uint32_t *>(offsets);
+    msg_off = static_cast<size_t>(offs32[idx]);
+    msg_len = static_cast<size_t>(offs32[idx + 1u] - offs32[idx]);
+  } else {
+    msg_off = idx * uniform_len;
+  }
+
   const size_t row = idx / message_count;
   const size_t msg = idx - (row * message_count);
   uint32_t uniform_words[12];
   expand_message_xmd_sha256_48_words_device(
-      messages + offsets[idx], static_cast<size_t>(lengths[idx]),
+      messages + msg_off, msg_len,
       message_dst, message_dst_len, uniform_words);
   uint64_t le[4];
   bls12_381_fr_reduce_words12_to_le64(uniform_words, le);
@@ -698,11 +715,20 @@ int32_t cubbs_bbs_cuda_sign_fused_common_batch(
   }
   const size_t message_count = term_count - 2u;
   const size_t total_messages = item_count * message_count;
+  const bool meta_uniform =
+      total_messages > 0u && item->message_offsets == nullptr && item->message_lengths == nullptr;
+  const bool meta_u32 =
+      total_messages > 0u && item->message_offsets != nullptr && item->message_lengths == nullptr;
+  const bool meta_u64 =
+      total_messages > 0u && item->message_offsets != nullptr && item->message_lengths != nullptr;
   if (total_messages > 0u &&
-      (item->message_offsets == nullptr || item->message_lengths == nullptr ||
+      ((!meta_uniform && !meta_u32 && !meta_u64) ||
+       (meta_uniform && (item->packed_messages_len % total_messages) != 0u) ||
+       (meta_u32 && item->packed_messages_len > 0xFFFFFFFFull) ||
        (item->packed_messages_len > 0u && item->packed_messages == nullptr))) {
     return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
   }
+  const size_t uniform_msg_len = meta_uniform ? (item->packed_messages_len / total_messages) : 0u;
 
   cubbs_bbs_ensure_cuda_device_schedule();
 
@@ -745,8 +771,10 @@ int32_t cubbs_bbs_cuda_sign_fused_common_batch(
   const size_t sig_bytes = item_count * 80u;
 
   cudaError_t err = pipe_ws.ensure_messages(item->packed_messages_len);
-  if (err == cudaSuccess && total_messages > 0u) {
+  if (err == cudaSuccess && meta_u64) {
     err = pipe_ws.ensure_msg_meta(total_messages);
+  } else if (err == cudaSuccess && meta_u32) {
+    err = pipe_ws.ensure_msg_meta((total_messages + 2u) / 2u);
   }
   if (err == cudaSuccess) {
     err = pipe_ws.ensure_aux(aux_in_bytes, sig_bytes);
@@ -758,12 +786,16 @@ int32_t cubbs_bbs_cuda_sign_fused_common_batch(
   if (item->packed_messages_len > 0u && pipe_ws.messages != item->packed_messages) {
     std::memcpy(pipe_ws.messages, item->packed_messages, item->packed_messages_len);
   }
-  if (total_messages > 0u) {
+  if (meta_u64) {
     if (pipe_ws.offsets != item->message_offsets) {
       std::memcpy(pipe_ws.offsets, item->message_offsets, total_messages * sizeof(uint64_t));
     }
     if (pipe_ws.lengths != item->message_lengths) {
       std::memcpy(pipe_ws.lengths, item->message_lengths, total_messages * sizeof(uint64_t));
+    }
+  } else if (meta_u32) {
+    if (pipe_ws.offsets != item->message_offsets) {
+      std::memcpy(pipe_ws.offsets, item->message_offsets, (total_messages + 1u) * sizeof(uint32_t));
     }
   }
   uint8_t *h_sk = pipe_ws.aux_in;
@@ -789,10 +821,15 @@ int32_t cubbs_bbs_cuda_sign_fused_common_batch(
   CuBbsCommonMsmTransient msm_transient;
 
   const size_t total_scalars = item_count * term_count;
+  const size_t d_off_bytes = meta_u64
+      ? (total_messages * sizeof(uint64_t))
+      : (meta_u32 ? ((total_messages + 1u) * sizeof(uint32_t)) : 0u);
+  const size_t d_len_bytes = meta_u64 ? (total_messages * sizeof(uint64_t)) : 0u;
   auto &arena = cubbs_bbs_thread_device_arena();
   const size_t arena_bytes =
       CuBbsDeviceArena::align_up(item->packed_messages_len) +
-      CuBbsDeviceArena::align_up(total_messages * sizeof(uint64_t)) * 2u +
+      CuBbsDeviceArena::align_up(d_off_bytes) +
+      CuBbsDeviceArena::align_up(d_len_bytes) +
       CuBbsDeviceArena::align_up(std::max<size_t>(1u, aux_in_bytes)) +
       CuBbsDeviceArena::align_up(total_scalars * 32u) +
       CuBbsDeviceArena::align_up(item_count * 32u) +
@@ -802,8 +839,8 @@ int32_t cubbs_bbs_cuda_sign_fused_common_batch(
   if (err == cudaSuccess) err = arena.reserve_and_reset(arena_bytes);
   if (err == cudaSuccess) {
     d_messages = arena.alloc<uint8_t>(item->packed_messages_len);
-    d_offsets = arena.alloc<uint64_t>(total_messages);
-    d_lengths = arena.alloc<uint64_t>(total_messages);
+    d_offsets = d_off_bytes > 0u ? reinterpret_cast<uint64_t *>(arena.alloc<uint8_t>(d_off_bytes)) : nullptr;
+    d_lengths = d_len_bytes > 0u ? arena.alloc<uint64_t>(total_messages) : nullptr;
     d_aux_in = arena.alloc<uint8_t>(std::max<size_t>(1u, aux_in_bytes));
     d_scalars_le = arena.alloc<uint8_t>(total_scalars * 32u);
     d_row_scales_le = arena.alloc<uint8_t>(item_count * 32u);
@@ -817,14 +854,13 @@ int32_t cubbs_bbs_cuda_sign_fused_common_batch(
   if (err == cudaSuccess && item->packed_messages_len > 0u)
     err = cudaMemcpyAsync(d_messages, pipe_ws.messages, item->packed_messages_len,
                           cudaMemcpyHostToDevice, stream);
-  if (err == cudaSuccess && total_messages > 0u) {
-    err = cudaMemcpyAsync(d_offsets, pipe_ws.offsets,
-                          total_messages * sizeof(uint64_t),
+  if (err == cudaSuccess && d_off_bytes > 0u) {
+    err = cudaMemcpyAsync(d_offsets, pipe_ws.offsets, d_off_bytes,
                           cudaMemcpyHostToDevice, stream);
-    if (err == cudaSuccess)
-      err = cudaMemcpyAsync(d_lengths, pipe_ws.lengths,
-                            total_messages * sizeof(uint64_t),
-                            cudaMemcpyHostToDevice, stream);
+  }
+  if (err == cudaSuccess && d_len_bytes > 0u) {
+    err = cudaMemcpyAsync(d_lengths, pipe_ws.lengths, d_len_bytes,
+                          cudaMemcpyHostToDevice, stream);
   }
   if (err == cudaSuccess)
     err = cudaMemcpyAsync(d_aux_in, pipe_ws.aux_in, aux_in_bytes,
@@ -850,7 +886,7 @@ int32_t cubbs_bbs_cuda_sign_fused_common_batch(
     const uint32_t h2s_blocks = static_cast<uint32_t>(
         (total_messages + h2s_threads - 1u) / h2s_threads);
     cubbs_bbs_sign_h2s_messages_to_le_kernel<<<h2s_blocks, h2s_threads, 0, stream>>>(
-        d_messages, d_offsets, d_lengths, item_count, message_count, term_count,
+        d_messages, d_offsets, d_lengths, uniform_msg_len, item_count, message_count, term_count,
         d_msg_dst, item->message_dst.len, d_scalars_le);
     err = cudaGetLastError();
   }
@@ -950,15 +986,29 @@ int32_t cubbs_bbs_cuda_sign_fused_common_batch(
 // ============================================================================
 
 // Hash every raw message into flat LE scalar array d_msg_scalars_le[total_messages * 32].
+// Supports 0B uniform, 4B/msg compact uint32_t prefix offsets, and legacy uint64_t modes.
 __global__ static void cubbs_bbs_verify_h2s_flat_to_le_kernel(
     const uint8_t *messages, const uint64_t *offsets, const uint64_t *lengths,
-    size_t total_messages, const uint8_t *message_dst, size_t message_dst_len,
+    size_t uniform_len, size_t total_messages,
+    const uint8_t *message_dst, size_t message_dst_len,
     uint8_t *msg_scalars_le) {
   const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= total_messages) return;
+  size_t msg_off = 0u;
+  size_t msg_len = uniform_len;
+  if (lengths != nullptr) {
+    msg_off = static_cast<size_t>(offsets[idx]);
+    msg_len = static_cast<size_t>(lengths[idx]);
+  } else if (offsets != nullptr) {
+    const auto *offs32 = reinterpret_cast<const uint32_t *>(offsets);
+    msg_off = static_cast<size_t>(offs32[idx]);
+    msg_len = static_cast<size_t>(offs32[idx + 1u] - offs32[idx]);
+  } else {
+    msg_off = idx * uniform_len;
+  }
   uint32_t uniform_words[12];
   expand_message_xmd_sha256_48_words_device(
-      messages + offsets[idx], static_cast<size_t>(lengths[idx]),
+      messages + msg_off, msg_len,
       message_dst, message_dst_len, uniform_words);
   uint64_t le[4];
   bls12_381_fr_reduce_words12_to_le64(uniform_words, le);
@@ -1072,6 +1122,78 @@ __global__ static void cubbs_bbs_verify_reduce_b_scalars_kernel(
     sum.from();
     memcpy(agg_b_scalars_le + (slot * 32u), &sum, 32u);
   }
+}
+
+// Fused 100%-coalesced H2S + random-coefficient Fr accumulation for uniform-M Verify.
+// Adjacent threads handle contiguous message slots (j, j+1, ..., j+31) so every
+// warp reads contiguous message bytes while broadcasting a single c_i across all
+// 32 lanes — eliminating the 134 MB d_msg_scalars_le allocation and 268 MB GDDR7
+// round-trip per batch!
+__global__ static void cubbs_bbs_verify_fused_h2s_reduce_tiled_kernel(
+    const uint8_t *messages, const uint64_t *offsets, const uint64_t *lengths,
+    size_t uniform_len, const uint8_t *coefficients_le,
+    size_t item_count, size_t uniform_msg_count, uint32_t num_chunks,
+    const uint8_t *message_dst, size_t message_dst_len,
+    cubbs_sppark_scalar_t *partials_out,
+    uint8_t *agg_b_scalars_le) {
+  const size_t j = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (j >= uniform_msg_count) return;
+  const uint32_t chunk = blockIdx.y;
+  const size_t per_chunk = (item_count + num_chunks - 1u) / num_chunks;
+  const size_t i_begin = static_cast<size_t>(chunk) * per_chunk;
+  const size_t i_end = min(item_count, i_begin + per_chunk);
+
+  cubbs_sppark_scalar_t acc;
+  acc.zero();
+  for (size_t i = i_begin; i < i_end; ++i) {
+    const size_t idx = i * uniform_msg_count + j;
+    size_t msg_off = 0u;
+    size_t msg_len = uniform_len;
+    if (lengths != nullptr) {
+      msg_off = static_cast<size_t>(offsets[idx]);
+      msg_len = static_cast<size_t>(lengths[idx]);
+    } else if (offsets != nullptr) {
+      const auto *offs32 = reinterpret_cast<const uint32_t *>(offsets);
+      msg_off = static_cast<size_t>(offs32[idx]);
+      msg_len = static_cast<size_t>(offs32[idx + 1u] - offs32[idx]);
+    } else {
+      msg_off = idx * uniform_len;
+    }
+    uint32_t uniform_words[12];
+    expand_message_xmd_sha256_48_words_device(
+        messages + msg_off, msg_len,
+        message_dst, message_dst_len, uniform_words);
+    uint64_t le[4];
+    bls12_381_fr_reduce_words12_to_le64(uniform_words, le);
+    cubbs_sppark_scalar_t m;
+    cubbs_sppark_scalar_t c;
+    memcpy(&m, le, 32u);
+    memcpy(&c, coefficients_le + (i * 32u), 32u);
+    m.to();
+    c.to();
+    acc += m * c;
+  }
+
+  if (num_chunks == 1u) {
+    acc.from();
+    memcpy(agg_b_scalars_le + ((2u + j) * 32u), &acc, 32u);
+  } else {
+    partials_out[static_cast<size_t>(chunk) * uniform_msg_count + j] = acc;
+  }
+}
+
+__global__ static void cubbs_bbs_verify_reduce_tiled_partials_kernel(
+    const cubbs_sppark_scalar_t *partials_in,
+    size_t uniform_msg_count, uint32_t num_chunks,
+    uint8_t *agg_b_scalars_le) {
+  const size_t j = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (j >= uniform_msg_count) return;
+  cubbs_sppark_scalar_t acc = partials_in[j];
+  for (uint32_t c = 1u; c < num_chunks; ++c) {
+    acc += partials_in[static_cast<size_t>(c) * uniform_msg_count + j];
+  }
+  acc.from();
+  memcpy(agg_b_scalars_le + ((2u + j) * 32u), &acc, 32u);
 }
 
 // Builds dual A-MSM scalar buffer on GPU:
@@ -1431,11 +1553,20 @@ int32_t cubbs_bbs_cuda_verify_pre_b_aggregate_fused(
     return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
   }
   const size_t total_messages = item->total_message_count;
+  const bool meta_uniform =
+      total_messages > 0u && item->message_offsets == nullptr && item->message_lengths == nullptr;
+  const bool meta_u32 =
+      total_messages > 0u && item->message_offsets != nullptr && item->message_lengths == nullptr;
+  const bool meta_u64 =
+      total_messages > 0u && item->message_offsets != nullptr && item->message_lengths != nullptr;
   if (total_messages > 0u &&
-      (item->message_offsets == nullptr || item->message_lengths == nullptr ||
+      ((!meta_uniform && !meta_u32 && !meta_u64) ||
+       (meta_uniform && (item->packed_messages_len % total_messages) != 0u) ||
+       (meta_u32 && item->packed_messages_len > 0xFFFFFFFFull) ||
        (item->packed_messages_len > 0u && item->packed_messages == nullptr))) {
     return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
   }
+  const size_t uniform_msg_len = meta_uniform ? (item->packed_messages_len / total_messages) : 0u;
 
   cubbs_bbs_ensure_cuda_device_schedule();
 
@@ -1516,19 +1647,24 @@ int32_t cubbs_bbs_cuda_verify_pre_b_aggregate_fused(
   const size_t aux_out_bytes = 32u;
 
   cudaError_t err = pipe_ws.ensure_messages(item->packed_messages_len);
-  if (err == cudaSuccess && total_messages > 0u)
+  if (err == cudaSuccess && meta_u64)
     err = pipe_ws.ensure_msg_meta(total_messages);
+  else if (err == cudaSuccess && meta_u32)
+    err = pipe_ws.ensure_msg_meta((total_messages + 2u) / 2u);
   if (err == cudaSuccess)
     err = pipe_ws.ensure_aux(aux_in_bytes, aux_out_bytes);
   if (err != cudaSuccess) return CUBBS_BBS_GPU_ERR_INTERNAL;
 
   if (item->packed_messages_len > 0u && pipe_ws.messages != item->packed_messages)
     std::memcpy(pipe_ws.messages, item->packed_messages, item->packed_messages_len);
-  if (total_messages > 0u) {
+  if (meta_u64) {
     if (pipe_ws.offsets != item->message_offsets)
       std::memcpy(pipe_ws.offsets, item->message_offsets, total_messages * sizeof(uint64_t));
     if (pipe_ws.lengths != item->message_lengths)
       std::memcpy(pipe_ws.lengths, item->message_lengths, total_messages * sizeof(uint64_t));
+  } else if (meta_u32) {
+    if (pipe_ws.offsets != item->message_offsets)
+      std::memcpy(pipe_ws.offsets, item->message_offsets, (total_messages + 1u) * sizeof(uint32_t));
   }
 
   size_t aux_off = 0u;
@@ -1613,11 +1749,30 @@ int32_t cubbs_bbs_cuda_verify_pre_b_aggregate_fused(
   }
 
   // Allocate all transient device buffers from persistent thread-local arena (0 cudaMallocAsync!).
+  const size_t uniform_msg_count = term_count - 2u;
+  const bool use_fused_tiled_h2s = (!mixed_counts && total_messages > 0u);
+  uint32_t h2s_chunks = 1u;
+  if (use_fused_tiled_h2s) {
+    while (h2s_chunks < 64u && (h2s_chunks * 2u) <= item_count &&
+           (uniform_msg_count * h2s_chunks) < 16384u) {
+      h2s_chunks <<= 1u;
+    }
+  }
+  const size_t d_off_bytes = meta_u64
+      ? (total_messages * sizeof(uint64_t))
+      : (meta_u32 ? ((total_messages + 1u) * sizeof(uint32_t)) : 0u);
+  const size_t d_len_bytes = meta_u64 ? (total_messages * sizeof(uint64_t)) : 0u;
+  const size_t d_msg_scalars_bytes =
+      use_fused_tiled_h2s ? 0u : (total_messages * 32u);
+  const size_t d_h2s_partials_count =
+      (use_fused_tiled_h2s && h2s_chunks > 1u) ? (static_cast<size_t>(h2s_chunks) * uniform_msg_count) : 0u;
   auto &arena = cubbs_bbs_thread_device_arena();
   const size_t arena_bytes =
       CuBbsDeviceArena::align_up(item->packed_messages_len) +
-      CuBbsDeviceArena::align_up(total_messages * sizeof(uint64_t)) * 2u +
-      CuBbsDeviceArena::align_up(total_messages * 32u) +
+      CuBbsDeviceArena::align_up(d_off_bytes) +
+      CuBbsDeviceArena::align_up(d_len_bytes) +
+      CuBbsDeviceArena::align_up(d_msg_scalars_bytes) +
+      CuBbsDeviceArena::align_up(d_h2s_partials_count * sizeof(cubbs_sppark_scalar_t)) +
       CuBbsDeviceArena::align_up(std::max<size_t>(1u, aux_off)) +
       CuBbsDeviceArena::align_up(term_count * 32u) +
       CuBbsDeviceArena::align_up(sizeof(cubbs_sppark_bucket_t)) +
@@ -1638,6 +1793,7 @@ int32_t cubbs_bbs_cuda_verify_pre_b_aggregate_fused(
   uint64_t *d_offsets = nullptr;
   uint64_t *d_lengths = nullptr;
   uint8_t *d_msg_scalars_le = nullptr;
+  cubbs_sppark_scalar_t *d_h2s_partials = nullptr;
   uint8_t *d_aux_in = nullptr;
   uint8_t *d_agg_b_scalars_le = nullptr;
   cubbs_sppark_bucket_t *d_b_output = nullptr;
@@ -1653,9 +1809,10 @@ int32_t cubbs_bbs_cuda_verify_pre_b_aggregate_fused(
 
   if (err == cudaSuccess) {
     d_messages = arena.alloc<uint8_t>(item->packed_messages_len);
-    d_offsets = arena.alloc<uint64_t>(total_messages);
-    d_lengths = arena.alloc<uint64_t>(total_messages);
-    d_msg_scalars_le = arena.alloc<uint8_t>(total_messages * 32u);
+    d_offsets = d_off_bytes > 0u ? reinterpret_cast<uint64_t *>(arena.alloc<uint8_t>(d_off_bytes)) : nullptr;
+    d_lengths = d_len_bytes > 0u ? arena.alloc<uint64_t>(total_messages) : nullptr;
+    d_msg_scalars_le = d_msg_scalars_bytes > 0u ? arena.alloc<uint8_t>(d_msg_scalars_bytes) : nullptr;
+    d_h2s_partials = d_h2s_partials_count > 0u ? arena.alloc<cubbs_sppark_scalar_t>(d_h2s_partials_count) : nullptr;
     d_aux_in = arena.alloc<uint8_t>(std::max<size_t>(1u, aux_off));
     d_agg_b_scalars_le = arena.alloc<uint8_t>(term_count * 32u);
     d_b_output = arena.alloc<cubbs_sppark_bucket_t>(1u);
@@ -1677,14 +1834,13 @@ int32_t cubbs_bbs_cuda_verify_pre_b_aggregate_fused(
   if (err == cudaSuccess && item->packed_messages_len > 0u)
     err = cudaMemcpyAsync(d_messages, pipe_ws.messages, item->packed_messages_len,
                           cudaMemcpyHostToDevice, stream_b);
-  if (err == cudaSuccess && total_messages > 0u) {
-    err = cudaMemcpyAsync(d_offsets, pipe_ws.offsets,
-                          total_messages * sizeof(uint64_t),
+  if (err == cudaSuccess && d_off_bytes > 0u) {
+    err = cudaMemcpyAsync(d_offsets, pipe_ws.offsets, d_off_bytes,
                           cudaMemcpyHostToDevice, stream_b);
-    if (err == cudaSuccess)
-      err = cudaMemcpyAsync(d_lengths, pipe_ws.lengths,
-                            total_messages * sizeof(uint64_t),
-                            cudaMemcpyHostToDevice, stream_b);
+  }
+  if (err == cudaSuccess && d_len_bytes > 0u) {
+    err = cudaMemcpyAsync(d_lengths, pipe_ws.lengths, d_len_bytes,
+                          cudaMemcpyHostToDevice, stream_b);
   }
   if (err == cudaSuccess)
     err = cudaMemcpyAsync(d_aux_in, pipe_ws.aux_in, aux_off,
@@ -1706,23 +1862,52 @@ int32_t cubbs_bbs_cuda_verify_pre_b_aggregate_fused(
   const uint8_t *d_msg_dst = d_aux_in + off_msg_dst;
 
   // Stage 1: GPU H2S + random-coefficient B-scalar reduction + 1-row B-MSM.
-  if (err == cudaSuccess && total_messages > 0u) {
-    constexpr uint32_t h2s_threads = 128u;
-    const uint32_t h2s_blocks = static_cast<uint32_t>(
-        (total_messages + h2s_threads - 1u) / h2s_threads);
-    cubbs_bbs_verify_h2s_flat_to_le_kernel<<<h2s_blocks, h2s_threads, 0, stream_b>>>(
-        d_messages, d_offsets, d_lengths, total_messages,
-        d_msg_dst, item->message_dst.len, d_msg_scalars_le);
-    err = cudaGetLastError();
-  }
-  if (err == cudaSuccess) {
+  if (err == cudaSuccess && use_fused_tiled_h2s) {
     constexpr uint32_t red_threads = 256u;
     cubbs_bbs_verify_reduce_b_scalars_kernel<red_threads>
-        <<<static_cast<uint32_t>(term_count), red_threads, 0, stream_b>>>(
-            d_coef, d_dom, item->domain_stride, d_msg_scalars_le,
-            d_item_counts, d_item_starts, item_count, term_count - 2u,
-            term_count, d_agg_b_scalars_le, d_invalid);
+        <<<2u, red_threads, 0, stream_b>>>(
+            d_coef, d_dom, item->domain_stride, nullptr,
+            nullptr, nullptr, item_count, uniform_msg_count,
+            2u, d_agg_b_scalars_le, d_invalid);
     err = cudaGetLastError();
+    if (err == cudaSuccess) {
+      constexpr uint32_t h2s_t = 128u;
+      const dim3 h2s_grid(static_cast<uint32_t>((uniform_msg_count + h2s_t - 1u) / h2s_t),
+                          h2s_chunks, 1u);
+      cubbs_bbs_verify_fused_h2s_reduce_tiled_kernel<<<h2s_grid, h2s_t, 0, stream_b>>>(
+          d_messages, d_offsets, d_lengths, uniform_msg_len, d_coef,
+          item_count, uniform_msg_count, h2s_chunks,
+          d_msg_dst, item->message_dst.len,
+          d_h2s_partials, d_agg_b_scalars_le);
+      err = cudaGetLastError();
+    }
+    if (err == cudaSuccess && h2s_chunks > 1u) {
+      constexpr uint32_t p_t = 128u;
+      const uint32_t p_blocks =
+          static_cast<uint32_t>((uniform_msg_count + p_t - 1u) / p_t);
+      cubbs_bbs_verify_reduce_tiled_partials_kernel<<<p_blocks, p_t, 0, stream_b>>>(
+          d_h2s_partials, uniform_msg_count, h2s_chunks, d_agg_b_scalars_le);
+      err = cudaGetLastError();
+    }
+  } else {
+    if (err == cudaSuccess && total_messages > 0u) {
+      constexpr uint32_t h2s_threads = 128u;
+      const uint32_t h2s_blocks = static_cast<uint32_t>(
+          (total_messages + h2s_threads - 1u) / h2s_threads);
+      cubbs_bbs_verify_h2s_flat_to_le_kernel<<<h2s_blocks, h2s_threads, 0, stream_b>>>(
+          d_messages, d_offsets, d_lengths, uniform_msg_len, total_messages,
+          d_msg_dst, item->message_dst.len, d_msg_scalars_le);
+      err = cudaGetLastError();
+    }
+    if (err == cudaSuccess) {
+      constexpr uint32_t red_threads = 256u;
+      cubbs_bbs_verify_reduce_b_scalars_kernel<red_threads>
+          <<<static_cast<uint32_t>(term_count), red_threads, 0, stream_b>>>(
+              d_coef, d_dom, item->domain_stride, d_msg_scalars_le,
+              d_item_counts, d_item_starts, item_count, uniform_msg_count,
+              term_count, d_agg_b_scalars_le, d_invalid);
+      err = cudaGetLastError();
+    }
   }
   if (err == cudaSuccess) {
     err = cubbs_bbs_launch_cached_common_msm_range(
