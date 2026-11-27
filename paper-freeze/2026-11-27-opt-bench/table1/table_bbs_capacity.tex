@@ -1,0 +1,52 @@
+\begin{table*}[t]
+\centering
+\caption{Frozen optimized BBS primitive capacity (\texttt{opt} commit \texttt{9cad7ca}): cuBBS-Cred GPU backend (RTX 5060 Ti 180W TDP, RTX 5090 400W host cap) versus the historical local ZKryptium v0.2.2-derived CPU baseline. Each cell reports median operations/s; parenthesized values are ratios relative to the same-row EPYC 9554 baseline.}
+\label{tab:bbs-capacity-opt}
+\setlength{\tabcolsep}{2.8pt}
+\renewcommand{\arraystretch}{1.12}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llllrrrrr}
+\toprule
+Message shape & Issuer & Disclosure & Operation & EPYC 7763 (ops/s) & EPYC 9554 (ops/s) & RTX 5060 Ti (ops/s) & RTX 5090 (ops/s) & \shortstack{RTX 5090 /\\RTX 5060 Ti} \\
+\midrule
+64 & Same & -- & Sign & 2,073.90 (0.76$\times$) & 2,725.45 (1.00$\times$) & 572,348.23 (210.00$\times$) & 1,666,867.70 (611.59$\times$) & 2.91$\times$ \\
+64 & Same & -- & Verify & 2,158.16 (0.81$\times$) & 2,668.75 (1.00$\times$) & 1,932,855.52 (724.25$\times$) & 2,347,433.41 (879.60$\times$) & 1.21$\times$ \\
+64 & Same & 50\% & ProofGen & 1,522.68 (0.79$\times$) & 1,916.04 (1.00$\times$) & 236,044.69 (123.19$\times$) & 675,115.77 (352.35$\times$) & 2.86$\times$ \\
+64 & Same & 50\% & ProofVerify & 2,055.23 (0.80$\times$) & 2,582.29 (1.00$\times$) & 292,234.61 (113.17$\times$) & 917,115.00 (355.16$\times$) & 3.14$\times$ \\
+\midrule
+256 & Same & -- & Sign & 555.65 (0.80$\times$) & 697.46 (1.00$\times$) & 134,398.96 (192.70$\times$) & 386,978.09 (554.84$\times$) & 2.88$\times$ \\
+256 & Unique & -- & Sign & 549.16 (0.80$\times$) & 690.62 (1.00$\times$) & 134,959.22 (195.42$\times$) & 389,329.70 (563.74$\times$) & 2.88$\times$ \\
+256 & Same & -- & Verify & 567.24 (0.77$\times$) & 735.33 (1.00$\times$) & 598,239.70 (813.57$\times$) & 673,921.27 (916.49$\times$) & 1.13$\times$ \\
+256 & Unique & -- & Verify & 565.61 (0.77$\times$) & 737.11 (1.00$\times$) & 415,298.84 (563.41$\times$) & 644,651.79 (874.56$\times$) & 1.55$\times$ \\
+256 & Same & 0\% & ProofGen & 319.22 (0.82$\times$) & 390.78 (1.00$\times$) & 67,070.93 (171.63$\times$) & 174,771.11 (447.24$\times$) & 2.61$\times$ \\
+256 & Same & 25\% & ProofGen & 333.35 (0.75$\times$) & 443.90 (1.00$\times$) & 69,363.81 (156.26$\times$) & 189,742.75 (427.45$\times$) & 2.74$\times$ \\
+256 & Same & 50\% & ProofGen & 396.23 (0.78$\times$) & 509.63 (1.00$\times$) & 79,873.08 (156.73$\times$) & 207,152.84 (406.48$\times$) & 2.59$\times$ \\
+256 & Same & 75\% & ProofGen & 464.46 (0.77$\times$) & 603.80 (1.00$\times$) & 89,605.23 (148.40$\times$) & 236,051.55 (390.94$\times$) & 2.63$\times$ \\
+256 & Same & 100\% & ProofGen & 598.14 (0.81$\times$) & 735.33 (1.00$\times$) & 105,711.04 (143.76$\times$) & 281,775.70 (383.20$\times$) & 2.67$\times$ \\
+256 & Unique & 50\% & ProofGen & 407.18 (0.80$\times$) & 511.68 (1.00$\times$) & 79,704.00 (155.77$\times$) & 206,234.27 (403.05$\times$) & 2.59$\times$ \\
+256 & Same & 0\% & ProofVerify & 585.06 (0.80$\times$) & 727.33 (1.00$\times$) & 112,468.72 (154.63$\times$) & 333,161.81 (458.06$\times$) & 2.96$\times$ \\
+256 & Same & 25\% & ProofVerify & 588.86 (0.81$\times$) & 730.93 (1.00$\times$) & 110,659.28 (151.39$\times$) & 314,530.09 (430.31$\times$) & 2.84$\times$ \\
+256 & Same & 50\% & ProofVerify & 575.52 (0.80$\times$) & 723.06 (1.00$\times$) & 106,997.20 (147.98$\times$) & 289,940.89 (400.99$\times$) & 2.71$\times$ \\
+256 & Same & 75\% & ProofVerify & 571.67 (0.79$\times$) & 721.78 (1.00$\times$) & 102,964.18 (142.65$\times$) & 272,555.97 (377.61$\times$) & 2.65$\times$ \\
+256 & Same & 100\% & ProofVerify & 579.93 (0.80$\times$) & 727.46 (1.00$\times$) & 97,444.14 (133.95$\times$) & 233,268.28 (320.66$\times$) & 2.39$\times$ \\
+256 & Unique & 50\% & ProofVerify & 589.76 (0.82$\times$) & 715.97 (1.00$\times$) & 96,451.73 (134.72$\times$) & 262,166.52 (366.17$\times$) & 2.72$\times$ \\
+\midrule
+2,048 & Same & -- & Sign & 68.80 (0.79$\times$) & 86.76 (1.00$\times$) & 15,646.37 (180.33$\times$) & 48,129.75 (554.72$\times$) & 3.08$\times$ \\
+2,048 & Same & -- & Verify & 75.15 (0.80$\times$) & 94.24 (1.00$\times$) & 92,125.51 (977.60$\times$) & 87,078.48 (924.04$\times$) & 0.95$\times$ \\
+2,048 & Same & 50\% & ProofGen & 52.17 (0.80$\times$) & 65.24 (1.00$\times$) & 10,042.85 (153.93$\times$) & 28,962.95 (443.92$\times$) & 2.88$\times$ \\
+2,048 & Same & 50\% & ProofVerify & 75.92 (0.80$\times$) & 94.90 (1.00$\times$) & 12,583.65 (132.60$\times$) & 40,858.66 (430.56$\times$) & 3.25$\times$ \\
+\midrule
+65,536 & Same & -- & Sign & 2.19 (0.80$\times$) & 2.75 (1.00$\times$) & 271.68 (98.85$\times$) & 562.53 (204.68$\times$) & 2.07$\times$ \\
+65,536 & Same & -- & Verify & 2.39 (0.80$\times$) & 2.98 (1.00$\times$) & 2,800.83 (940.03$\times$) & 3,042.80 (1021.24$\times$) & 1.09$\times$ \\
+65,536 & Same & 50\% & ProofGen & 1.61 (0.80$\times$) & 2.02 (1.00$\times$) & 170.85 (84.51$\times$) & 329.66 (163.06$\times$) & 1.93$\times$ \\
+65,536 & Same & 50\% & ProofVerify & 2.36 (0.80$\times$) & 2.95 (1.00$\times$) & 209.38 (70.89$\times$) & 338.74 (114.69$\times$) & 1.62$\times$ \\
+\midrule
+\{64,128,256\} & Same & -- & Sign & 2,186.06 (0.80$\times$) & 2,728.58 (1.00$\times$) & 179,358.57 (65.73$\times$) & 405,031.26 (148.44$\times$) & 2.26$\times$ \\
+\{64,128,256\} & Same & -- & Verify & 2,140.73 (0.80$\times$) & 2,669.96 (1.00$\times$) & 819,205.54 (306.82$\times$) & 1,021,121.95 (382.45$\times$) & 1.25$\times$ \\
+\{64,128,256\} & Same & 50\% & ProofGen & 1,514.91 (0.79$\times$) & 1,917.61 (1.00$\times$) & 91,028.15 (47.47$\times$) & 213,914.63 (111.55$\times$) & 2.35$\times$ \\
+\{64,128,256\} & Same & 50\% & ProofVerify & 1,999.71 (0.77$\times$) & 2,582.44 (1.00$\times$) & 133,555.67 (51.72$\times$) & 263,683.57 (102.11$\times$) & 1.97$\times$ \\
+\bottomrule
+\end{tabular}%
+}
+\begin{minipage}{\textwidth}\footnotesize\textit{Note:} Same uses one issuer per template; Unique assigns distinct issuers to template items, with templates reused across batches and streams. CPU columns retain the historical local ZKryptium v0.2.2-derived baseline; GPU columns use the optimized cuBBS-Cred GPU backend (\texttt{CUBBS\_BBS\_FORCE\_GPU=1}, commit \texttt{9cad7ca}, 0 failed items across all 32 rows). RTX 5060 Ti was measured on Intel Core Ultra 7 265K (180W TDP); RTX 5090 was measured on Vast.ai AMD Ryzen 9 9950X3D2 (32T, 62GB, 400W host power limit). Hardware telemetry (100ms \texttt{nvidia-smi}) is archived in \texttt{table\_bbs\_capacity\_telemetry.csv}.\end{minipage}
+\end{table*}

@@ -1,0 +1,29 @@
+analysis_role,condition,condition_label,operation,operation_label,batch_size,streams,repetitions,median_operations_per_s,minimum_operations_per_s,maximum_operations_per_s,cv_operations_per_s_pct
+factor-reference,cpu-unique,CPU / unique issuer (capacity reference),sign,Sign,8,128,5,2811.7912457637312,2811.096480682767,2814.9858201563816,0.06341360703395837
+factor-reference,cpu-unique,CPU / unique issuer (capacity reference),verify-signature,Verify,8,128,5,2738.8486016757274,2729.4665565667256,2744.5421095597667,0.22554010827906718
+factor-reference,cpu-unique,CPU / unique issuer (capacity reference),proof-gen,ProofGen,8,128,5,1977.9021542397088,1960.5328004407545,1978.3182863643767,0.39426293486880776
+factor-reference,cpu-unique,CPU / unique issuer (capacity reference),proof-verify,ProofVerify,8,128,5,2630.7177066098866,2628.704620802034,2650.3662094134047,0.3398198820332873
+factor-gpu,production-unique,GPU / unique issuer,sign,Sign,512,1,3,64987.39171841649,64578.88062114361,67995.64107200858,2.8334716762369605
+factor-gpu,production-unique,GPU / unique issuer,verify-signature,Verify,512,1,3,34756.4702230577,34725.300418342405,35156.224043409245,0.68895196292259
+factor-gpu,production-unique,GPU / unique issuer,proof-gen,ProofGen,512,1,3,19155.192661122237,19137.508372485016,19217.05351739098,0.217878194998543
+factor-gpu,production-unique,GPU / unique issuer,proof-verify,ProofVerify,512,1,3,9783.128323094443,9726.766346929144,9887.889051698538,0.8343883735138712
+factor-gpu,production-shared,GPU / shared issuer,sign,Sign,512,1,3,66399.78675478924,64766.97496838672,68213.75696776964,2.594312046518322
+factor-gpu,production-shared,GPU / shared issuer,verify-signature,Verify,512,1,3,34385.9669575215,34253.30779677077,34745.460301575826,0.7389087457480192
+factor-gpu,production-shared,GPU / shared issuer,proof-gen,ProofGen,512,1,3,19304.46452019692,19117.255496099642,19595.59268289845,1.2464001680495784
+factor-gpu,production-shared,GPU / shared issuer,proof-verify,ProofVerify,512,1,3,12547.646352660955,12405.52506441139,12742.835989453584,1.347753820606793
+legacy-dispatch-control,serial-shape-shared,Serial shape buckets / shared issuer,sign,Sign,512,1,3,65144.42119335171,64282.533390578814,67562.5729894019,2.5896395529193788
+legacy-dispatch-control,serial-shape-shared,Serial shape buckets / shared issuer,verify-signature,Verify,512,1,3,17849.34262042492,17804.797122338037,18099.187250088893,0.8855896641137627
+legacy-dispatch-control,serial-shape-shared,Serial shape buckets / shared issuer,proof-gen,ProofGen,512,1,3,19480.760077472467,19248.762305210363,19687.226084988186,1.1265044031127107
+legacy-dispatch-control,serial-shape-shared,Serial shape buckets / shared issuer,proof-verify,ProofVerify,512,1,3,12462.111084394857,12320.038179868321,12625.902509606063,1.2274947583290627
+legacy-dispatch-control,serial-shape-unique,Serial shape buckets / unique issuer,sign,Sign,512,1,3,65471.79934872999,64531.172353049675,66005.75217344776,1.1426702527870474
+legacy-dispatch-control,serial-shape-unique,Serial shape buckets / unique issuer,verify-signature,Verify,512,1,3,11233.056467843877,11119.876590634058,11284.152294184363,0.7498008331438667
+legacy-dispatch-control,serial-shape-unique,Serial shape buckets / unique issuer,proof-gen,ProofGen,512,1,3,19553.202290389443,19447.845436727428,19565.957643936374,0.332052768061638
+legacy-dispatch-control,serial-shape-unique,Serial shape buckets / unique issuer,proof-verify,ProofVerify,512,1,3,9763.0938538569,9699.959781122967,9777.487096813773,0.42309327086479986
+verify-policy-control,aggregate-off-shared,GPU / shared issuer / pre-B aggregation off,sign,Sign,512,1,3,66127.5861679293,65442.35151071476,67789.40871187701,1.8161918344274928
+verify-policy-control,aggregate-off-shared,GPU / shared issuer / pre-B aggregation off,verify-signature,Verify,512,1,3,2770.3732245436063,2630.4036469357825,2770.406320025439,2.9672947094481166
+verify-policy-control,aggregate-off-shared,GPU / shared issuer / pre-B aggregation off,proof-gen,ProofGen,512,1,3,19651.749739167248,19193.755290021323,20371.236367852856,3.00705557731832
+verify-policy-control,aggregate-off-shared,GPU / shared issuer / pre-B aggregation off,proof-verify,ProofVerify,512,1,3,12429.72642222688,12396.72860620351,12492.218649153536,0.3898711856349472
+verify-policy-control,aggregate-off-unique,GPU / unique issuer / pre-B aggregation off,sign,Sign,512,1,3,64847.71304750492,64330.97055773603,66889.87008423413,2.070358348743275
+verify-policy-control,aggregate-off-unique,GPU / unique issuer / pre-B aggregation off,verify-signature,Verify,512,1,3,1826.047972299664,1822.9594464686816,1836.135915083878,0.37689715229402093
+verify-policy-control,aggregate-off-unique,GPU / unique issuer / pre-B aggregation off,proof-gen,ProofGen,512,1,3,18441.730470362007,18135.004888566407,18683.45336559451,1.4922071961475234
+verify-policy-control,aggregate-off-unique,GPU / unique issuer / pre-B aggregation off,proof-verify,ProofVerify,512,1,3,9550.337499517387,9505.369903178576,9606.05768791841,0.5279454195655671

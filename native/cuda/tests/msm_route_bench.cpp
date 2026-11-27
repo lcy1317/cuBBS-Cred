@@ -154,7 +154,7 @@ uint8_t expected_route(const Options &options) {
                ? CUBBS_BBS_MSM_ROUTE_CUBBS_ITEM
                : CUBBS_BBS_MSM_ROUTE_CUBBS_UNIVERSAL;
   }
-  return options.term_count <= 258u
+  return options.term_count <= 2100u
              ? CUBBS_BBS_MSM_ROUTE_CUBBS_COMMON_POINTS
              : CUBBS_BBS_MSM_ROUTE_CUBBS_LARGE;
 }
