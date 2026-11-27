@@ -332,6 +332,7 @@ static bool g1_msm_items_have_common_points(const CuBbsG1MsmInput *items,
 // Slim production Opt CUDA modules included in dependency order.
 #include "kernels/common_base.cuh"
 #include "kernels/device_arena.cuh"
+#include "kernels/fp_lazy_xyzz.cuh"
 #include "kernels/limlee_msm.cuh"
 #include "kernels/pippenger_large_msm.cuh"
 #include "kernels/gpu_g1_decompress.cuh"

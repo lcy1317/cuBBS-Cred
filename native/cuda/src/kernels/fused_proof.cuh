@@ -222,45 +222,186 @@ __device__ static void cubbs_bbs_compute_proof_challenge_le_device(
 // GPU-Resident Fused ProofGen Kernels
 // ============================================================================
 
-// Fill slots 0 (1) and 1 (domain_le) of every row in d_b_scalars_le.
-__global__ static void cubbs_bbs_proof_gen_init_b_header_scalars_kernel(
+// Fill slots 0 (1) and 1 (domain_le) of b_scalars_le, AND fold r2 into
+// d_scalars_le slots 0 (r2) and 1 (r2 * domain) so Lim-Lee computes D = r2*B directly!
+__global__ static void cubbs_bbs_proof_gen_init_bd_header_scalars_kernel(
     const uint8_t *domains_be, size_t domain_stride,
+    const uint8_t *row_state_le,
     size_t item_count, size_t term_count,
-    uint8_t *b_scalars_le, uint32_t *invalid_out) {
+    uint8_t *b_scalars_le, uint8_t *d_scalars_le, uint32_t *invalid_out) {
   const size_t row = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (row >= item_count) return;
-  uint8_t *row_s = b_scalars_le + (row * term_count * 32u);
-  memset(row_s, 0, 32u);
-  row_s[0] = 1u;
+  uint8_t *row_b = b_scalars_le + (row * term_count * 32u);
+  uint8_t *row_d = d_scalars_le + (row * term_count * 32u);
+  memset(row_b, 0, 32u);
+  row_b[0] = 1u;
+
+  const uint8_t *r2_le = row_state_le + ((row * 6u + 1u) * 32u);
+  memcpy(row_d, r2_le, 32u);
+
   const uint8_t *dom_be = domains_be + (domain_stride == 0u ? 0u : row * domain_stride);
   if (!cubbs_bbs_scalar_be_is_canonical(dom_be)) {
     atomicExch(invalid_out, 1u);
-    memset(row_s + 32u, 0, 32u);
+    memset(row_b + 32u, 0, 32u);
+    memset(row_d + 32u, 0, 32u);
     return;
   }
-  uint8_t *dom_le = row_s + 32u;
+  uint8_t dom_le[32];
   #pragma unroll
   for (int i = 0; i < 32; ++i) dom_le[i] = dom_be[31 - i];
+  memcpy(row_b + 32u, dom_le, 32u);
+
+  cubbs_sppark_scalar_t fr_dom, fr_r2;
+  memcpy(&fr_dom, dom_le, 32u); fr_dom.to();
+  memcpy(&fr_r2, r2_le, 32u);   fr_r2.to();
+  cubbs_sppark_scalar_t fr_r2_dom = fr_dom * fr_r2;
+  fr_r2_dom.from();
+  memcpy(row_d + 32u, &fr_r2_dom, 32u);
 }
 
-// Normalize helper moved to gpu_g1_decompress.cuh (cubbs_bbs_xyzz_to_plain_affine_batch64_kernel).
+// Fused H2S + r2-scaling: writes unscaled m_j to b_scalars_le (for Stage 5 challenge
+// and m_cap[u]) and r2*m_j to d_scalars_le (so Lim-Lee computes D = r2*B directly!).
+__global__ static void cubbs_bbs_proof_gen_h2s_and_scale_kernel(
+    const uint8_t *messages, const uint64_t *offsets, const uint64_t *lengths,
+    size_t uniform_len, const uint8_t *row_state_le,
+    size_t item_count, size_t message_count, size_t term_count,
+    const uint8_t *message_dst, size_t message_dst_len,
+    uint8_t *b_scalars_le, uint8_t *d_scalars_le) {
+  const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t total = item_count * message_count;
+  if (idx >= total) return;
 
-// Per-proof GPU ChaCha20 CSPRNG + 7 GLV-split multiplier preparation:
+  size_t msg_off = 0u;
+  size_t msg_len = uniform_len;
+  if (lengths != nullptr) {
+    msg_off = static_cast<size_t>(offsets[idx]);
+    msg_len = static_cast<size_t>(lengths[idx]);
+  } else if (offsets != nullptr) {
+    const auto *offs32 = reinterpret_cast<const uint32_t *>(offsets);
+    msg_off = static_cast<size_t>(offs32[idx]);
+    msg_len = static_cast<size_t>(offs32[idx + 1u] - offs32[idx]);
+  } else {
+    msg_off = idx * uniform_len;
+  }
+
+  const size_t row = idx / message_count;
+  const size_t msg = idx - (row * message_count);
+  uint32_t uniform_words[12];
+  expand_message_xmd_sha256_48_words_device(
+      messages + msg_off, msg_len,
+      message_dst, message_dst_len, uniform_words);
+  uint64_t le[4];
+  bls12_381_fr_reduce_words12_to_le64(uniform_words, le);
+  const size_t slot_off = (row * term_count + 2u + msg) * 32u;
+  bls12_381_fr_store_le(le, b_scalars_le + slot_off);
+
+  cubbs_sppark_scalar_t fr_m, fr_r2;
+  memcpy(&fr_m, le, 32u);
+  memcpy(&fr_r2, row_state_le + ((row * 6u + 1u) * 32u), 32u);
+  fr_m.to();
+  fr_r2.to();
+  cubbs_sppark_scalar_t fr_scaled = fr_m * fr_r2;
+  fr_scaled.from();
+  memcpy(d_scalars_le + slot_off, &fr_scaled, 32u);
+}
+
+// Normalize D = r2*B from xyzz -> plain affine AND simultaneously compress D
+// directly into pts5_compressed[row * 240 + 96..144] (zero duplicate inversion!).
+__global__ static void cubbs_bbs_xyzz_to_plain_affine_and_compress_d_kernel(
+    const cubbs_sppark_bucket_t *d_xyzz_in,
+    cubbs_sppark_plain_affine_t *d_affine_out,
+    uint8_t *pts5_compressed_out,
+    size_t count) {
+  const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const bool valid = idx < count;
+
+  cubbs_sppark_bucket_t pt;
+  pt.inf();
+  bool finite = false;
+  fp_t zzz = fp_t::one();
+  if (valid) {
+    pt = d_xyzz_in[idx];
+    finite = !pt.is_inf();
+    if (finite) {
+      const fp_t *coords = reinterpret_cast<const fp_t *>(&pt);
+      zzz = coords[2];
+    }
+  }
+  const fp_t inv_zzz = zzz.reciprocal();
+
+  if (valid) {
+    fp_t affine_x, affine_y;
+    if (!finite) {
+      affine_x.zero();
+      affine_y.zero();
+    } else {
+      const fp_t *coords = reinterpret_cast<const fp_t *>(&pt);
+      affine_y = inv_zzz * coords[1];
+      const fp_t inv_z = inv_zzz * coords[3];
+      affine_x = sqr(inv_z) * coords[0];
+    }
+    d_affine_out[idx] = cubbs_sppark_plain_affine_t{affine_x, affine_y};
+    cubbs_bbs_compress_affine_fp_to_be48(
+        affine_x, affine_y, finite, pts5_compressed_out + (idx * 240u) + 96u);
+  }
+}
+
+// Compress 4 proof points [Abar, Bbar, T1, T2] directly into pts5_compressed
+// at offsets [0, 48, 144, 192] (slot 96 already holds D!).
+__global__ static void cubbs_bbs_g1_xyzz_to_compressed_pts4_into_pts5_kernel(
+    const cubbs_sppark_bucket_t *pts4_in,
+    size_t item_count,
+    uint8_t *pts5_compressed_out) {
+  const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t total = item_count * 4u;
+  const bool valid = idx < total;
+
+  cubbs_sppark_bucket_t pt;
+  pt.inf();
+  bool finite = false;
+  fp_t zzz = fp_t::one();
+  if (valid) {
+    pt = pts4_in[idx];
+    finite = !pt.is_inf();
+    if (finite) {
+      const fp_t *coords = reinterpret_cast<const fp_t *>(&pt);
+      zzz = coords[2];
+    }
+  }
+  const fp_t inv_zzz = zzz.reciprocal();
+
+  if (valid) {
+    fp_t affine_x, affine_y;
+    if (finite) {
+      const fp_t *coords = reinterpret_cast<const fp_t *>(&pt);
+      affine_y = inv_zzz * coords[1];
+      const fp_t inv_z = inv_zzz * coords[3];
+      affine_x = sqr(inv_z) * coords[0];
+    }
+    const size_t row = idx >> 2u;
+    const uint32_t sub = static_cast<uint32_t>(idx & 3u);
+    const uint32_t dst_slot = (sub < 2u) ? sub : (sub + 1u); // 0->0, 1->1, 2->3, 3->4
+    cubbs_bbs_compress_affine_fp_to_be48(
+        affine_x, affine_y, finite,
+        pts5_compressed_out + (row * 240u) + (static_cast<size_t>(dst_slot) * 48u));
+  }
+}
+
+// Per-proof GPU ChaCha20 CSPRNG + 6 GLV-split multiplier preparation (D = r2*B folded!):
 //   row_state[row * 6 + 0..5] = [r1, r2, e_tilde, r1_tilde, r3_tilde, e] (LE)
-//   glv_splits[row * 7 + 0..6] = GLV(rem||quot) of:
-//     [0] r2              (for D = r2*B)
-//     [1] r1*r2           (for Abar = (r1*r2)*A)
-//     [2] r1*r2           (for Bbar_pos = (r1*r2)*B)
-//     [3] r1*r2*e         (for Bbar_neg = -(r1*r2*e)*A)
-//     [4] r1*r2*e_tilde   (for T1_a = (r1*r2*e_tilde)*A)
-//     [5] r2*r1_tilde     (for T1_b = (r2*r1_tilde)*B)
-//     [6] r2*r3_tilde     (for T2_var = (r2*r3_tilde)*B = r3_tilde*D)
+//   glv_splits[row * 6 + 0..5] = GLV(rem||quot) of:
+//     [0] r1*r2           (for Abar = (r1*r2)*A)
+//     [1] r1              (for Bbar_pos = r1*D)
+//     [2] r1*r2*e         (for Bbar_neg = -(r1*r2*e)*A)
+//     [3] r1*r2*e_tilde   (for T1_a = (r1*r2*e_tilde)*A)
+//     [4] r1_tilde        (for T1_b = r1_tilde*D)
+//     [5] r3_tilde        (for T2_var = r3_tilde*D)
 __global__ static void cubbs_bbs_proof_gen_prep_scalars_kernel(
     const uint8_t *signatures_e_be,
     const uint8_t *csprng_seed,
     size_t item_count,
     uint8_t *row_state_le,    // item_count * 6 * 32
-    uint8_t *glv_splits_le,   // item_count * 7 * 32
+    uint8_t *glv_splits_le,   // item_count * 6 * 32
     uint32_t *invalid_out) {
   const size_t row = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (row >= item_count) return;
@@ -269,7 +410,7 @@ __global__ static void cubbs_bbs_proof_gen_prep_scalars_kernel(
   if (!cubbs_bbs_scalar_be_is_canonical(e_be)) {
     atomicExch(invalid_out, 1u);
     memset(row_state_le + (row * 6u * 32u), 0, 6u * 32u);
-    memset(glv_splits_le + (row * 7u * 32u), 0, 7u * 32u);
+    memset(glv_splits_le + (row * 6u * 32u), 0, 6u * 32u);
     return;
   }
 
@@ -293,34 +434,33 @@ __global__ static void cubbs_bbs_proof_gen_prep_scalars_kernel(
   memcpy(st + 4u * 32u, r3t_le, 32u);
   memcpy(st + 5u * 32u, e_le, 32u);
 
-  cubbs_sppark_scalar_t fr_r1, fr_r2, fr_et, fr_r1t, fr_r3t, fr_e;
+  cubbs_sppark_scalar_t fr_r1, fr_r2, fr_et, fr_e;
   memcpy(&fr_r1, r1_le, 32u);   fr_r1.to();
   memcpy(&fr_r2, r2_le, 32u);   fr_r2.to();
   memcpy(&fr_et, et_le, 32u);   fr_et.to();
-  memcpy(&fr_r1t, r1t_le, 32u); fr_r1t.to();
-  memcpy(&fr_r3t, r3t_le, 32u); fr_r3t.to();
   memcpy(&fr_e, e_le, 32u);     fr_e.to();
 
   const cubbs_sppark_scalar_t fr_r1r2 = fr_r1 * fr_r2;
-  const cubbs_sppark_scalar_t fr_m3 = fr_r1r2 * fr_e;
-  const cubbs_sppark_scalar_t fr_m4 = fr_r1r2 * fr_et;
-  const cubbs_sppark_scalar_t fr_m5 = fr_r2 * fr_r1t;
-  const cubbs_sppark_scalar_t fr_m6 = fr_r2 * fr_r3t;
+  const cubbs_sppark_scalar_t fr_m2 = fr_r1r2 * fr_e;
+  const cubbs_sppark_scalar_t fr_m3 = fr_r1r2 * fr_et;
 
-  auto store_split = [&](uint32_t slot, cubbs_sppark_scalar_t val) {
+  auto store_split_fr = [&](uint32_t slot, cubbs_sppark_scalar_t val) {
     val.from();
     uint8_t le[32];
     memcpy(le, &val, 32u);
-    uint8_t *dst = glv_splits_le + ((row * 7u + slot) * 32u);
+    uint8_t *dst = glv_splits_le + ((row * 6u + slot) * 32u);
     cubbs_bbs_scalar_div_by_z2_device(le, dst, dst + 16u);
   };
-  store_split(0u, fr_r2);
-  store_split(1u, fr_r1r2);
-  store_split(2u, fr_r1r2);
-  store_split(3u, fr_m3);
-  store_split(4u, fr_m4);
-  store_split(5u, fr_m5);
-  store_split(6u, fr_m6);
+  auto store_split_le = [&](uint32_t slot, const uint8_t le[32]) {
+    uint8_t *dst = glv_splits_le + ((row * 6u + slot) * 32u);
+    cubbs_bbs_scalar_div_by_z2_device(le, dst, dst + 16u);
+  };
+  store_split_fr(0u, fr_r1r2);
+  store_split_le(1u, r1_le);
+  store_split_fr(2u, fr_m2);
+  store_split_fr(3u, fr_m3);
+  store_split_le(4u, r1t_le);
+  store_split_le(5u, r3t_le);
 }
 
 // Parallel ChaCha20 generator for m_tilde[row * U + u] (all B*U scalars in parallel!).
@@ -390,14 +530,15 @@ static cudaError_t cubbs_bbs_launch_build_radix16_affine_tables(
   return err;
 }
 
-// 5-way Straus simultaneous multi-base Signed Radix-16 GLV kernel for ProofGen:
-//   8-entry affine tables (2x smaller L2 footprint & 2x faster B table build!).
+// 4-way Straus simultaneous multi-base Signed Radix-16 GLV kernel for ProofGen
+// in a=0 Jacobian coordinates (2M+5S dbl-2009-l + 7M+4S madd-2007-bl).
+// Role 0 (D = r2*B) is eliminated by folding r2 directly into the Lim-Lee B-MSM!
 __global__ static void __launch_bounds__(64, 5)
-cubbs_bbs_proof_gen_straus5_affine_u_kernel(
-    const cubbs_sppark_plain_affine_t *b_tables_aff,
+cubbs_bbs_proof_gen_straus4_jac_kernel(
+    const cubbs_sppark_plain_affine_t *d_tables_aff,
     const cubbs_sppark_plain_affine_t *a_tables_aff,
     const uint8_t *glv_splits_le,
-    cubbs_sppark_bucket_t *pts5_xyzz,
+    cubbs_sppark_bucket_t *pts4_xyzz,
     size_t item_count) {
   __shared__ uint64_t s_digs[64u][4u][3u];
 
@@ -408,25 +549,23 @@ cubbs_bbs_proof_gen_straus5_affine_u_kernel(
 
   uint32_t slot0 = 0u, slot1 = 0u;
   uint32_t n_passes = 2u;
-  bool base0_is_b = true;
-  bool base1_is_b = false;
+  bool base0_is_d = true;
+  bool base1_is_d = false;
   bool base1_neg = false;
   uint32_t out_slot = 0u;
 
   if (role == 0u) {
-    slot0 = 0u; n_passes = 2u; base0_is_b = true;  out_slot = 2u; // D
+    slot0 = 0u; n_passes = 2u; base0_is_d = false; out_slot = 0u; // Abar = (r1*r2)*A
   } else if (role == 1u) {
-    slot0 = 1u; n_passes = 2u; base0_is_b = false; out_slot = 0u; // Abar
+    slot0 = 1u; slot1 = 2u; n_passes = 4u; base0_is_d = true; base1_is_d = false; base1_neg = true; out_slot = 1u; // Bbar = r1*D - (r1*r2*e)*A
   } else if (role == 2u) {
-    slot0 = 2u; slot1 = 3u; n_passes = 4u; base0_is_b = true; base1_is_b = false; base1_neg = true; out_slot = 1u; // Bbar
-  } else if (role == 3u) {
-    slot0 = 4u; slot1 = 5u; n_passes = 4u; base0_is_b = false; base1_is_b = true; base1_neg = false; out_slot = 3u; // T1
+    slot0 = 3u; slot1 = 4u; n_passes = 4u; base0_is_d = false; base1_is_d = true; base1_neg = false; out_slot = 2u; // T1 = (r1*r2*e_tilde)*A + r1_tilde*D
   } else {
-    slot0 = 6u; n_passes = 2u; base0_is_b = true;  out_slot = 4u; // T2_var
+    slot0 = 5u; n_passes = 2u; base0_is_d = true; out_slot = 3u; // T2_var = r3_tilde*D
   }
 
   {
-    const uint8_t *c0 = glv_splits_le + ((proof * 7u + slot0) * 32u);
+    const uint8_t *c0 = glv_splits_le + ((proof * 6u + slot0) * 32u);
     uint64_t r[3], q[3];
     cubbs_bbs_pack_signed_radix16(c0, r);
     cubbs_bbs_pack_signed_radix16(c0 + 16u, q);
@@ -434,7 +573,7 @@ cubbs_bbs_proof_gen_straus5_affine_u_kernel(
     for (int k = 0; k < 3; ++k) { s_digs[tid][0][k] = r[k]; s_digs[tid][1][k] = q[k]; }
   }
   if (n_passes == 4u) {
-    const uint8_t *c1 = glv_splits_le + ((proof * 7u + slot1) * 32u);
+    const uint8_t *c1 = glv_splits_le + ((proof * 6u + slot1) * 32u);
     uint64_t r[3], q[3];
     cubbs_bbs_pack_signed_radix16(c1, r);
     cubbs_bbs_pack_signed_radix16(c1 + 16u, q);
@@ -443,18 +582,18 @@ cubbs_bbs_proof_gen_straus5_affine_u_kernel(
   }
 
   const cubbs_sppark_plain_affine_t *tbl0 =
-      (base0_is_b ? b_tables_aff : a_tables_aff) + (proof * 8u);
+      (base0_is_d ? d_tables_aff : a_tables_aff) + (proof * 8u);
   const cubbs_sppark_plain_affine_t *tbl1 =
-      (base1_is_b ? b_tables_aff : a_tables_aff) + (proof * 8u);
+      (base1_is_d ? d_tables_aff : a_tables_aff) + (proof * 8u);
 
-  cubbs_sppark_bucket_t acc;
+  CuBbsG1Jac acc;
   acc.inf();
   #pragma unroll 1
   for (int window = 32; window >= 0; --window) {
     if (!acc.is_inf()) {
       #pragma unroll 1
       for (uint32_t doubling = 0u; doubling < 4u; ++doubling) {
-        cubbs_bbs_xyzz_dbl_u(acc);
+        cubbs_bbs_jac_dbl(acc);
       }
     }
     #pragma unroll 1
@@ -478,15 +617,15 @@ cubbs_bbs_proof_gen_straus5_affine_u_kernel(
           }
           neg = !neg;
         }
-        acc.uadd(p, neg);
+        cubbs_bbs_jac_madd(acc, p, neg);
       }
     }
   }
-  pts5_xyzz[proof * 5u + out_slot] = acc;
+  pts4_xyzz[proof * 4u + out_slot] = cubbs_bbs_jac_to_xyzz(acc);
 }
 
-// 2-way Straus simultaneous multi-base Signed Radix-16 GLV kernel for ProofVerify:
-//   8-entry affine tables (2x smaller L2 footprint) + inline T2 += r3_cap*D!
+// 2-way Straus simultaneous multi-base Signed Radix-16 GLV kernel for ProofVerify
+// in a=0 Jacobian coordinates (2M+5S dbl-2009-l + 7M+4S madd-2007-bl).
 __global__ static void __launch_bounds__(64, 5)
 cubbs_bbs_proof_verify_straus2_affine_u_kernel(
     const cubbs_sppark_plain_affine_t *pts_tables_aff,
@@ -528,14 +667,14 @@ cubbs_bbs_proof_verify_straus2_affine_u_kernel(
   }
 
   const cubbs_sppark_plain_affine_t *proof_tbl = pts_tables_aff + (proof * 3u * 8u);
-  cubbs_sppark_bucket_t acc;
+  CuBbsG1Jac acc;
   acc.inf();
   #pragma unroll 1
   for (int window = 32; window >= 0; --window) {
     if (!acc.is_inf()) {
       #pragma unroll 1
       for (uint32_t doubling = 0u; doubling < 4u; ++doubling) {
-        cubbs_bbs_xyzz_dbl_u(acc);
+        cubbs_bbs_jac_dbl(acc);
       }
     }
     #pragma unroll 1
@@ -559,27 +698,28 @@ cubbs_bbs_proof_verify_straus2_affine_u_kernel(
           }
           neg = !neg;
         }
-        acc.uadd(p, neg);
+        cubbs_bbs_jac_madd(acc, p, neg);
       }
     }
   }
 
+  const cubbs_sppark_bucket_t acc_xyzz = cubbs_bbs_jac_to_xyzz(acc);
   if (is_t1) {
-    t1_xyzz[proof] = acc;
+    t1_xyzz[proof] = acc_xyzz;
   } else {
     cubbs_sppark_bucket_t t2 = t2_xyzz[proof];
-    cubbs_bbs_limlee_xyzz_add_noinline(t2, acc);
+    cubbs_bbs_limlee_xyzz_add_noinline(t2, acc_xyzz);
     t2_xyzz[proof] = t2;
   }
 }
 
 __global__ static void cubbs_bbs_proof_gen_add_t2_common_kernel(
-    cubbs_sppark_bucket_t *pts5_xyzz,
+    cubbs_sppark_bucket_t *pts4_xyzz,
     const cubbs_sppark_bucket_t *t2_common_xyzz,
     size_t item_count) {
   const size_t row = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (row < item_count) {
-    pts5_xyzz[row * 5u + 4u].uadd(t2_common_xyzz[row]);
+    pts4_xyzz[row * 4u + 3u].uadd(t2_common_xyzz[row]);
   }
 }
 
@@ -865,15 +1005,16 @@ int32_t cubbs_bbs_cuda_proof_gen_fused_common_batch(
       CuBbsDeviceArena::align_up(d_len_bytes) +
       CuBbsDeviceArena::align_up(std::max<size_t>(1u, off)) +
       CuBbsDeviceArena::align_up(item_count * term_count * 32u) +
+      CuBbsDeviceArena::align_up(item_count * term_count * 32u) +
       CuBbsDeviceArena::align_up(item_count * sizeof(cubbs_sppark_bucket_t)) +
       CuBbsDeviceArena::align_up(item_count * sizeof(cubbs_sppark_plain_affine_t)) +
       CuBbsDeviceArena::align_up(item_count * 8u * sizeof(cubbs_sppark_plain_affine_t)) +
       CuBbsDeviceArena::align_up(item_count * 6u * 32u) +
-      CuBbsDeviceArena::align_up(item_count * 7u * 32u) +
+      CuBbsDeviceArena::align_up(item_count * 6u * 32u) +
       (U > 0u ? (CuBbsDeviceArena::align_up(item_count * U * 32u) +
                  CuBbsDeviceArena::align_up(item_count * sizeof(cubbs_sppark_bucket_t)))
               : 0u) +
-      CuBbsDeviceArena::align_up(item_count * 5u * sizeof(cubbs_sppark_bucket_t)) +
+      CuBbsDeviceArena::align_up(item_count * 4u * sizeof(cubbs_sppark_bucket_t)) +
       CuBbsDeviceArena::align_up(item_count * 240u) +
       CuBbsDeviceArena::align_up(proofs_out_bytes) +
       CuBbsDeviceArena::align_up(sizeof(uint32_t));
@@ -884,13 +1025,14 @@ int32_t cubbs_bbs_cuda_proof_gen_fused_common_batch(
   uint64_t *d_lengths = nullptr;
   uint8_t *d_aux_in = nullptr;
   uint8_t *d_b_scalars_le = nullptr;
-  cubbs_sppark_bucket_t *d_b_xyzz = nullptr;
-  cubbs_sppark_plain_affine_t *d_b_affines = nullptr;
-  cubbs_sppark_plain_affine_t *d_b_tbl_aff = nullptr;
+  uint8_t *d_d_scalars_le = nullptr;
+  cubbs_sppark_bucket_t *d_d_xyzz = nullptr;
+  cubbs_sppark_plain_affine_t *d_d_affines = nullptr;
+  cubbs_sppark_plain_affine_t *d_d_tbl_aff = nullptr;
   uint8_t *d_row_state_le = nullptr;
   uint8_t *d_glv_splits_le = nullptr;
   uint8_t *d_m_tilde_le = nullptr;
-  cubbs_sppark_bucket_t *d_pts5_xyzz = nullptr;
+  cubbs_sppark_bucket_t *d_pts4_xyzz = nullptr;
   cubbs_sppark_bucket_t *d_t2_common_xyzz = nullptr;
   uint8_t *d_pts5_compressed = nullptr;
   uint8_t *d_proofs_out = nullptr;
@@ -902,16 +1044,17 @@ int32_t cubbs_bbs_cuda_proof_gen_fused_common_batch(
     d_lengths = d_len_bytes > 0u ? arena.alloc<uint64_t>(total_messages) : nullptr;
     d_aux_in = arena.alloc<uint8_t>(std::max<size_t>(1u, off));
     d_b_scalars_le = arena.alloc<uint8_t>(item_count * term_count * 32u);
-    d_b_xyzz = arena.alloc<cubbs_sppark_bucket_t>(item_count);
-    d_b_affines = arena.alloc<cubbs_sppark_plain_affine_t>(item_count);
-    d_b_tbl_aff = arena.alloc<cubbs_sppark_plain_affine_t>(item_count * 8u);
+    d_d_scalars_le = arena.alloc<uint8_t>(item_count * term_count * 32u);
+    d_d_xyzz = arena.alloc<cubbs_sppark_bucket_t>(item_count);
+    d_d_affines = arena.alloc<cubbs_sppark_plain_affine_t>(item_count);
+    d_d_tbl_aff = arena.alloc<cubbs_sppark_plain_affine_t>(item_count * 8u);
     d_row_state_le = arena.alloc<uint8_t>(item_count * 6u * 32u);
-    d_glv_splits_le = arena.alloc<uint8_t>(item_count * 7u * 32u);
+    d_glv_splits_le = arena.alloc<uint8_t>(item_count * 6u * 32u);
     if (U > 0u) {
       d_m_tilde_le = arena.alloc<uint8_t>(item_count * U * 32u);
       d_t2_common_xyzz = arena.alloc<cubbs_sppark_bucket_t>(item_count);
     }
-    d_pts5_xyzz = arena.alloc<cubbs_sppark_bucket_t>(item_count * 5u);
+    d_pts4_xyzz = arena.alloc<cubbs_sppark_bucket_t>(item_count * 4u);
     d_pts5_compressed = arena.alloc<uint8_t>(item_count * 240u);
     d_proofs_out = arena.alloc<uint8_t>(proofs_out_bytes);
     d_invalid = arena.alloc<uint32_t>(1u);
@@ -948,43 +1091,46 @@ int32_t cubbs_bbs_cuda_proof_gen_fused_common_batch(
   const uint8_t *d_msg_dst = d_aux_in + off_msg_dst;
   const uint8_t *d_chal_dst = d_aux_in + off_chal_dst;
 
-  // Stage 1: Fill [1, domain] + H2S all raw messages directly into B scalar layout.
-  if (err == cudaSuccess) {
-    constexpr uint32_t t = 128u;
-    const uint32_t b = static_cast<uint32_t>((item_count + t - 1u) / t);
-    cubbs_bbs_proof_gen_init_b_header_scalars_kernel<<<b, t, 0, stream>>>(
-        d_dom, item->domain_stride, item_count, term_count, d_b_scalars_le, d_invalid);
-    err = cudaGetLastError();
-  }
-  if (err == cudaSuccess && total_messages > 0u) {
-    constexpr uint32_t t = 128u;
-    const uint32_t b = static_cast<uint32_t>((total_messages + t - 1u) / t);
-    cubbs_bbs_sign_h2s_messages_to_le_kernel<<<b, t, 0, stream>>>(
-        d_messages, d_offsets, d_lengths, uniform_msg_len, item_count, message_count, term_count,
-        d_msg_dst, item->message_dst.len, d_b_scalars_le);
-    err = cudaGetLastError();
-  }
-  // Stage 2: Lim-Lee/Pippenger B-MSM + B affine normalization + Radix-32 table + ChaCha20 prep.
-  if (err == cudaSuccess) {
-    err = cubbs_bbs_launch_cached_common_msm_range(
-        *cached_b, d_b_scalars_le, term_count, item_count, d_b_xyzz, stream);
-  }
-  if (err == cudaSuccess) {
-    const uint32_t norm_blocks = static_cast<uint32_t>((item_count + 63u) / 64u);
-    cubbs_bbs_xyzz_to_plain_affine_batch64_kernel<<<norm_blocks, 64u, 0, stream>>>(
-        d_b_xyzz, d_b_affines, item_count);
-    err = cudaGetLastError();
-  }
-  if (err == cudaSuccess) {
-    err = cubbs_bbs_launch_build_radix16_affine_tables(
-        d_b_affines, item_count, d_b_tbl_aff, stream);
-  }
+  // Stage 1: ChaCha20 CSPRNG prep (gives r2) + Fill [1, domain] & [r2, r2*domain] +
+  // Fused H2S + r2-scaling so Lim-Lee computes D = r2*B directly!
   if (err == cudaSuccess) {
     constexpr uint32_t t = 128u;
     const uint32_t b = static_cast<uint32_t>((item_count + t - 1u) / t);
     cubbs_bbs_proof_gen_prep_scalars_kernel<<<b, t, 0, stream>>>(
         d_sig_e, d_seed, item_count, d_row_state_le, d_glv_splits_le, d_invalid);
     err = cudaGetLastError();
+  }
+  if (err == cudaSuccess) {
+    constexpr uint32_t t = 128u;
+    const uint32_t b = static_cast<uint32_t>((item_count + t - 1u) / t);
+    cubbs_bbs_proof_gen_init_bd_header_scalars_kernel<<<b, t, 0, stream>>>(
+        d_dom, item->domain_stride, d_row_state_le, item_count, term_count,
+        d_b_scalars_le, d_d_scalars_le, d_invalid);
+    err = cudaGetLastError();
+  }
+  if (err == cudaSuccess && total_messages > 0u) {
+    constexpr uint32_t t = 128u;
+    const uint32_t b = static_cast<uint32_t>((total_messages + t - 1u) / t);
+    cubbs_bbs_proof_gen_h2s_and_scale_kernel<<<b, t, 0, stream>>>(
+        d_messages, d_offsets, d_lengths, uniform_msg_len, d_row_state_le,
+        item_count, message_count, term_count,
+        d_msg_dst, item->message_dst.len, d_b_scalars_le, d_d_scalars_le);
+    err = cudaGetLastError();
+  }
+  // Stage 2: Lim-Lee/Pippenger D-MSM (D = r2*B directly!) + D affine normalize & compress + Radix-16 table.
+  if (err == cudaSuccess) {
+    err = cubbs_bbs_launch_cached_common_msm_range(
+        *cached_b, d_d_scalars_le, term_count, item_count, d_d_xyzz, stream);
+  }
+  if (err == cudaSuccess) {
+    const uint32_t norm_blocks = static_cast<uint32_t>((item_count + 63u) / 64u);
+    cubbs_bbs_xyzz_to_plain_affine_and_compress_d_kernel<<<norm_blocks, 64u, 0, stream>>>(
+        d_d_xyzz, d_d_affines, d_pts5_compressed, item_count);
+    err = cudaGetLastError();
+  }
+  if (err == cudaSuccess) {
+    err = cubbs_bbs_launch_build_radix16_affine_tables(
+        d_d_affines, item_count, d_d_tbl_aff, stream);
   }
   if (err == cudaSuccess && U > 0u) {
     constexpr uint32_t t = 128u;
@@ -1008,11 +1154,11 @@ int32_t cubbs_bbs_cuda_proof_gen_fused_common_batch(
     }
   }
 
-  // Stage 3: 5-way Straus multi-base Signed Radix-16 GLV kernel + T2 undisclosed MSM.
+  // Stage 3: 4-way Jacobian Straus multi-base Signed Radix-16 GLV kernel + T2 undisclosed MSM.
   if (err == cudaSuccess) {
-    const dim3 f_grid(static_cast<uint32_t>((item_count + 63u) / 64u), 5u);
-    cubbs_bbs_proof_gen_straus5_affine_u_kernel<<<f_grid, 64u, 0, stream>>>(
-        d_b_tbl_aff, a_cache.d_radix16_aff, d_glv_splits_le, d_pts5_xyzz, item_count);
+    const dim3 f_grid(static_cast<uint32_t>((item_count + 63u) / 64u), 4u);
+    cubbs_bbs_proof_gen_straus4_jac_kernel<<<f_grid, 64u, 0, stream>>>(
+        d_d_tbl_aff, a_cache.d_radix16_aff, d_glv_splits_le, d_pts4_xyzz, item_count);
     err = cudaGetLastError();
   }
   if (err == cudaSuccess && U > 0u) {
@@ -1022,15 +1168,18 @@ int32_t cubbs_bbs_cuda_proof_gen_fused_common_batch(
       constexpr uint32_t t = 128u;
       const uint32_t b = static_cast<uint32_t>((item_count + t - 1u) / t);
       cubbs_bbs_proof_gen_add_t2_common_kernel<<<b, t, 0, stream>>>(
-          d_pts5_xyzz, d_t2_common_xyzz, item_count);
+          d_pts4_xyzz, d_t2_common_xyzz, item_count);
       err = cudaGetLastError();
     }
   }
 
-  // Stage 4: GPU 64-thread Montgomery batch-compress [Abar, Bbar, D, T1, T2].
+  // Stage 4: GPU parallel compress [Abar, Bbar, T1, T2] into slots {0,1,3,4} (slot 2 already holds D!).
   if (err == cudaSuccess) {
-    err = cubbs_bbs_launch_xyzz_to_compressed(
-        d_pts5_xyzz, item_count * 5u, d_pts5_compressed, 48u, 0u, stream);
+    constexpr uint32_t t = 64u;
+    const uint32_t b = static_cast<uint32_t>(((item_count * 4u) + t - 1u) / t);
+    cubbs_bbs_g1_xyzz_to_compressed_pts4_into_pts5_kernel<<<b, t, 0, stream>>>(
+        d_pts4_xyzz, item_count, d_pts5_compressed);
+    err = cudaGetLastError();
   }
 
   // Stage 5: GPU zero-spill challenge + r3 = r2^-1 + scalar finalize + wire assembly!
@@ -1217,23 +1366,23 @@ __global__ static void cubbs_bbs_g1_scale_128bit_from_radix16_aff_kernel(
   cubbs_bbs_pack_signed_radix16(s_le, digs);
 
   const cubbs_sppark_plain_affine_t *tbl = radix16_tables_3 + (idx * 24u);
-  cubbs_sppark_bucket_t acc;
+  CuBbsG1Jac acc;
   acc.inf();
   #pragma unroll 1
   for (int window = 32; window >= 0; --window) {
     if (!acc.is_inf()) {
       #pragma unroll 1
       for (uint32_t doubling = 0u; doubling < 4u; ++doubling) {
-        cubbs_bbs_xyzz_dbl_u(acc);
+        cubbs_bbs_jac_dbl(acc);
       }
     }
     const int32_t d = cubbs_bbs_signed_radix16_digit(digs, static_cast<uint32_t>(window));
     if (d != 0) {
       const uint32_t mag = static_cast<uint32_t>(d < 0 ? -d : d);
-      acc.uadd(tbl[mag - 1u], d < 0);
+      cubbs_bbs_jac_madd(acc, tbl[mag - 1u], d < 0);
     }
   }
-  xyzz_out[idx] = acc;
+  xyzz_out[idx] = cubbs_bbs_jac_to_xyzz(acc);
 }
 
 // Compress T1[row] and T2[row] by packing into one contiguous 2*B array first?

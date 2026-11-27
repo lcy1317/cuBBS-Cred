@@ -54,65 +54,31 @@ __device__ __forceinline__ static void cubbs_bbs_compress_affine_fp_to_be48(
 }
 
 // Converts xyzz_t points directly to 48-byte compressed BLS12-381 G1 bytes on GPU
-// using 256-way Montgomery batch inversion with SPPARK's warp-cooperative Euclidean
-// reciprocal(). Eliminates host BLST compression and shrinks D2H by 4x.
+// using 100% parallel warp-cooperative SPPARK fp_t::reciprocal() (0 SMEM, 0 serial
+// bottleneck). Eliminates host BLST compression and shrinks D2H by 4x.
 __global__ static void cubbs_bbs_g1_xyzz_to_compressed_stride_kernel(
     const cubbs_sppark_bucket_t *input, size_t count, uint8_t *out,
     size_t out_stride, size_t out_offset) {
-  constexpr uint32_t kThreads = 64u;
-  __shared__ __align__(16) uint8_t
-      scan_storage[2u * kThreads * sizeof(fp_t)];
-  __shared__ __align__(16) uint8_t total_storage[sizeof(fp_t)];
-  auto *scan_a = reinterpret_cast<fp_t *>(scan_storage);
-  auto *scan_b = scan_a + kThreads;
-  auto *total_product = reinterpret_cast<fp_t *>(total_storage);
-
-  const uint32_t tid = threadIdx.x;
-  const size_t index = static_cast<size_t>(blockIdx.x) * kThreads + tid;
+  const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const bool valid = index < count;
   cubbs_sppark_bucket_t point;
+  point.inf();
   if (valid) point = input[index];
   const bool finite = valid && !point.is_inf();
   const fp_t *coordinates = reinterpret_cast<const fp_t *>(&point);
-  const fp_t one = fp_t::one();
   // xyzz_t layout: [0]=X, [1]=Y, [2]=ZZZ, [3]=ZZ.
-  const fp_t zzz = finite ? coordinates[2] : one;
+  const fp_t zzz = finite ? coordinates[2] : fp_t::one();
 
-  scan_b[tid] = zzz;
-  __syncthreads();
-  if (tid == 0u) {
-    fp_t product = one;
-    for (uint32_t item = 0u; item < kThreads; ++item) {
-      scan_a[item] = product;
-      product *= scan_b[item];
-    }
-    *total_product = product;
-  }
-  __syncthreads();
-  // All 32 lanes of warp 0 participate in fp_t::reciprocal() so shfl_xor(mask=0xffffffff)
-  // is strictly uniform across the warp.
-  if (tid < 32u) {
-    const fp_t val = (tid == 0u) ? *total_product : one;
-    fp_t inverse = val.reciprocal();
-    if (tid == 0u) {
-      for (int item = static_cast<int>(kThreads) - 1; item >= 0; --item) {
-        const fp_t inverse_item = inverse * scan_a[item];
-        inverse *= scan_b[item];
-        scan_a[item] = inverse_item;
-      }
-    }
-  }
-  __syncthreads();
+  // All 32 lanes of every warp execute reciprocal() uniformly in parallel.
+  const fp_t inverse_zzz = zzz.reciprocal();
 
   if (valid) {
     fp_t affine_x;
     fp_t affine_y;
     if (finite) {
-      const fp_t inverse_zzz = scan_a[tid];
       affine_y = inverse_zzz * coordinates[1];
       const fp_t inverse_z = inverse_zzz * coordinates[3];
-      affine_x = inverse_z * inverse_z;
-      affine_x *= coordinates[0];
+      affine_x = sqr(inverse_z) * coordinates[0];
     }
     cubbs_bbs_compress_affine_fp_to_be48(
         affine_x, affine_y, finite, out + (index * out_stride) + out_offset);

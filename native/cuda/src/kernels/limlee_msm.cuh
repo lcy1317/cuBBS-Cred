@@ -25,76 +25,31 @@
 
 static constexpr uint32_t CUBBS_LIMLEE_MAX_GROUP_SIZE = 18u;
 
-// Single-multiplier state-machine XYZZ doubling for BLS12-381 (a = 0).
-// Costs 6M + 3S (vs 10M + 3S for generic xyzz_t::add(acc)) with 1 mul unit.
+// Direct XYZZ doubling for BLS12-381 (a = 0) using SPPARK symmetric sqr():
+// 6M + 3S (eliminates switch state-machine overhead and uses symmetric wide_t sqr).
 // Kept __noinline__ so hot MSM/Straus loops only inline mixed affine uadd()
 // with zero local-memory stack spills and higher SM occupancy.
 __device__ __noinline__ static void cubbs_bbs_xyzz_dbl_u(cubbs_sppark_bucket_t &pt) {
   if (pt.is_inf()) return;
   fp_t *c = reinterpret_cast<fp_t *>(&pt);
-  fp_t X = c[0];
-  fp_t Y = c[1];
-  fp_t ZZZ = c[2];
-  fp_t ZZ = c[3];
+  const fp_t X = c[0];
+  const fp_t Y = c[1];
+  const fp_t ZZZ = c[2];
+  const fp_t ZZ = c[3];
 
-  fp_t U = Y + Y;
-  fp_t A = U;
-  fp_t B = U;
-  fp_t V, W, S, M;
-  int pc = -1;
-  #pragma unroll 1
-  do {
-    A = A * B;
-    switch (++pc) {
-    case 0: // V = U^2
-      V = A;
-      B = U;
-      break;
-    case 1: // W = V * U
-      W = A;
-      A = X;
-      B = V;
-      break;
-    case 2: // S = X * V
-      S = A;
-      A = X;
-      B = X;
-      break;
-    case 3: // X^2 -> M = 3 * X^2
-      M = A + A + A;
-      A = M;
-      B = M;
-      break;
-    case 4: // M^2 -> X3 = M^2 - 2*S
-      X = A - S - S;
-      A = S - X;
-      B = M;
-      break;
-    case 5: // M * (S - X3)
-      M = A;
-      A = W;
-      B = Y;
-      break;
-    case 6: // W * Y -> Y3 = M*(S-X3) - W*Y
-      Y = M - A;
-      A = V;
-      B = ZZ;
-      break;
-    case 7: // ZZ3 = V * ZZ
-      ZZ = A;
-      A = W;
-      B = ZZZ;
-      break;
-    case 8: // ZZZ3 = W * ZZZ
-      ZZZ = A;
-      break;
-    }
-  } while (pc < 8);
+  const fp_t U = Y + Y;
+  const fp_t V = sqr(U);
+  const fp_t W = V * U;
+  const fp_t S = X * V;
+  const fp_t XX = sqr(X);
+  const fp_t M = XX + (XX << 1);
+  const fp_t X3 = sqr(M) - S - S;
+  const fp_t Y3 = (M * (S - X3)) - (W * Y);
 
-  c[0] = X;
-  c[1] = Y;
-  c[2] = ZZZ;
-  c[3] = ZZ;
+  c[0] = X3;
+  c[1] = Y3;
+  c[2] = W * ZZZ;
+  c[3] = V * ZZ;
 }
 
 __device__ __noinline__ static void cubbs_bbs_limlee_xyzz_add_noinline(
@@ -319,6 +274,7 @@ cubbs_bbs_g1_msm_glv_limlee_direct_kernel(
   if (row < output_count) {
     for (int bit = static_cast<int>(num_bits) - 1; bit >= 0; --bit) {
       if (bit != static_cast<int>(num_bits) - 1) {
+        cubbs_bbs_xyzz_canonicalize(acc);
         cubbs_bbs_xyzz_dbl_u(acc);
       }
       for (uint32_t s = 0u; s < total_subtables; ++s) {
@@ -326,9 +282,10 @@ cubbs_bbs_g1_msm_glv_limlee_direct_kernel(
             masks[(static_cast<size_t>(s) * num_bits + static_cast<size_t>(bit)) * stride + col]);
         const bool neg = (entry & sign_bit) != 0u;
         const uint32_t idx = entry & idx_mask;
-        acc.uadd(affines[subtable_offsets[s] + idx], neg);
+        cubbs_bbs_xyzz_madd_lazy_inline(acc, affines[subtable_offsets[s] + idx], neg);
       }
     }
+    cubbs_bbs_xyzz_canonicalize(acc);
     if (half == 1u) {
       cubbs_bbs_apply_glv_endomorphism(acc);
       k2_partials[tid >> 1u] = acc;
@@ -378,6 +335,7 @@ cubbs_bbs_g1_msm_glv_limlee_split_kernel(
     if (s_begin < s_end) {
       for (int bit = static_cast<int>(num_bits) - 1; bit >= 0; --bit) {
         if (bit != static_cast<int>(num_bits) - 1) {
+          cubbs_bbs_xyzz_canonicalize(acc);
           cubbs_bbs_xyzz_dbl_u(acc);
         }
         for (uint32_t s = s_begin; s < s_end; ++s) {
@@ -385,9 +343,10 @@ cubbs_bbs_g1_msm_glv_limlee_split_kernel(
               masks[(static_cast<size_t>(s) * num_bits + static_cast<size_t>(bit)) * stride + col]);
           const bool neg = (entry & sign_bit) != 0u;
           const uint32_t idx = entry & idx_mask;
-          acc.uadd(affines[subtable_offsets[s] + idx], neg);
+          cubbs_bbs_xyzz_madd_lazy_8m2s(acc, affines[subtable_offsets[s] + idx], neg);
         }
       }
+      cubbs_bbs_xyzz_canonicalize(acc);
       if (half == 1u) {
         cubbs_bbs_apply_glv_endomorphism(acc);
       }

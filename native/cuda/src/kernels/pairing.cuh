@@ -245,11 +245,11 @@ cubbs_dist_fp12_cyclotomic_square(const CuBbsDistFp12 &a) {
   const auto u = (pair == 0u) ? z0 : (pair == 1u ? z2 : z4);
   const auto v = (pair == 0u) ? z1 : (pair == 1u ? z3 : z5);
 
-  const auto t0 = u * u;
-  const auto t1 = v * v;
+  const auto t0 = u ^ 2;
+  const auto t1 = v ^ 2;
   const auto s0 = t0 + cubbs_pairing_fp2_mul_nonresidue(t1);
   const auto uv = u + v;
-  const auto s1 = (uv * uv) - t0 - t1;
+  const auto s1 = (uv ^ 2) - t0 - t1;
 
   // out.c0 = (new_z0, new_z4, new_z3) aligns 1:1 with (a_sq.c0, b_sq.c0, c_sq.c0)!
   const auto d0 = s0 - a.c0;
@@ -272,7 +272,7 @@ cubbs_dist_fp6_inverse(const bls12_381::fp2_t &a) {
   const auto a1 = cubbs_dist_shfl_pair(a, 1u);
   const auto a2 = cubbs_dist_shfl_pair(a, 2u);
 
-  const auto sq = a * a;
+  const auto sq = a ^ 2;
   const auto c_lhs = (pair == 0u) ? a1 : a0;
   const auto c_rhs = (pair == 1u) ? a1 : a2;
   const auto cross = c_lhs * c_rhs; // p0=a1*a2, p1=a0*a1, p2=a0*a2
@@ -642,6 +642,8 @@ struct CuBbsMillerDeviceWorkspace {
   // Persistent buffers for GPU-resident Unique-PK Multi-Miller + Single FinalExp.
   uint8_t *unique_g2_lines{nullptr};
   size_t unique_g2_lines_capacity{0u};
+  uint8_t *unique_g2_c4_scratch{nullptr};
+  size_t unique_g2_c4_scratch_capacity{0u};
   uint8_t *unique_block_fp12{nullptr};
   size_t unique_block_fp12_capacity{0u};
   std::vector<uint8_t> unique_pk_key;
@@ -665,6 +667,7 @@ struct CuBbsMillerDeviceWorkspace {
     (void)cudaFree(lhs_out); (void)cudaFree(rhs_out);
     (void)cudaFree(values_out);
     (void)cudaFree(unique_g2_lines);
+    (void)cudaFree(unique_g2_c4_scratch);
     (void)cudaFree(unique_block_fp12);
     if (stream != nullptr) (void)cudaStreamDestroy(stream);
     if (previous >= 0 && previous != device) (void)cudaSetDevice(previous);
@@ -992,26 +995,37 @@ int32_t cubbs_bbs_cuda_launch_pairing_eq_single_on_stream(
 // ============================================================================
 
 __device__ __noinline__ static fp_t cubbs_pairing_fp_pow_p_minus_3_div_4(const fp_t &a) {
-  static constexpr uint64_t EXP[6] = {
-      0xee7fbfffffffeaaaULL, 0x07aaffffac54ffffULL,
-      0xd9cc34a83dac3d89ULL, 0xd91dd2e13ce144afULL,
-      0x92c6e9ed90d2eb35ULL, 0x0680447a8e5ff9a6ULL};
-  const fp_t t1 = a;
-  const fp_t t2 = t1 * t1;
-  const fp_t t3 = t2 * t1;
+  // 4-bit sliding-window chain for (p - 3) / 4 using SPPARK symmetric sqr():
+  // 376 sqr() + 85 muls (vs 378 generic muls + 140 muls previously).
+  static constexpr uint8_t OPS[79] = {
+      0x91u, 0x41u, 0x78u, 0x43u, 0x64u, 0x66u, 0x48u, 0x48u,
+      0x67u, 0x67u, 0x65u, 0x32u, 0x77u, 0x47u, 0x68u, 0x57u,
+      0x45u, 0x87u, 0x66u, 0x33u, 0x32u, 0x67u, 0x44u, 0x32u,
+      0x31u, 0x64u, 0x44u, 0x55u, 0x44u, 0x85u, 0x34u, 0x54u,
+      0x73u, 0x75u, 0x56u, 0x48u, 0x32u, 0x54u, 0x42u, 0x87u,
+      0x53u, 0x21u, 0x98u, 0x57u, 0x32u, 0x88u, 0x32u, 0x75u,
+      0x98u, 0x43u, 0x56u, 0x48u, 0x48u, 0x48u, 0x34u, 0x56u,
+      0x63u, 0x55u, 0x48u, 0x48u, 0x48u, 0x48u, 0x47u, 0x22u,
+      0x68u, 0x48u, 0x58u, 0x48u, 0x48u, 0x48u, 0x48u, 0x48u,
+      0x48u, 0x48u, 0x33u, 0x43u, 0x43u, 0x21u, 0x10u};
+  fp_t t[8];
+  const fp_t a2 = sqr(a);
+  t[0] = a;
+  #pragma unroll
+  for (int i = 1; i < 8; ++i) t[i] = t[i - 1] * a2;
 
-  fp_t res = t1; // pair 189 (bits 379..378) == 1
+  fp_t res = t[6]; // leading window 13 = 0b1101 -> t[6] = a^13
   #pragma unroll 1
-  for (int pair_idx = 188; pair_idx >= 0; --pair_idx) {
-    res = res * res;
-    res = res * res;
-    const uint32_t bit = static_cast<uint32_t>(pair_idx) * 2u;
-    const uint32_t d = static_cast<uint32_t>((EXP[bit >> 6u] >> (bit & 63u)) & 3ull);
-    if (d != 0u) {
-      fp_t term = t1;
-      if (d == 2u) term = t2;
-      else if (d == 3u) term = t3;
-      res = res * term;
+  for (int step = 0; step < 79; ++step) {
+    const uint32_t op = OPS[step];
+    const uint32_t sq = op >> 4u;
+    const uint32_t idx = op & 0xfu;
+    #pragma unroll 1
+    for (uint32_t s = 0u; s < sq; ++s) {
+      res = sqr(res);
+    }
+    if (idx != 0u) {
+      res *= t[idx - 1u];
     }
   }
   return res;
@@ -1051,30 +1065,30 @@ struct CuBbsG2Jac {
 
 __device__ __noinline__ static CuBbsPairingLine014
 cubbs_pairing_g2_line_dbl(CuBbsG2Jac &T) {
-  const auto A = T.X * T.X;
-  const auto B = T.Y * T.Y;
-  const auto ZZ = T.Z * T.Z;
-  const auto C = B * B;
+  const auto A = T.X ^ 2;
+  const auto B = T.Y ^ 2;
+  const auto ZZ = T.Z ^ 2;
+  const auto C = B ^ 2;
 
   auto D = T.X + B;
-  D = (D * D) - A - C;
+  D = (D ^ 2) - A - C;
   D = D + D;
 
   const auto E = A + A + A;
-  const auto F = E * E;
+  const auto F = E ^ 2;
 
   auto l0 = E + T.X;
   T.X = F - D - D;
 
   auto TZ = T.Y + T.Z;
-  T.Z = (TZ * TZ) - B - ZZ;
+  T.Z = (TZ ^ 2) - B - ZZ;
 
   auto C8 = C + C;
   C8 = C8 + C8;
   C8 = C8 + C8;
   T.Y = (E * (D - T.X)) - C8;
 
-  l0 = (l0 * l0) - A - F;
+  l0 = (l0 ^ 2) - A - F;
   auto B4 = B + B;
   B4 = B4 + B4;
   return {l0 - B4, E * ZZ, T.Z * ZZ};
@@ -1085,12 +1099,12 @@ cubbs_pairing_g2_line_add(CuBbsG2Jac &T,
                           const bls12_381::fp2_t &Qx,
                           const bls12_381::fp2_t &Qy,
                           bool &invalid) {
-  const auto Z1Z1 = T.Z * T.Z;
+  const auto Z1Z1 = T.Z ^ 2;
   const auto U2 = Qx * Z1Z1;
   const auto S2 = (Qy * T.Z) * Z1Z1;
   const auto H = U2 - T.X;
   if (H.is_zero()) invalid = true;
-  const auto HH = H * H;
+  const auto HH = H ^ 2;
   auto I = HH + HH;
   I = I + I;
   const auto J = H * I;
@@ -1099,22 +1113,24 @@ cubbs_pairing_g2_line_add(CuBbsG2Jac &T,
   const auto V = T.X * I;
 
   const auto old_Y = T.Y;
-  T.X = (r * r) - J - V - V;
+  T.X = (r ^ 2) - J - V - V;
   const auto JY = J * old_Y;
   T.Y = (r * (V - T.X)) - JY - JY;
   auto ZH = T.Z + H;
-  T.Z = (ZH * ZH) - Z1Z1 - HH;
+  T.Z = (ZH ^ 2) - Z1Z1 - HH;
 
   auto l0 = (r * Qx) - (Qy * T.Z);
   return {l0 + l0, r, T.Z};
 }
 
-// 100% GPU G2 uncompress + 68-step Miller line precompute + zero-cost Scott G2
-// subgroup check (T_final == -psi(Q)) using 2 lanes/key (32 threads/block = 16 keys/block,
-// 4x fewer warp lanes spent on G2 line math than running inside 8-lane Miller!).
+// 100% GPU G2 uncompress + 68-step Affine-normalized Miller line precompute (192B/line,
+// c4 == 1 via 68-step per-key Montgomery batch Fp2 inversion) + zero-cost Scott G2
+// subgroup check (T_final == -psi(Q)).
 __global__ static void cubbs_bbs_g2_uncompress_and_precompute_lines_kernel(
     const uint8_t *pks_compressed, size_t item_count,
-    uint8_t *g2_lines_out, uint32_t *invalid_flag) {
+    uint8_t *g2_aff_lines_out, // item_count * 68 * 192B (c0_aff, c1_aff; c4 == 1)
+    uint8_t *g2_c4_scratch,    // item_count * 68 * 2 * 96B (c4, prefix_prod)
+    uint32_t *invalid_flag) {
   const size_t raw_item = (static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x) >> 1u;
   const bool valid = raw_item < item_count;
   const size_t item = valid ? raw_item : 0u;
@@ -1175,17 +1191,17 @@ __global__ static void cubbs_bbs_g2_uncompress_and_precompute_lines_kernel(
   four = four + four;
   bls12_381::fp2_t b_e2;
   memcpy(&b_e2, &four, sizeof(fp_t));
-  const bls12_381::fp2_t rhs = (X * X * X) + b_e2;
+  const bls12_381::fp2_t rhs = ((X ^ 2) * X) + b_e2;
 
   fp_t rhs_lane;
   memcpy(&rhs_lane, &rhs, sizeof(fp_t));
   const fp_t a = cubbs_pairing_shfl_fp(rhs_lane, even_lane);
   const fp_t b = cubbs_pairing_shfl_fp(rhs_lane, odd_lane);
 
-  const fp_t norm = (a * a) + (b * b);
+  const fp_t norm = sqr(a) + sqr(b);
   const fp_t u_norm = cubbs_pairing_fp_pow_p_minus_3_div_4(norm);
   const fp_t s = norm * u_norm;
-  ok = ok && ((s * s) - norm).is_zero();
+  ok = ok && (sqr(s) - norm).is_zero();
 
   static constexpr uint64_t FP_INV2_LE[6] = {
       0xdcff7fffffffd556ull, 0x0f55ffff58a9ffffull,
@@ -1216,7 +1232,7 @@ __global__ static void cubbs_bbs_g2_uncompress_and_precompute_lines_kernel(
   fp_t y_lane = is_odd ? y_im : y_re;
   bls12_381::fp2_t Y;
   memcpy(&Y, &y_lane, sizeof(fp_t));
-  ok = ok && ((Y * Y) - rhs).is_zero();
+  ok = ok && ((Y ^ 2) - rhs).is_zero();
 
   fp_t y_re_std = y_re; y_re_std.from();
   fp_t y_im_std = y_im; y_im_std.from();
@@ -1225,12 +1241,18 @@ __global__ static void cubbs_bbs_g2_uncompress_and_precompute_lines_kernel(
       : cubbs_pairing_fp_std_gt_half(y_im_std);
   Y.cneg(y_gt_half != sign_flag);
 
-  // Precompute all 68 Miller lines + check Scott G2 subgroup T_final == -psi(Q)!
-  constexpr size_t line_stride = 6u * sizeof(fp_t);
-  constexpr size_t lines_bytes = 68u * line_stride;
-  uint8_t *dst_lines = g2_lines_out + (item * lines_bytes);
-  CuBbsG2Jac T{X, Y, cubbs_pairing_fp2_one()};
+  // Precompute all 68 Miller lines + normalize by c4 (Affine c4==1, 192B/line) +
+  // check Scott G2 subgroup T_final == -psi(Q)!
+  constexpr size_t aff_line_stride = 4u * sizeof(fp_t); // 192B: c0_aff, c1_aff
+  constexpr size_t aff_lines_bytes = 68u * aff_line_stride;
+  constexpr size_t c4_pair_stride = 4u * sizeof(fp_t);  // 192B: c4, prefix_prod
+  uint8_t *dst_lines = g2_aff_lines_out + (item * aff_lines_bytes);
+  uint8_t *dst_c4 = g2_c4_scratch + (item * 68u * c4_pair_stride);
+
+  const auto fp2_one = cubbs_pairing_fp2_one();
+  CuBbsG2Jac T{X, Y, fp2_one};
   bool g2_invalid = false;
+  bls12_381::fp2_t run_prod = fp2_one;
   #pragma unroll 1
   for (uint32_t i = 0u; i < 68u; ++i) {
     const bool addition_line =
@@ -1239,12 +1261,20 @@ __global__ static void cubbs_bbs_g2_uncompress_and_precompute_lines_kernel(
         ? cubbs_pairing_g2_line_add(T, X, Y, g2_invalid)
         : cubbs_pairing_g2_line_dbl(T);
     if (T.Z.is_zero()) g2_invalid = true;
+    auto c4_safe = line.c4;
+    if (c4_safe.is_zero()) {
+      g2_invalid = true;
+      c4_safe = fp2_one;
+    }
     if (valid) {
-      uint8_t *ldst = dst_lines + (i * line_stride);
+      uint8_t *ldst = dst_lines + (i * aff_line_stride);
       cubbs_pairing_store_fp2(ldst, line.c0);
       cubbs_pairing_store_fp2(ldst + 96u, line.c1);
-      cubbs_pairing_store_fp2(ldst + 192u, line.c4);
+      uint8_t *cdst = dst_c4 + (i * c4_pair_stride);
+      cubbs_pairing_store_fp2(cdst, c4_safe);
+      cubbs_pairing_store_fp2(cdst + 96u, run_prod);
     }
+    run_prod *= c4_safe;
   }
 
   // Zero-cost Scott G2 subgroup check: T == [-z]Q == -psi(Q).
@@ -1269,7 +1299,7 @@ __global__ static void cubbs_bbs_g2_uncompress_and_precompute_lines_kernel(
   memcpy(&frob_x, &fx_lane, 48u);
   memcpy(&frob_y, &fy_lane, 48u);
 
-  const auto zz = T.Z * T.Z;
+  const auto zz = T.Z ^ 2;
   const auto zzz = zz * T.Z;
   const auto psi_x = cubbs_pairing_fp2_conjugate(X) * frob_x;
   auto neg_psi_y = cubbs_pairing_fp2_conjugate(Y) * frob_y;
@@ -1280,6 +1310,24 @@ __global__ static void cubbs_bbs_g2_uncompress_and_precompute_lines_kernel(
                      (T.Y - (neg_psi_y * zzz)).is_zero();
   if (valid && !in_g2 && is_odd == 0u) {
     atomicExch(invalid_flag, 1u);
+  }
+
+  // Uniform 68-step Montgomery batch Fp2 inversion -> normalize (c0, c1) by c4 so c4 == 1!
+  bls12_381::fp2_t inv_prod = run_prod.reciprocal();
+  if (valid) {
+    #pragma unroll 1
+    for (int i = 67; i >= 0; --i) {
+      const uint8_t *cdst = dst_c4 + (static_cast<size_t>(i) * c4_pair_stride);
+      const auto c4_i = cubbs_pairing_load_fp2(cdst);
+      const auto pref_i = cubbs_pairing_load_fp2(cdst + 96u);
+      const auto inv_c4 = inv_prod * pref_i;
+      inv_prod *= c4_i;
+      uint8_t *ldst = dst_lines + (static_cast<size_t>(i) * aff_line_stride);
+      const auto c0_aff = cubbs_pairing_load_fp2(ldst) * inv_c4;
+      const auto c1_aff = cubbs_pairing_load_fp2(ldst + 96u) * inv_c4;
+      cubbs_pairing_store_fp2(ldst, c0_aff);
+      cubbs_pairing_store_fp2(ldst + 96u, c1_aff);
+    }
   }
 }
 
@@ -1300,28 +1348,194 @@ __device__ __forceinline__ static CuBbsDistFp12 cubbs_dist_fp12_load(
   return {cubbs_pairing_fp2_zero(), cubbs_pairing_fp2_zero()};
 }
 
-// Fast shared-squaring 1-warp (4-group x kItemsPerGroup) Miller loop reading
-// GPU-precomputed validated G2 lines + in-warp 4->1 Fp12 product reduction.
-// Sharing ONE Fp12 squaring across kItemsPerGroup items cuts Miller Fp12 squarings
-// by 2x (K=2) to 4x (K=4) with zero extra register pressure!
+// ============================================================================
+// 5-Per-Warp (30/32 Active Lanes = 93.75%) Cooperative Fp6 / Fp12 Arithmetic
+// + Affine-Normalized Real-c4 Sparse-by-Sparse (014 x 014) Multi-Miller Loop
+// ============================================================================
+
+__device__ __forceinline__ static bls12_381::fp2_t
+cubbs_dist5_shfl_pair(const bls12_381::fp2_t &v, uint32_t group_base, uint32_t src_pair) {
+  const uint32_t src_lane = group_base + ((src_pair & 3u) << 1u) + (threadIdx.x & 1u);
+  uint32_t limbs[12];
+  memcpy(limbs, &v, 48u);
+  #pragma unroll
+  for (int i = 0; i < 12; ++i) {
+    limbs[i] = __shfl_sync(0xffffffffu, limbs[i], src_lane);
+  }
+  bls12_381::fp2_t out;
+  memcpy(&out, limbs, 48u);
+  return out;
+}
+
+__device__ __forceinline__ static bls12_381::fp2_t
+cubbs_dist5_fp6_mul_nonresidue(const bls12_381::fp2_t &a, uint32_t group_base, uint32_t pair) {
+  const uint32_t src_pair = (pair == 0u) ? 2u : (pair == 1u ? 0u : 1u);
+  const auto shifted = cubbs_dist5_shfl_pair(a, group_base, src_pair);
+  const auto nr = cubbs_pairing_fp2_mul_nonresidue(shifted);
+  return (pair == 0u) ? nr : shifted;
+}
+
+__device__ __noinline__ static bls12_381::fp2_t
+cubbs_dist5_fp6_mul(const bls12_381::fp2_t &a, const bls12_381::fp2_t &b,
+                    uint32_t group_base, uint32_t pair) {
+  const auto v = a * b;
+  const auto v0 = cubbs_dist5_shfl_pair(v, group_base, 0u);
+  const auto v1 = cubbs_dist5_shfl_pair(v, group_base, 1u);
+  const auto v2 = cubbs_dist5_shfl_pair(v, group_base, 2u);
+
+  const auto a0 = cubbs_dist5_shfl_pair(a, group_base, 0u);
+  const auto a1 = cubbs_dist5_shfl_pair(a, group_base, 1u);
+  const auto a2 = cubbs_dist5_shfl_pair(a, group_base, 2u);
+  const auto b0 = cubbs_dist5_shfl_pair(b, group_base, 0u);
+  const auto b1 = cubbs_dist5_shfl_pair(b, group_base, 1u);
+  const auto b2 = cubbs_dist5_shfl_pair(b, group_base, 2u);
+
+  const auto sa = (pair == 0u) ? (a1 + a2) : (pair == 1u ? (a0 + a1) : (a0 + a2));
+  const auto sb = (pair == 0u) ? (b1 + b2) : (pair == 1u ? (b0 + b1) : (b0 + b2));
+  const auto k = sa * sb;
+
+  const auto nr_in = (pair == 0u) ? (k - v1 - v2) : v2;
+  const auto nr_out = cubbs_pairing_fp2_mul_nonresidue(nr_in);
+  if (pair == 0u) return v0 + nr_out;
+  if (pair == 1u) return (k - v0 - v1) + nr_out;
+  return k - v0 + v1 - v2;
+}
+
+__device__ __noinline__ static CuBbsDistFp12
+cubbs_dist5_fp12_mul(const CuBbsDistFp12 &a, const CuBbsDistFp12 &b,
+                     uint32_t group_base, uint32_t pair) {
+  const auto aa = cubbs_dist5_fp6_mul(a.c0, b.c0, group_base, pair);
+  const auto bb = cubbs_dist5_fp6_mul(a.c1, b.c1, group_base, pair);
+  const auto c0 = aa + cubbs_dist5_fp6_mul_nonresidue(bb, group_base, pair);
+  const auto c1 = cubbs_dist5_fp6_mul(a.c0 + a.c1, b.c0 + b.c1, group_base, pair) - aa - bb;
+  return {c0, c1};
+}
+
+__device__ __noinline__ static CuBbsDistFp12
+cubbs_dist5_fp12_square(const CuBbsDistFp12 &a, uint32_t group_base, uint32_t pair) {
+  const auto ab = cubbs_dist5_fp6_mul(a.c0, a.c1, group_base, pair);
+  const auto prod = cubbs_dist5_fp6_mul(
+      a.c0 + a.c1, a.c0 + cubbs_dist5_fp6_mul_nonresidue(a.c1, group_base, pair),
+      group_base, pair);
+  const auto c0 = (prod - ab) - cubbs_dist5_fp6_mul_nonresidue(ab, group_base, pair);
+  const auto c1 = ab + ab;
+  return {c0, c1};
+}
+
+// Sparse-by-Sparse 014 x 014 product for two Affine-normalized lines where
+// c4 is pure real Fp (a4_fp = py_a, b4_fp = py_b). Costs only 1 parallel fp2 mul +
+// 2 parallel fp muls (= 4 Fp muls/lane), cutting 2-line accumulation from 24 -> 18 Fp muls!
+__device__ __forceinline__ static CuBbsDistFp12
+cubbs_dist5_line014_mul_pair_real4(
+    const bls12_381::fp2_t &a0, const bls12_381::fp2_t &a1, const fp_t &a4_fp,
+    const bls12_381::fp2_t &b0, const bls12_381::fp2_t &b1, const fp_t &b4_fp,
+    uint32_t group_base, uint32_t pair) {
+  const auto m_a = (pair == 0u) ? a0 : (pair == 1u ? a1 : (a0 + a1));
+  const auto m_b = (pair == 0u) ? b0 : (pair == 1u ? b1 : (b0 + b1));
+  const auto p_ab = m_a * m_b;
+
+  fp_t fp_a0, fp_b0, fp_a1, fp_b1;
+  memcpy(&fp_a0, &a0, sizeof(fp_t));
+  memcpy(&fp_b0, &b0, sizeof(fp_t));
+  memcpy(&fp_a1, &a1, sizeof(fp_t));
+  memcpy(&fp_b1, &b1, sizeof(fp_t));
+
+  // pair 0: t4 = a4*b4 (both lanes hold t4 => (t4, t4) == xi * t4!)
+  // pair 1: c11 = a0*b4 + b0*a4
+  // pair 2: c12 = a1*b4 + b1*a4
+  const fp_t f1_l = (pair == 0u) ? a4_fp : (pair == 1u ? fp_a0 : fp_a1);
+  const fp_t prod1 = f1_l * b4_fp;
+  const fp_t f2_l = (pair == 1u) ? fp_b0 : fp_b1;
+  const fp_t prod2 = f2_l * a4_fp;
+
+  const auto t0 = cubbs_dist5_shfl_pair(p_ab, group_base, 0u);
+  const auto t1 = cubbs_dist5_shfl_pair(p_ab, group_base, 1u);
+  const auto s01 = cubbs_dist5_shfl_pair(p_ab, group_base, 2u);
+
+  bls12_381::fp2_t xi_t4, c1_part;
+  memcpy(&xi_t4, &prod1, sizeof(fp_t));
+  const fp_t sum_c1 = prod1 + prod2;
+  memcpy(&c1_part, &sum_c1, sizeof(fp_t));
+
+  const auto out_c0 = (pair == 0u) ? (t0 + xi_t4)
+                                   : (pair == 1u ? (s01 - t0 - t1) : t1);
+  const auto out_c1 = (pair == 0u) ? cubbs_pairing_fp2_zero() : c1_part;
+  return {out_c0, out_c1};
+}
+
+__device__ __forceinline__ static bls12_381::fp2_t
+cubbs_dist5_fp6_mul_by_01(const bls12_381::fp2_t &r,
+                          const bls12_381::fp2_t &l_c0,
+                          const bls12_381::fp2_t &l_c1,
+                          uint32_t group_base, uint32_t pair) {
+  const auto r0 = cubbs_dist5_shfl_pair(r, group_base, 0u);
+  const auto r1 = cubbs_dist5_shfl_pair(r, group_base, 1u);
+  const auto r2 = cubbs_dist5_shfl_pair(r, group_base, 2u);
+
+  const auto m1_a = (pair == 0u) ? r0 : (pair == 1u ? r1 : (r0 + r2));
+  const auto m1_b = (pair == 1u) ? l_c1 : l_c0;
+  const auto mul1 = m1_a * m1_b;
+
+  const auto m2_a = (pair == 0u) ? (r1 + r2) : (r0 + r1);
+  const auto m2_b = (pair == 0u) ? l_c1 : (l_c0 + l_c1);
+  const auto mul2 = m2_a * m2_b;
+
+  const auto aa = cubbs_dist5_shfl_pair(mul1, group_base, 0u);
+  const auto bb = cubbs_dist5_shfl_pair(mul1, group_base, 1u);
+  const auto t1_nr = cubbs_pairing_fp2_mul_nonresidue(mul2 - bb);
+  if (pair == 0u) return t1_nr + aa;
+  if (pair == 1u) return mul2 - aa - bb;
+  return mul1 - aa + bb;
+}
+
+__device__ __forceinline__ static void cubbs_dist5_fp12_mul_by_014_real4(
+    CuBbsDistFp12 &f, const bls12_381::fp2_t &l0, const bls12_381::fp2_t &l1,
+    const fp_t &py_fp, uint32_t group_base, uint32_t pair) {
+  const auto aa = cubbs_dist5_fp6_mul_by_01(f.c0, l0, l1, group_base, pair);
+  // bb = f.c1 * (0, (py, 0), 0) -> (xi*r2*py, r0*py, r1*py) using 1 Fp mul/lane!
+  const uint32_t src_pair = (pair == 0u) ? 2u : (pair == 1u ? 0u : 1u);
+  const auto shifted = cubbs_dist5_shfl_pair(f.c1, group_base, src_pair);
+  const auto scaled = cubbs_pairing_fp2_mul_fp(shifted, py_fp);
+  const auto nr_scaled = cubbs_pairing_fp2_mul_nonresidue(scaled);
+  const auto bb = (pair == 0u) ? nr_scaled : scaled;
+
+  fp_t py_lane;
+  if ((threadIdx.x & 1u) == 0u) py_lane = py_fp;
+  else py_lane.zero();
+  bls12_381::fp2_t py_fp2;
+  memcpy(&py_fp2, &py_lane, sizeof(fp_t));
+
+  const auto c1 = cubbs_dist5_fp6_mul_by_01(
+                      f.c0 + f.c1, l0, l1 + py_fp2, group_base, pair) -
+                  aa - bb;
+  f.c0 = cubbs_dist5_fp6_mul_nonresidue(bb, group_base, pair) + aa;
+  f.c1 = c1;
+}
+
+// Fast 5-per-warp (30/32 active lanes) shared-squaring Miller loop reading
+// compact Affine-normalized G2 lines (192B/line -> 26.7MB for B=2048, 100% L2!)
+// with Sparse-by-Sparse 014x014 line pairing + in-warp 5->1 Fp12 reduction.
 template <uint32_t kItemsPerGroup>
 __global__ static void cubbs_bbs_unique_pk_miller_lines_block_reduce_kernel(
-    const uint8_t *lhs_g1_affines,  // B * 96B plain affine P_i
-    const uint8_t *g2_lines_all,    // B * (68 * 288B) validated GPU G2 lines
+    const uint8_t *lhs_g1_affines,   // B * 96B plain affine P_i
+    const uint8_t *g2_aff_lines_all, // B * (68 * 192B) Affine-normalized G2 lines (c4 == 1)
     size_t item_count,
-    uint8_t *block_fp12_out) {      // num_blocks * 576B
-  __shared__ __align__(16) uint8_t s_fp12[4u * 576u];
-  __shared__ __align__(16) uint8_t s_g1[4u * kItemsPerGroup * 96u];
-  __shared__ uint8_t s_valid[4u * kItemsPerGroup];
+    uint8_t *block_fp12_out) {       // num_blocks * 576B
+  __shared__ __align__(16) uint8_t s_fp12[5u * 576u];
+  __shared__ __align__(16) uint8_t s_g1[5u * kItemsPerGroup * 96u];
+  __shared__ uint8_t s_valid[5u * kItemsPerGroup];
 
-  const uint32_t g_in_blk = threadIdx.x >> 3u; // 0..3
-  const uint32_t sub = threadIdx.x & 7u;
-  const uint32_t pair = sub >> 1u;
+  const uint32_t lane = threadIdx.x & 31u;
+  const bool active_lane = lane < 30u;
+  const uint32_t g_in_blk = active_lane ? (lane / 6u) : 0u; // 0..4
+  const uint32_t group_base = active_lane ? (g_in_blk * 6u) : 0u;
+  const uint32_t sub = active_lane ? (lane - group_base) : 6u;
+  const uint32_t pair = sub >> 1u; // 0, 1, 2 (active) or 3 (padding lanes 30, 31)
   const size_t base_item =
-      (static_cast<size_t>(blockIdx.x) * 4u + g_in_blk) * kItemsPerGroup;
+      (static_cast<size_t>(blockIdx.x) * 5u + g_in_blk) * kItemsPerGroup;
 
   // Pre-transform and cache kItemsPerGroup G1 affine points in shared memory.
-  if (sub == 0u) {
+  if (active_lane && sub == 0u) {
     #pragma unroll
     for (uint32_t k = 0u; k < kItemsPerGroup; ++k) {
       const size_t raw_item = base_item + k;
@@ -1342,8 +1556,12 @@ __global__ static void cubbs_bbs_unique_pk_miller_lines_block_reduce_kernel(
   }
   __syncwarp();
 
-  constexpr size_t line_stride = 6u * sizeof(fp_t);
-  constexpr size_t lines_bytes = 68u * line_stride;
+  constexpr size_t aff_line_stride = 4u * sizeof(fp_t); // 192B
+  constexpr size_t aff_lines_bytes = 68u * aff_line_stride;
+  const auto fp2_one = cubbs_pairing_fp2_one();
+  const auto fp2_zero = cubbs_pairing_fp2_zero();
+  fp_t fp_zero;
+  fp_zero.zero();
 
   CuBbsDistFp12 acc = cubbs_dist_fp12_one(pair);
   #pragma unroll 1
@@ -1351,39 +1569,85 @@ __global__ static void cubbs_bbs_unique_pk_miller_lines_block_reduce_kernel(
     const bool addition_line =
         i == 0u || i == 1u || i == 4u || i == 8u || i == 18u || i == 51u;
     if (!addition_line) {
-      acc = cubbs_dist_fp12_square(acc);
+      acc = cubbs_dist5_fp12_square(acc, group_base, pair);
     }
-    #pragma unroll
-    for (uint32_t k = 0u; k < kItemsPerGroup; ++k) {
-      const size_t raw_item = base_item + k;
-      const size_t item = (raw_item < item_count) ? raw_item : 0u;
-      const uint8_t *g1_ptr = s_g1 + ((g_in_blk * kItemsPerGroup + k) * 96u);
-      const fp_t px = cubbs_pairing_load_fp(g1_ptr);
-      const fp_t py = cubbs_pairing_load_fp(g1_ptr + sizeof(fp_t));
-      const uint8_t *lines = g2_lines_all + (item * lines_bytes);
-      const auto line = cubbs_pairing_line_for_g1(lines + (i * line_stride), px, py);
+    if constexpr (kItemsPerGroup >= 2u) {
+      #pragma unroll
+      for (uint32_t k = 0u; k < kItemsPerGroup; k += 2u) {
+        const size_t raw_a = base_item + k;
+        const size_t raw_b = base_item + k + 1u;
+        const size_t item_a = (raw_a < item_count) ? raw_a : 0u;
+        const size_t item_b = (raw_b < item_count) ? raw_b : 0u;
+        const bool val_a = s_valid[g_in_blk * kItemsPerGroup + k] != 0u;
+        const bool val_b = s_valid[g_in_blk * kItemsPerGroup + k + 1u] != 0u;
+
+        const uint8_t *g1_a = s_g1 + ((g_in_blk * kItemsPerGroup + k) * 96u);
+        const uint8_t *g1_b = s_g1 + ((g_in_blk * kItemsPerGroup + k + 1u) * 96u);
+        const fp_t px_a = cubbs_pairing_load_fp(g1_a);
+        const fp_t py_a = cubbs_pairing_load_fp(g1_a + sizeof(fp_t));
+        const fp_t px_b = cubbs_pairing_load_fp(g1_b);
+        const fp_t py_b = cubbs_pairing_load_fp(g1_b + sizeof(fp_t));
+
+        const uint8_t *la_ptr = g2_aff_lines_all + (item_a * aff_lines_bytes) + (i * aff_line_stride);
+        const uint8_t *lb_ptr = g2_aff_lines_all + (item_b * aff_lines_bytes) + (i * aff_line_stride);
+
+        const auto a0 = val_a ? cubbs_pairing_load_fp2(la_ptr) : fp2_one;
+        const auto a1 = val_a ? cubbs_pairing_fp2_mul_fp(cubbs_pairing_load_fp2(la_ptr + 96u), px_a) : fp2_zero;
+        const fp_t a4 = val_a ? py_a : fp_zero;
+
+        const auto b0 = val_b ? cubbs_pairing_load_fp2(lb_ptr) : fp2_one;
+        const auto b1 = val_b ? cubbs_pairing_fp2_mul_fp(cubbs_pairing_load_fp2(lb_ptr + 96u), px_b) : fp2_zero;
+        const fp_t b4 = val_b ? py_b : fp_zero;
+
+        const auto pair_prod = cubbs_dist5_line014_mul_pair_real4(
+            a0, a1, a4, b0, b1, b4, group_base, pair);
+        acc = cubbs_dist5_fp12_mul(acc, pair_prod, group_base, pair);
+      }
+    } else {
+      const size_t raw_a = base_item;
+      const size_t item_a = (raw_a < item_count) ? raw_a : 0u;
+      const bool val_a = s_valid[g_in_blk] != 0u;
+      const uint8_t *g1_a = s_g1 + (g_in_blk * 96u);
+      const fp_t px_a = cubbs_pairing_load_fp(g1_a);
+      const fp_t py_a = cubbs_pairing_load_fp(g1_a + sizeof(fp_t));
+      const uint8_t *la_ptr = g2_aff_lines_all + (item_a * aff_lines_bytes) + (i * aff_line_stride);
+      const auto a0 = cubbs_pairing_load_fp2(la_ptr);
+      const auto a1 = cubbs_pairing_fp2_mul_fp(cubbs_pairing_load_fp2(la_ptr + 96u), px_a);
       CuBbsDistFp12 next = acc;
-      cubbs_dist_fp12_mul_by_014(next, line, pair);
-      if (s_valid[g_in_blk * kItemsPerGroup + k] != 0u) acc = next;
+      cubbs_dist5_fp12_mul_by_014_real4(next, a0, a1, py_a, group_base, pair);
+      if (val_a) acc = next;
     }
   }
   acc = cubbs_dist_fp12_conjugate(acc);
 
-  cubbs_dist_fp12_store(s_fp12 + (g_in_blk * 576u), acc, pair);
+  // In-warp 5 -> 1 Fp12 reduction: (0 *= 4), then (0 *= 2, 1 *= 3), then (0 *= 1).
+  if (active_lane) {
+    cubbs_dist_fp12_store(s_fp12 + (g_in_blk * 576u), acc, pair);
+  }
   __syncwarp();
+  {
+    const uint32_t partner = (active_lane && g_in_blk == 0u) ? 4u : g_in_blk;
+    const auto rhs = cubbs_dist_fp12_load(s_fp12 + (partner * 576u), pair);
+    const auto prod = cubbs_dist5_fp12_mul(acc, rhs, group_base, pair);
+    if (active_lane && g_in_blk == 0u) {
+      acc = prod;
+      cubbs_dist_fp12_store(s_fp12, acc, pair);
+    }
+    __syncwarp();
+  }
   #pragma unroll
   for (uint32_t stride = 2u; stride > 0u; stride >>= 1u) {
-    const uint32_t partner = (g_in_blk < stride) ? (g_in_blk + stride) : g_in_blk;
+    const uint32_t partner = (active_lane && g_in_blk < stride) ? (g_in_blk + stride) : g_in_blk;
     const auto rhs = cubbs_dist_fp12_load(s_fp12 + (partner * 576u), pair);
-    const auto prod = cubbs_dist_fp12_mul(acc, rhs);
-    if (g_in_blk < stride) {
+    const auto prod = cubbs_dist5_fp12_mul(acc, rhs, group_base, pair);
+    if (active_lane && g_in_blk < stride) {
       acc = prod;
       cubbs_dist_fp12_store(s_fp12 + (g_in_blk * 576u), acc, pair);
     }
     __syncwarp();
   }
 
-  if (g_in_blk == 0u) {
+  if (active_lane && g_in_blk == 0u) {
     cubbs_dist_fp12_store(block_fp12_out + (static_cast<size_t>(blockIdx.x) * 576u), acc, pair);
   }
 }
@@ -1476,10 +1740,11 @@ int32_t cubbs_bbs_cuda_launch_pairing_unique_pk_on_stream(
     return CUBBS_BBS_GPU_ERR_INVALID_INPUT;
   }
   constexpr size_t lines_bytes = 68u * 6u * sizeof(fp_t);
-  const size_t all_lines_bytes = item_count * lines_bytes;
+  constexpr size_t aff_lines_bytes = 68u * 4u * sizeof(fp_t); // 192B/line (c4 == 1)
+  const size_t all_lines_bytes = item_count * aff_lines_bytes;
   const uint32_t items_per_group =
-      (item_count >= 512u) ? 4u : ((item_count >= 256u) ? 2u : 1u);
-  const size_t items_per_block = 4u * static_cast<size_t>(items_per_group);
+      (item_count >= 512u) ? 4u : ((item_count >= 128u) ? 2u : 1u);
+  const size_t items_per_block = 5u * static_cast<size_t>(items_per_group);
   const size_t num_blocks = (item_count + items_per_block - 1u) / items_per_block;
   const size_t blk_fp12_bytes = num_blocks * 576u;
 
@@ -1529,11 +1794,22 @@ int32_t cubbs_bbs_cuda_launch_pairing_unique_pk_on_stream(
       workspace.unique_pk_key.size() == item_count * 96u &&
       std::memcmp(workspace.unique_pk_key.data(), h_pks_compressed, item_count * 96u) == 0;
   if (error == cudaSuccess && !pk_cache_hit) {
-    // 32 threads/block (16 keys/block -> 32 blocks for B=512, fills RTX 5060 Ti SMs!).
-    const uint32_t dec_blocks = static_cast<uint32_t>((item_count * 2u + 31u) / 32u);
-    cubbs_bbs_g2_uncompress_and_precompute_lines_kernel<<<dec_blocks, 32u, 0, stream>>>(
-        d_pks_compressed, item_count, workspace.unique_g2_lines, d_invalid_flag);
-    error = cudaGetLastError();
+    if (workspace.unique_g2_c4_scratch_capacity < all_lines_bytes) {
+      if (workspace.unique_g2_c4_scratch != nullptr)
+        (void)cudaFree(workspace.unique_g2_c4_scratch);
+      workspace.unique_g2_c4_scratch = nullptr;
+      workspace.unique_g2_c4_scratch_capacity = 0u;
+      error = cudaMalloc(&workspace.unique_g2_c4_scratch, all_lines_bytes);
+      if (error == cudaSuccess) workspace.unique_g2_c4_scratch_capacity = all_lines_bytes;
+    }
+    if (error == cudaSuccess) {
+      // 32 threads/block (16 keys/block -> 32 blocks for B=512, fills RTX 5060 Ti SMs!).
+      const uint32_t dec_blocks = static_cast<uint32_t>((item_count * 2u + 31u) / 32u);
+      cubbs_bbs_g2_uncompress_and_precompute_lines_kernel<<<dec_blocks, 32u, 0, stream>>>(
+          d_pks_compressed, item_count, workspace.unique_g2_lines,
+          workspace.unique_g2_c4_scratch, d_invalid_flag);
+      error = cudaGetLastError();
+    }
   }
   if (error == cudaSuccess) {
     if (items_per_group == 4u) {

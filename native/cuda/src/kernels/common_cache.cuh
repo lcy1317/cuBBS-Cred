@@ -24,8 +24,9 @@ struct CuBbsFusedCommonPointsCache {
   CuBbsFusedCommonPointsCache() { (void)cudaGetDevice(&device); }
 
   size_t table_bytes() const {
+    const size_t base_pts = use_pippenger_large ? (2u * term_count) : term_count;
     const size_t base_bytes =
-        (device_points != nullptr ? term_count * sizeof(cubbs_sppark_plain_affine_t) : 0u);
+        (device_points != nullptr ? base_pts * sizeof(cubbs_sppark_plain_affine_t) : 0u);
     return base_bytes + limlee_total_entries * sizeof(cubbs_sppark_plain_affine_t);
   }
 
@@ -65,8 +66,14 @@ static std::mutex &fused_common_points_build_mutex(const std::string &key) {
 }
 
 static size_t cubbs_gpu_table_cache_budget_bytes() {
+  size_t default_budget = 2048ull * 1024ull * 1024ull;
+  size_t free_vram = 0u, total_vram = 0u;
+  if (cudaMemGetInfo(&free_vram, &total_vram) == cudaSuccess &&
+      total_vram >= 12ull * 1024ull * 1024ull * 1024ull) {
+    default_budget = 3072ull * 1024ull * 1024ull;
+  }
   return env_size_or_default(
-      "CUBBS_BBS_GPU_TABLE_CACHE_BUDGET_BYTES", 2048ull * 1024ull * 1024ull);
+      "CUBBS_BBS_GPU_TABLE_CACHE_BUDGET_BYTES", default_budget);
 }
 
 static void retain_fused_common_points_cache(
@@ -107,8 +114,7 @@ static std::string fused_common_points_cache_key(
 
 static cudaError_t build_limlee_table_for_cache(
     CuBbsFusedCommonPointsCache *cached, size_t term_count) {
-  uint32_t group_size =
-      (term_count <= 70u) ? 17u : ((term_count <= 512u) ? 16u : 18u);
+  uint32_t group_size = (term_count <= 150u) ? 17u : 18u;
   if (const char *genv = std::getenv("CUBBS_BBS_LIMLEE_GROUP_SIZE")) {
     const unsigned long parsed = std::strtoul(genv, nullptr, 10);
     if (parsed >= 1ul && parsed <= CUBBS_LIMLEE_MAX_GROUP_SIZE) {
@@ -119,7 +125,7 @@ static cudaError_t build_limlee_table_for_cache(
     group_size = static_cast<uint32_t>(term_count);
   }
   uint32_t v_sub =
-      (term_count <= 70u) ? 4u : ((term_count <= 512u) ? 2u : 1u);
+      (term_count <= 320u) ? 4u : ((term_count <= 512u) ? 2u : 1u);
   if (const char *venv = std::getenv("CUBBS_BBS_LIMLEE_V_SUB")) {
     const unsigned long parsed = std::strtoul(venv, nullptr, 10);
     if (parsed == 1ul || parsed == 2ul || parsed == 4ul) {
@@ -298,15 +304,23 @@ static int32_t get_fused_common_points_cache(
 
   auto cached = std::make_shared<CuBbsFusedCommonPointsCache>();
   cached->term_count = term_count;
+  const bool use_large_pip = (term_count > 2100u);
   const size_t point_bytes = term_count * sizeof(cubbs_sppark_plain_affine_t);
-  cudaError_t cuda_status = cudaMalloc(&cached->device_points, point_bytes);
+  const size_t alloc_point_bytes = use_large_pip ? (2u * point_bytes) : point_bytes;
+  cudaError_t cuda_status = cudaMalloc(&cached->device_points, alloc_point_bytes);
   if (cuda_status == cudaSuccess) {
     cuda_status = cudaMemcpy(cached->device_points, decoded_points.data(),
                              point_bytes, cudaMemcpyHostToDevice);
   }
   if (cuda_status == cudaSuccess) {
-    if (term_count > 2100u) {
+    if (use_large_pip) {
       cached->use_pippenger_large = true;
+      constexpr uint32_t glv_t = 256u;
+      const uint32_t glv_b = static_cast<uint32_t>((term_count + glv_t - 1u) / glv_t);
+      cubbs_large_pip_fill_glv_points_kernel<<<glv_b, glv_t>>>(
+          cached->device_points, term_count);
+      cuda_status = cudaGetLastError();
+      if (cuda_status == cudaSuccess) cuda_status = cudaDeviceSynchronize();
     } else {
       cuda_status = build_limlee_table_for_cache(cached.get(), term_count);
     }
